@@ -1,7 +1,7 @@
 #pragma once
 
 #include "inference/generator.h"
-#include "dataset/langid.h"
+
 #include <map>
 #include <string>
 #include <vector>
@@ -117,11 +117,9 @@ private:
     Generator&      gen_;
     const Tokenizer& tok_;
     BenchmarkConfig cfg_;
-    LangId          lid_;
 };
 
 double distinct_n(const std::string& text, int n);
 int    max_ngram_repeat(const std::string& text, int n);
-double darija_marker_ratio(const std::string& text, const LangId& lid);
 
 }

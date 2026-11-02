@@ -105,10 +105,15 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
         float scale = amax / 8.0f;
         float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
         out[b].scale = fp32_to_fp16(scale);
-        for (int i = 0; i < Q4_BLOCK / 2; ++i) {
-            int q0 = std::clamp(static_cast<int>(std::lround(x[2 * i]     * inv)), -8, 7) + 8;
-            int q1 = std::clamp(static_cast<int>(std::lround(x[2 * i + 1] * inv)), -8, 7) + 8;
-            out[b].q[i] = static_cast<u8>((q1 << 4) | q0);
+        // GGML layout: low nibble = element j, high nibble = element j+16.
+        for (int j = 0; j < Q4_BLOCK / 2; ++j) {
+            int q0 = 8, q1 = 8;
+            if (j < Q4_BLOCK) {
+                // element j is always in a full block
+            }
+            q0 = std::clamp(static_cast<int>(std::lround(x[j] * inv)), -8, 7) + 8;
+            q1 = std::clamp(static_cast<int>(std::lround(x[j + Q4_BLOCK / 2] * inv)), -8, 7) + 8;
+            out[b].q[j] = static_cast<u8>((q1 << 4) | q0);
         }
     }
     const i64 rem = n % Q4_BLOCK;
@@ -129,11 +134,13 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
         float scale = amax / 8.0f;
         float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
         out[full].scale = fp32_to_fp16(scale);
-        for (int i = 0; i < Q4_BLOCK / 2; ++i) {
-            const i64 i0 = static_cast<i64>(2 * i), i1 = i0 + 1;
-            int q0 = (i0 < rem ? std::clamp(static_cast<int>(std::lround(x[i0] * inv)), -8, 7) + 8 : 8);
-            int q1 = (i1 < rem ? std::clamp(static_cast<int>(std::lround(x[i1] * inv)), -8, 7) + 8 : 8);
-            out[full].q[i] = static_cast<u8>((q1 << 4) | q0);
+        for (int j = 0; j < Q4_BLOCK / 2; ++j) {
+            int q0 = 8, q1 = 8;
+            if (j < rem)
+                q0 = std::clamp(static_cast<int>(std::lround(x[j] * inv)), -8, 7) + 8;
+            if (j + Q4_BLOCK / 2 < rem)
+                q1 = std::clamp(static_cast<int>(std::lround(x[j + Q4_BLOCK / 2] * inv)), -8, 7) + 8;
+            out[full].q[j] = static_cast<u8>((q1 << 4) | q0);
         }
     }
 }
@@ -145,20 +152,20 @@ void dequantize_q4_0(const void* src, float* dst, i64 n) {
     for (i64 b = 0; b < full; ++b) {
         float s = fp16_to_fp32(in[b].scale);
         float* o = dst + b * Q4_BLOCK;
-        for (int i = 0; i < Q4_BLOCK / 2; ++i) {
-            u8 byte = in[b].q[i];
-            o[2 * i]     = (static_cast<float>(byte & 0x0F) - 8.0f) * s;
-            o[2 * i + 1] = (static_cast<float>(byte >> 4)   - 8.0f) * s;
+        for (int j = 0; j < Q4_BLOCK / 2; ++j) {
+            u8 byte = in[b].q[j];
+            o[j]                  = (static_cast<float>(byte & 0x0F) - 8.0f) * s;
+            o[j + Q4_BLOCK / 2]   = (static_cast<float>(byte >> 4)   - 8.0f) * s;
         }
     }
     const i64 rem = n % Q4_BLOCK;
     if (rem > 0) {
         float tmp[Q4_BLOCK];
         float s = fp16_to_fp32(in[full].scale);
-        for (int i = 0; i < Q4_BLOCK / 2; ++i) {
-            u8 byte = in[full].q[i];
-            tmp[2 * i]     = (static_cast<float>(byte & 0x0F) - 8.0f) * s;
-            tmp[2 * i + 1] = (static_cast<float>(byte >> 4)   - 8.0f) * s;
+        for (int j = 0; j < Q4_BLOCK / 2; ++j) {
+            u8 byte = in[full].q[j];
+            tmp[j]                  = (static_cast<float>(byte & 0x0F) - 8.0f) * s;
+            tmp[j + Q4_BLOCK / 2]   = (static_cast<float>(byte >> 4)   - 8.0f) * s;
         }
         for (i64 i = 0; i < rem; ++i) dst[full * Q4_BLOCK + i] = tmp[i];
     }

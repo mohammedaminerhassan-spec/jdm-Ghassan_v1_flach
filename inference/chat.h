@@ -1,7 +1,7 @@
 #pragma once
 
 #include "inference/generator.h"
-#include "dataset/retrieval.h"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -48,7 +48,6 @@ private:
     std::vector<Message> history_;
     bool                 custom_system_ = false;
 
-    mutable std::unique_ptr<RetrievalIndex> retrieve_;
     mutable bool retrieve_tried_ = false;
 
     mutable std::string retrieve_loaded_path_;

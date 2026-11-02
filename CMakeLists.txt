@@ -157,11 +157,10 @@ endif()
 
 add_executable(ghassan-ai      tools/inference_cli.cpp tools/cli_common.cpp)
 add_executable(train_tokenizer tools/tokenizer_trainer_cli.cpp tools/cli_common.cpp)
-add_executable(corpus_stats    tools/corpus_inspector_cli.cpp tools/cli_common.cpp)
-add_executable(data_pipeline   tools/data_pipeline_cli.cpp tools/cli_common.cpp)
+# corpus_stats disabled: depends on deleted dataset module
 add_executable(gai_train       tools/training_cli.cpp tools/cli_common.cpp)
 
-foreach(t ghassan-ai train_tokenizer corpus_stats data_pipeline gai_train)
+foreach(t ghassan-ai train_tokenizer gai_train)
     target_link_libraries(${t} PRIVATE gai_core)
     gai_apply_cxx_flags(${t})
 endforeach()

@@ -426,12 +426,12 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
             float inv   = (scale != 0.f) ? (1.f / scale) : 0.f;
             uint16_t sh = fp32_to_fp16(scale);
             memcpy(block, &sh, 2);
-            for (size_t i = 0; i < 16; ++i) {
-                float f0 = (start + 2*i     < end) ? src[start + 2*i]     : 0.f;
-                float f1 = (start + 2*i + 1 < end) ? src[start + 2*i + 1] : 0.f;
+            for (size_t j = 0; j < 16; ++j) {
+                float f0 = (start + j        < end) ? src[start + j]        : 0.f;
+                float f1 = (start + j + 16  < end) ? src[start + j + 16]    : 0.f;
                 int q0 = std::max(-8, std::min(7, static_cast<int>(std::lround(f0 * inv)))) + 8;
                 int q1 = std::max(-8, std::min(7, static_cast<int>(std::lround(f1 * inv)))) + 8;
-                block[2 + i] = static_cast<uint8_t>((q1 << 4) | q0);
+                block[2 + j] = static_cast<uint8_t>((q1 << 4) | q0);
             }
         }
         return out;
@@ -1090,13 +1090,14 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
         for (size_t b = 0; b < nblocks; ++b) {
             const uint8_t* block = raw.data() + b * 18;
             float scale = fp16_to_f32(*reinterpret_cast<const uint16_t*>(block));
-            for (size_t i = 0; i < 16 && b*32+2*i < nelems; ++i) {
-
-                uint8_t byte = block[2+i];
+            for (size_t j = 0; j < 16; ++j) {
+                if (b*32 + j >= nelems) break;
+                uint8_t byte = block[2+j];
                 int q0 = static_cast<int>(byte & 0xF) - 8;
                 int q1 = static_cast<int>(byte >> 4) - 8;
-                dst[b*32+2*i]   = static_cast<float>(q0) * scale;
-                if (b*32+2*i+1 < nelems) dst[b*32+2*i+1] = static_cast<float>(q1) * scale;
+                dst[b*32 + j] = static_cast<float>(q0) * scale;
+                if (b*32 + j + 16 < nelems)
+                    dst[b*32 + j + 16] = static_cast<float>(q1) * scale;
             }
         }
     } else {
@@ -1249,7 +1250,7 @@ void export_model_gguf(const std::string& path, Model& model,
         if (itn != extra_meta.end() && !itn->second.empty()) name = itn->second;
         w.set_model_name(name);
     }
-    w.set_description("Ghassan MoE language model for Moroccan Darija");
+    w.set_description("Ghassan language model");
     w.set_general_type("model");
     {
         u64 n = static_cast<u64>(model.num_parameters());
@@ -1315,10 +1316,10 @@ void export_model_gguf(const std::string& path, Model& model,
         types.reserve(static_cast<size_t>(tok.vocab_size()));
         // GGUF spec: 0=normal,1=unknown,2=control,3=user-defined,4=unused,5=byte
         for (int i = 0; i < tok.vocab_size(); ++i) {
-            int32_t t = 0;
-            if (i == special::UNK) t = 1;
-            else if (i < special::COUNT) t = 2;
-            else if (i < special::COUNT + 256) t = 5;
+            int32_t t = 1; // GGUF: 1 = normal
+            if (i == special::UNK) t = 2; // unknown
+            else if (i < special::COUNT) t = 3; // control
+            else if (i < special::COUNT + 256) t = 6; // byte
             types.push_back(t);
         }
         w.set_tokenizer_token_types(types);

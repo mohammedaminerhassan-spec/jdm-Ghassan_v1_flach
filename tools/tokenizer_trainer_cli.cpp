@@ -1,6 +1,6 @@
 #include "tools/cli_common.h"
 #include "tokenizer/bpe_trainer.h"
-#include "dataset/darija_synthesis_engine.h"
+
 #include "core/config.h"
 
 #include <iostream>
@@ -136,16 +136,7 @@ int main(int argc, char** argv) {
         const int nsynth = args.num_int("synth", 0);
         GAI_CHECK(nsynth >= 0, "--synth must be >= 0");
         if (nsynth > 0) {
-            log_info(strfmt("[synth] generating %d darija conversations for tokenizer training",
-                            nsynth));
-            SynthConfig sc;
-            sc.num_conversations = nsynth;
-            sc.max_template_uses = 100000;
-            SynthGenerator gen(sc);
-            auto convs = gen.generate_many(nsynth);
-            for (const auto& c : convs)
-                for (const auto& m : c.messages) corpus_lines.push_back(m.content);
-            log_info("[synth] " + gen.stats().summary());
+            log_warn("[synth] disabled: darija synthesis engine removed; provide --input corpus instead");
         }
 
         GAI_CHECK(!corpus_lines.empty(),

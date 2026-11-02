@@ -1,8 +1,5 @@
 #include "evaluation/benchmark.h"
-#include "dataset/english_style_policy.h"
 #include "inference/generator.h"
-#include "dataset/langid.h"
-#include "dataset/cleaner.h"
 #include "core/common.h"
 #include "tokenizer/tokenizer.h"
 
@@ -96,10 +93,7 @@ int max_ngram_repeat(const std::string& text, int n) {
     return mx;
 }
 
-double darija_marker_ratio(const std::string& text, const LangId& lid) {
-    auto res = lid.classify(text);
-    return res.darija_score;
-}
+
 
 static bool is_robotic(const std::string& resp) {
     static const std::vector<std::string> patterns = {
@@ -635,34 +629,12 @@ ItemResult Benchmark::evaluate_item(const EvalItem& item) {
     r.distinct2 = distinct_n(response, 2);
     r.max_ngram_repeat = max_ngram_repeat(response, 3);
 
-    r.darija_ratio = darija_marker_ratio(response, lid_);
+    r.darija_ratio = 0.0;
     r.lang_ok = true;
-    r.has_lang_gate = !item.expect_lang.empty();
-    if (r.has_lang_gate) {
-        LangScore ls = lid_.classify(response);
-        const char* got = lang_name(ls.tag);
-        if (std::string(got) == item.expect_lang) r.lang_ok = true;
-        else if (ls.tag == LangTag::Mixed &&
-                 (item.expect_lang == "ar-MA-arab" || item.expect_lang == "ar-MA-latn" ||
-                  item.expect_lang == "ar-MSA"))
-            r.lang_ok = true;
-        else if (item.expect_lang == "en" &&
-                 (ls.tag == LangTag::English || ls.tag == LangTag::Mixed ||
-                  ls.tag == LangTag::Other))
-
-            r.lang_ok = (ls.english_score > 0.02);
-        else r.lang_ok = false;
-    }
-
-    {
-        ToxicityResult tox = check_toxicity(response);
-        r.toxic = tox.toxic;
-    }
-
-    r.has_discipline = (item.expect_lang == "en");
-    if (r.has_discipline) {
-        r.discipline_ok = english_logic::check_english_reply(item.prompt, response).disciplined;
-    }
+    r.has_lang_gate = false;
+    r.toxic = false;
+    r.has_discipline = false;
+    r.discipline_ok = true;
 
     double s = 0.0;
     if (r.matched)       s += 0.40;

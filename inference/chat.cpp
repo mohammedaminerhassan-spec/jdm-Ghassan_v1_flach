@@ -1,5 +1,5 @@
 #include "inference/chat.h"
-#include "dataset/english_style_policy.h"
+
 
 #include <iostream>
 #include <algorithm>
@@ -75,83 +75,12 @@ void ChatSession::trim_history() {
     history_ = std::move(trimmed);
 }
 
-bool ChatSession::try_retrieve(const std::string& user_message, std::string& out) const {
-    if (opts_.retrieve_index.empty()) return false;
-
-    if (opts_.retrieve_index != retrieve_loaded_path_) retrieve_tried_ = false;
-    if (!retrieve_tried_) {
-        retrieve_tried_ = true;
-        retrieve_loaded_path_ = opts_.retrieve_index;
-        std::vector<QaEntry> docs;
-        size_t n = 0;
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        if (fs::is_directory(opts_.retrieve_index, ec)) {
-            n = load_qa_dir(opts_.retrieve_index, docs);
-        } else {
-
-            if (load_qa_json(opts_.retrieve_index, docs)) n = docs.size();
-            else n = load_qa_dir(opts_.retrieve_index, docs);
-        }
-        if (n > 0) {
-            retrieve_ = std::make_unique<RetrievalIndex>();
-            retrieve_->build(docs);
-        }
-    }
-    if (!retrieve_ || retrieve_->size() == 0) return false;
-
-    const int k = opts_.retrieve_top_k > 0 ? opts_.retrieve_top_k : 1;
-    auto hits = retrieve_->query(user_message, k, opts_.retrieve_threshold);
-    if (hits.empty()) return false;
-    out = retrieve_->doc(hits[0].doc).answer;
-    return true;
+bool ChatSession::try_retrieve(const std::string& /*user_message*/, std::string& /*out*/) const {
+    // Retrieval/RAG removed along with the dataset module; no-op.
+    return false;
 }
 
-static void adapt_english_generation(GenerationConfig& cfg, const std::string& user_message) {
-    using namespace english_logic;
-    const DialogAct act = classify_dialog_act(user_message);
-    auto& s = cfg.sampling;
-    switch (act) {
-        case DialogAct::Greeting:
-            cfg.max_new_tokens = std::min(cfg.max_new_tokens, 96);
-            s.temperature = std::min(s.temperature, 0.8f);
-            s.top_p = 0.90f;
-            s.min_p = 0.02f;
-            s.no_repeat_ngram = 0;
-            break;
-        case DialogAct::Coding:
-            s.temperature = std::min(s.temperature, 0.4f);
-            s.top_k = 40;
-            s.top_p = 1.0f;
-            s.min_p = 0.0f;
-            s.no_repeat_ngram = 0;
-            break;
-        case DialogAct::Reasoning:
-            s.temperature = std::min(s.temperature, 0.6f);
-            s.top_k = 40;
-            s.top_p = 0.95f;
-            s.min_p = 0.02f;
-            s.no_repeat_ngram = 0;
-            break;
-        case DialogAct::Instruction:
-            s.temperature = std::min(s.temperature, 0.6f);
-            s.top_k = 40;
-            s.top_p = 0.90f;
-            s.min_p = 0.05f;
-            s.no_repeat_ngram = 0;
-            break;
-        case DialogAct::Question:
-            s.temperature = std::min(s.temperature, 0.7f);
-            s.top_p = 0.92f;
-            s.min_p = 0.05f;
-            s.no_repeat_ngram = 0;
-            break;
-        case DialogAct::Chitchat:
-        case DialogAct::Unknown:
-            break;
-    }
-    s.validate();
-}
+
 
 std::string ChatSession::send(const std::string& user_message) {
 
@@ -188,10 +117,6 @@ std::string ChatSession::send(const std::string& user_message) {
         };
     }
     GenerationConfig turn_cfg = opts_.gen;
-    if (opts_.adaptive_dialog &&
-        (opts_.persona == "en" || opts_.persona == "english")) {
-        adapt_english_generation(turn_cfg, user_message);
-    }
     reply = gen_.chat(history_, turn_cfg, cb);
     if (opts_.stream) std::cout << std::endl;
 

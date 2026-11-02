@@ -6,7 +6,7 @@ import numpy as np
 import gguf
 
 CKPT_DIR = r"C:\Users\Ghassan PC\Documents\Projects\Ghassan Ai model\safetensors"
-OUT_GGUF = r"C:\Users\Ghassan PC\Documents\Projects\Ghassan Ai model\artifacts\Ghassan-v1-pro-360m-f16.gguf"
+OUT_GGUF = r"C:\Users\Ghassan PC\Documents\Projects\Ghassan Ai model\artifacts\Ghassan-v1-pro-1.7B-f16.gguf"
 
 def read_safetensors_raw(path):
     with open(path, "rb") as f:
@@ -55,6 +55,7 @@ def main():
     
     writer.add_context_length(max_seq_len)
     writer.add_embedding_length(hidden_size)
+    writer.add_bool("llama.tie_word_embeddings", True)
     writer.add_block_count(num_layers)
     writer.add_feed_forward_length(intermediate_size)
     writer.add_head_count(num_heads)

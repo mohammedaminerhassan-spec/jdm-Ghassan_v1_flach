@@ -8,7 +8,7 @@
 #include "evaluation/benchmark.h"
 #include "evaluation/perplexity.h"
 #include "training/checkpoint.h"
-#include "dataset/retrieval.h"
+
 
 #include <iostream>
 #include <fstream>
@@ -35,7 +35,7 @@ static unsigned long long this_pid() {
 
 static void usage() {
     std::cout <<
-    "ghassan-ai - Moroccan Darija conversational model (GGUF-only)\n\n"
+    "ghassan-ai - Ghassan language model (GGUF-only)\n\n"
     "usage:\n"
     "  ghassan-ai chat      --model model.gguf\n"
     "  ghassan-ai generate  --model model.gguf --prompt \"شنو هو C++؟\"\n"
@@ -293,29 +293,6 @@ static int cmd_chat(const Args& args) {
 
 static int cmd_generate(const Args& args) {
 
-    if (args.has("retrieve-index")) {
-        std::string idx_path = args.str("retrieve-index");
-        double thr = args.real("retrieve-threshold", 3.0);
-        std::string prompt = args.str("prompt");
-        if (prompt.empty() && !args.positional().empty() && args.positional().size() > 1)
-            prompt = args.positional()[1];
-        if (!prompt.empty()) {
-            std::vector<QaEntry> docs;
-            if (load_qa_dir(idx_path, docs) > 0 || load_qa_json(idx_path, docs)) {
-                RetrievalIndex ridx;
-                ridx.build(docs);
-                auto hits = ridx.query(prompt, 1, thr);
-                if (!hits.empty()) {
-                    std::string ans = ridx.doc(hits[0].doc).answer;
-                    std::cout << ans << std::endl;
-                    if (args.flag("stats")) std::cerr << "  [retrieved id=" << ridx.doc(hits[0].doc).id
-                                                      << " score=" << hits[0].score << "]\n";
-                    return 0;
-                }
-            }
-        }
-
-    }
     LoadedModel lm = load_model(args);
     GenerationConfig g = make_gen_config(args);
     g.max_context = args.num_int("ctx", 0);
