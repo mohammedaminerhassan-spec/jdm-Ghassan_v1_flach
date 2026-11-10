@@ -202,6 +202,19 @@ public:
     Tensor& forward(const i32* ids, int B, int T, Activations& act,
                     const i32* segment_ids = nullptr);
 
+    // Same as forward(), but some positions take their embedding from the
+    // caller instead of the token embedding table. This is how a vision
+    // tower injects image features: the prompt carries a placeholder token
+    // and the tower's output is written over that position.
+    //
+    // embed_override : [n_override, hidden] features
+    // override_pos   : [n_override] absolute positions in [0, B*T)
+    Tensor& forward(const i32* ids, int B, int T, Activations& act,
+                    const i32* segment_ids,
+                    const float* embed_override,
+                    const int* override_pos,
+                    int n_override);
+
     double  forward_backward(const i32* ids, const i32* targets, int B, int T,
                               Activations& act, i64* out_ntok = nullptr,
                               float dout_scale = 1.0f, bool want_aux_stats = false,
@@ -279,6 +292,12 @@ private:
 
     void forward_body(const i32* ids, int B, int T, Activations& act,
                       const i32* segment_ids);
+
+    void forward_body(const i32* ids, int B, int T, Activations& act,
+                      const i32* segment_ids,
+                      const float* embed_override,
+                      const int* override_pos,
+                      int n_override);
 
     ModelConfig cfg_;
 

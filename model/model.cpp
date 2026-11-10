@@ -1247,6 +1247,14 @@ static void check_act_device(Device dev, const char* name, const Tensor& t) {
 
 void Model::forward_body(const i32* ids, int B, int T, Activations& act,
                          const i32* segment_ids) {
+    forward_body(ids, B, T, act, segment_ids, nullptr, nullptr, 0);
+}
+
+void Model::forward_body(const i32* ids, int B, int T, Activations& act,
+                         const i32* segment_ids,
+                         const float* embed_override,
+                         const int* override_pos,
+                         int n_override) {
 
     GAI_CHECK(ids != nullptr, "forward: null ids");
     GAI_CHECK(B > 0 && T > 0, "forward: B and T must be > 0");
@@ -1336,6 +1344,19 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
     }
 
     ops::embedding_forward(dev, ids, tok_emb_.w.f32(), act.x.f32(), N, d, V);
+
+    // Image features (or any other caller supplied embedding) replace the
+    // token embedding at the placeholder positions.
+    if (embed_override && override_pos && n_override > 0) {
+        float* x = act.x.f32();
+        for (int i = 0; i < n_override; ++i) {
+            const int p = override_pos[i];
+            if (p < 0 || p >= N) continue;
+            std::memcpy(x + static_cast<size_t>(p) * d,
+                        embed_override + static_cast<size_t>(i) * d,
+                        sizeof(float) * static_cast<size_t>(d));
+        }
+    }
 
     const float* rope_freq = rope_inv_freq_ptr();
     GAI_CHECK(rope_freq != nullptr, "forward: RoPE frequency cache is missing");
@@ -1459,8 +1480,7 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
 
 Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
                        const i32* segment_ids) {
-
-    forward_body(ids, B, T, act, segment_ids);
+    forward_body(ids, B, T, act, segment_ids, nullptr, nullptr, 0);
     const int d = cfg_.hidden_size;
     const int V = cfg_.vocab_size;
     const i64 N = static_cast<i64>(B) * T;
@@ -1469,6 +1489,25 @@ Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
         GAI_CHECK(act.logits.numel() >= need,
                   "forward: logits buffer too small (chunked training activations "
                   "need forward_backward, not forward)");
+    }
+    ops::linear_forward(device_, act.xb.f32(), lm_head().w.f32(), act.logits.f32(),
+                        static_cast<int>(N), d, V);
+    return act.logits;
+}
+
+Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
+                       const i32* segment_ids,
+                       const float* embed_override,
+                       const int* override_pos,
+                       int n_override) {
+    forward_body(ids, B, T, act, segment_ids, embed_override, override_pos, n_override);
+    const int d = cfg_.hidden_size;
+    const int V = cfg_.vocab_size;
+    const i64 N = static_cast<i64>(B) * T;
+    {
+        const i64 need = N * static_cast<i64>(V);
+        GAI_CHECK(act.logits.numel() >= need,
+                  "forward: logits buffer too small");
     }
     ops::linear_forward(device_, act.xb.f32(), lm_head().w.f32(), act.logits.f32(),
                         static_cast<int>(N), d, V);

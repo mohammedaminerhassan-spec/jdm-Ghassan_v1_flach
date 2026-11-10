@@ -87,7 +87,8 @@ file(GLOB_RECURSE GAI_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_SOURCE_DIR}/inference/*.cpp
      ${CMAKE_SOURCE_DIR}/quantization/*.cpp
      ${CMAKE_SOURCE_DIR}/evaluation/*.cpp
-     ${CMAKE_SOURCE_DIR}/server/*.cpp)
+     ${CMAKE_SOURCE_DIR}/server/*.cpp
+     ${CMAKE_SOURCE_DIR}/vision/*.cpp)
 
 add_library(gai_core STATIC ${GAI_SOURCES})
 target_include_directories(gai_core PUBLIC ${CMAKE_SOURCE_DIR})

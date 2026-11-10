@@ -36,4 +36,9 @@ GenerationConfig make_gen_config(const Args& a);
 // The chat style of a loaded vocabulary (native / ChatML / Llama-3 / Mistral).
 const char* chat_style_name(ChatStyle s);
 
+// Reads the vision tower of a multimodal GGUF. Returns null when the file
+// carries no vision weights.
+std::unique_ptr<class VisionTower> load_vision_tower(const std::string& path,
+                                                     class VisionConfig* out_cfg);
+
 }  // namespace gai

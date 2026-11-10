@@ -9,6 +9,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -89,6 +91,72 @@ bool extract_messages(const Json& body, std::vector<Message>& out, std::string& 
     return true;
 }
 
+std::string base64_decode(const std::string& in) {
+    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int rev[256];
+    for (int i = 0; i < 256; ++i) rev[i] = -1;
+    for (int i = 0; i < 64; ++i) rev[static_cast<u8>(tbl[i])] = i;
+
+    std::string out;
+    out.reserve(in.size() * 3 / 4 + 3);
+    int buf = 0, bits = 0;
+    for (char c : in) {
+        if (c == '=' ) break;
+        const int v = rev[static_cast<u8>(c)];
+        if (v < 0) continue;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// Loads the image of a request and returns the normalized CHW pixels.
+// The image is either a PPM file (the Python side converts PNG/JPEG) or a
+// base64 encoded PPM.
+bool load_request_image(const Json& body, const VisionConfig& cfg,
+                        std::vector<float>& pixels, std::string& error) {
+    const std::string path = body.at("image_path").as_string();
+    const std::string b64 = body.at("image_ppm_base64").as_string();
+
+    pixels.assign(static_cast<size_t>(cfg.channels) * cfg.image_size * cfg.image_size, 0.0f);
+
+    if (!path.empty()) {
+        if (!load_ppm(path, pixels.data(), cfg.channels, cfg.image_size, cfg.image_size)) {
+            error = "cannot read the image (expected a " +
+                    std::to_string(cfg.image_size) + "x" + std::to_string(cfg.image_size) +
+                    " P6 PPM): " + path;
+            return false;
+        }
+        return true;
+    }
+    if (!b64.empty()) {
+        const std::string raw = base64_decode(b64);
+        const std::string tmp = std::string((std::filesystem::temp_directory_path() /
+            ("gai_img_" + std::to_string(raw.size()) + ".ppm")).string());
+        {
+            std::ofstream f(tmp, std::ios::binary);
+            if (!f.good()) { error = "cannot stage the image"; return false; }
+            f.write(raw.data(), static_cast<std::streamsize>(raw.size()));
+        }
+        const bool ok = load_ppm(tmp, pixels.data(), cfg.channels, cfg.image_size, cfg.image_size);
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        if (!ok) {
+            error = "the base64 image is not a valid " +
+                    std::to_string(cfg.image_size) + "x" + std::to_string(cfg.image_size) +
+                    " P6 PPM";
+            return false;
+        }
+        return true;
+    }
+    error = "no image in the request";
+    return false;
+}
+
 struct ServeState {
     std::unique_ptr<Model>      model;
     Tokenizer                    tokenizer;
@@ -97,6 +165,8 @@ struct ServeState {
     std::string                  chat_style;
     int                          max_context = 4096;
     GenerationConfig             defaults;
+    VisionConfig                 vcfg;
+    bool                         has_vision = false;
     std::mutex                   mu;      // one request at a time
     std::unique_ptr<Generator>   gen;
     std::atomic<unsigned long long> served{0};
@@ -119,6 +189,34 @@ void handle_chat(ServeState& st, HttpConn& conn, const HttpRequest& req) {
     if (!extract_messages(body, msgs, err)) {
         write_json(conn, error_json(err));
         return;
+    }
+
+    // An image attached to the request goes to the last user turn.
+    const bool wants_image = body.has("image_path") || body.has("image_ppm_base64");
+    if (wants_image) {
+        if (!st.has_vision) {
+            write_json(conn, error_json(
+                "this model has no vision tower; the request carries an image"));
+            return;
+        }
+        std::vector<float> pixels;
+        std::string ierr;
+        if (!load_request_image(body, st.vcfg, pixels, ierr)) {
+            write_json(conn, error_json(ierr));
+            return;
+        }
+        int target = -1;
+        for (int i = static_cast<int>(msgs.size()) - 1; i >= 0; --i) {
+            if (msgs[static_cast<size_t>(i)].role == Role::User) { target = i; break; }
+        }
+        if (target < 0) {
+            write_json(conn, error_json("the image must be attached to a user turn"));
+            return;
+        }
+        Message& m = msgs[static_cast<size_t>(target)];
+        m.pixels = std::move(pixels);
+        m.image_h = st.vcfg.image_size;
+        m.image_w = st.vcfg.image_size;
     }
 
     const bool stream = body.at("stream").as_bool(false);
@@ -294,9 +392,26 @@ int cmd_serve(const Args& args) {
     st.defaults.max_context = st.max_context;
     st.gen = std::make_unique<Generator>(*st.model, st.tokenizer, st.max_context);
 
+    // A multimodal checkpoint carries its vision tower in the same file.
+    {
+        VisionConfig vcfg;
+        auto tower = load_vision_tower(lm.path, &vcfg);
+        if (tower) {
+            if (vcfg.out_dim != st.cfg.hidden_size) {
+                log_warn(strfmt("[vision] the tower outputs %d but the model expects %d; "
+                                "the image would not fit", vcfg.out_dim, st.cfg.hidden_size));
+            } else {
+                st.vcfg = vcfg;
+                st.has_vision = true;
+                st.gen->set_vision(std::move(tower));
+            }
+        }
+    }
+
     log_info(strfmt("[serve] model %s", st.model_name.c_str()));
-    log_info(strfmt("[serve] chat style %s | context %d | vocab %d",
-                    st.chat_style.c_str(), st.max_context, st.tokenizer.vocab_size()));
+    log_info(strfmt("[serve] chat style %s | context %d | vocab %d | vision %s",
+                    st.chat_style.c_str(), st.max_context, st.tokenizer.vocab_size(),
+                    st.has_vision ? "yes" : "no"));
 
     HttpServer server;
     if (!server.start(host, port, [&st](HttpConn& conn, const HttpRequest& req) {

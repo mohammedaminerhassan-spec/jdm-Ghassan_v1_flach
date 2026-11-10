@@ -207,7 +207,10 @@ float* Generator::decode_step(i32 token, int position) {
     return logits_host_.data();
 }
 
-void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
+void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
+                                const float* embed_override,
+                                const int* override_pos,
+                                int n_override) {
     GAI_CHECK(model_.device() == expected_device_,
               "model device changed after Generator construction; rebuild the Generator");
 
@@ -255,6 +258,18 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
     Tensor atmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
 
     ops::embedding_forward(dev, d_ids.i32p(), model_.tok_embeddings().w.f32(), x.f32(), P, d, c.vocab_size);
+
+    // The vision features replace the embedding of the placeholder tokens.
+    if (embed_override && override_pos && n_override > 0) {
+        float* xh = x.f32();
+        for (int i = 0; i < n_override; ++i) {
+            const int p = override_pos[i];
+            if (p < 0 || p >= P) continue;
+            std::memcpy(xh + static_cast<size_t>(p) * d,
+                        embed_override + static_cast<size_t>(i) * d,
+                        sizeof(float) * static_cast<size_t>(d));
+        }
+    }
     const float* rope_freq = model_.rope_inv_freq_ptr();
     GAI_CHECK(rope_freq != nullptr, "prefill: RoPE frequency cache is missing");
     for (int l = 0; l < c.num_layers; ++l) {
@@ -325,7 +340,10 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
     for (auto t : tokens) push_history(t);
 }
 
-void Generator::prefill(const std::vector<i32>& tokens, int front_drop) {
+void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
+                        const float* embed_override,
+                        const int* override_pos,
+                        int n_override) {
     if (tokens.empty()) return;
     GAI_CHECK(front_drop >= 0, "prefill: front_drop must be >= 0");
     Timer t;
@@ -350,7 +368,7 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop) {
             static constexpr size_t PREFILL_CHUNK = 1024;
             if (work.size() > PREFILL_CHUNK) {
                 std::vector<i32> head(work.begin(), work.begin() + PREFILL_CHUNK);
-                forward_prefill(head, 0);
+                forward_prefill(head, 0, embed_override, override_pos, n_override);
                 absolute_pos_ = static_cast<int64_t>(head.size());
                 for (size_t i = PREFILL_CHUNK; i < work.size(); ++i) {
                     decode_step(work[i], static_cast<int>(absolute_pos_));
@@ -358,7 +376,7 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop) {
                     push_history(work[i]);
                 }
             } else {
-                forward_prefill(work, 0);
+                forward_prefill(work, 0, embed_override, override_pos, n_override);
 
                 absolute_pos_ = static_cast<int64_t>(work.size());
             }
@@ -508,7 +526,29 @@ std::string Generator::chat(const std::vector<Message>& msgs, const GenerationCo
     // native Gai checkpoints use <|system|>/<|user|>/<|assistant|>, HF
     // checkpoints use ChatML / Llama-3 / Mistral markers.
     const ChatStyle style = detect_chat_style(tok_);
-    std::vector<i32> ids = encode_chat(tok_, style, msgs, true, nullptr);
+    const int n_img_tokens = has_vision() ? vision_->config().n_patches() : 0;
+    std::vector<int> img_pos;
+    std::vector<i32> ids = encode_chat(tok_, style, msgs, true, nullptr,
+                                       &img_pos, n_img_tokens);
+
+    // Encode the attached images with the vision tower.
+    std::vector<float> feats;
+    if (!img_pos.empty()) {
+        GAI_CHECK(has_vision(),
+                  "the prompt carries an image but the model has no vision tower");
+        for (const Message& m : msgs) {
+            if (!m.has_image()) continue;
+            std::vector<float> f;
+            vision_->encode(m.pixels.data(), f);
+            feats.insert(feats.end(), f.begin(), f.end());
+        }
+        const size_t want = img_pos.size() *
+                            static_cast<size_t>(model_.config().hidden_size);
+        GAI_CHECK(feats.size() == want,
+                  strfmt("vision: %zu image features for %zu placeholders",
+                         feats.size() / static_cast<size_t>(model_.config().hidden_size),
+                         img_pos.size()));
+    }
 
     int budget = max_context_ - cfg.max_new_tokens - 4;
     int drop = 0;
@@ -516,8 +556,29 @@ std::string Generator::chat(const std::vector<Message>& msgs, const GenerationCo
         drop = static_cast<int>(ids.size()) - budget;
         ids.erase(ids.begin() + 1, ids.begin() + 1 + drop);
         log_warn(strfmt("chat: history truncated by %d tokens", drop));
+        // The placeholders move with the tokens; the ones that were cut
+        // away lose their features.
+        std::vector<int> kept_pos;
+        std::vector<float> kept_feat;
+        const size_t d = static_cast<size_t>(model_.config().hidden_size);
+        for (size_t i = 0; i < img_pos.size(); ++i) {
+            const int p = img_pos[i];
+            if (p == 0) { kept_pos.push_back(0); }
+            else if (p <= drop) { continue; }  // cut away
+            else {
+                kept_pos.push_back(p - drop);
+                kept_feat.insert(kept_feat.end(),
+                                 feats.begin() + static_cast<ptrdiff_t>(i * d),
+                                 feats.begin() + static_cast<ptrdiff_t>((i + 1) * d));
+            }
+        }
+        img_pos.swap(kept_pos);
+        feats.swap(kept_feat);
     }
-    prefill(ids, drop);
+    prefill(ids, drop,
+            feats.empty() ? nullptr : feats.data(),
+            img_pos.empty() ? nullptr : img_pos.data(),
+            static_cast<int>(img_pos.size()));
     std::vector<i32> gen = generate(cfg, on_token);
     return tok_.decode(gen, true);
 }

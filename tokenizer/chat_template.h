@@ -11,6 +11,15 @@ enum class Role : u8 { System = 0, User = 1, Assistant = 2 };
 struct Message {
     Role        role = Role::User;
     std::string content;
+
+    // Optional image attached to this message. The pixels are CHW and
+    // already resized and normalized; the vision tower turns them into
+    // embeddings that replace the placeholder tokens in the prompt.
+    std::vector<float> pixels;
+    int               image_h = 0;
+    int               image_w = 0;
+
+    bool has_image() const { return !pixels.empty(); }
 };
 
 enum class ReplyScript : u8 { Arabic = 0, Latin = 1 };
@@ -34,6 +43,7 @@ struct ChatSegment {
     i32         token      = -1;
     std::string text;
     bool        supervised = false;  // contributes to the training loss
+    bool        is_image   = false;  // the vision features go here
 };
 
 // Detects the chat style from the marker tokens present in the vocabulary.
@@ -46,10 +56,20 @@ std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
 
 // Renders and tokenizes. loss_mask (optional) is 1 for the tokens that
 // should be predicted (assistant content + the turn terminator).
+//
+// image_positions (optional) receives the absolute positions of the
+// placeholder tokens that stand for an attached image, so the caller can
+// write the vision features over them. image_tokens is how many
+// placeholders one image takes (the number of patches).
 std::vector<i32> encode_chat(const Tokenizer& tk, ChatStyle style,
                               const std::vector<Message>& msgs,
                               bool add_generation_prompt,
-                              std::vector<u8>* loss_mask = nullptr);
+                              std::vector<u8>* loss_mask = nullptr,
+                              std::vector<int>* image_positions = nullptr,
+                              int image_tokens = 0);
+
+// The token the engine puts in the prompt where the image features go.
+extern const char* kImagePadToken;
 
 class ChatTemplate {
 public:

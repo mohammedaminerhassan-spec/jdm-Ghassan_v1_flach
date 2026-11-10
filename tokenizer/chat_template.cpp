@@ -50,6 +50,8 @@ i32 ChatTemplate::role_token(Role r) {
 // Foreign chat styles
 // ---------------------------------------------------------------------------
 
+const char* kImagePadToken = "<|image_pad|>";
+
 namespace {
 
 const char* role_name(Role r) {
@@ -83,8 +85,7 @@ ChatStyle detect_chat_style(const Tokenizer& tk) {
 
 std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
                                      const std::vector<Message>& msgs,
-                                     bool add_generation_prompt) {
-    std::vector<ChatSegment> segs;
+                                     bool add_generation_prompt) {    std::vector<ChatSegment> segs;
 
     auto push_tok = [&](i32 id, bool sup) {
         ChatSegment s;
@@ -98,6 +99,11 @@ std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
         ChatSegment s;
         s.text = std::move(t);
         s.supervised = sup;
+        segs.push_back(std::move(s));
+    };
+    auto push_img = [&]() {
+        ChatSegment s;
+        s.is_image = true;
         segs.push_back(std::move(s));
     };
 
@@ -134,6 +140,7 @@ std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
                                                            : asstm;
                 const bool sup = (m.role == Role::Assistant);
                 push_tok(marker, false);
+                if (m.has_image()) push_img();
                 push_txt(m.content, sup);
                 push_tok(endm, sup);
             }
@@ -155,6 +162,7 @@ std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
                 const bool sup = (m.role == Role::Assistant);
                 push_tok(im_s, false);
                 push_txt(std::string(role_name(m.role)) + "\n", false);
+                if (m.has_image()) push_img();
                 push_txt(m.content, sup);
                 push_tok(im_e, sup);
                 push_txt("\n", false);
@@ -184,6 +192,7 @@ std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
                 push_txt(role_name(m.role), false);
                 push_tok(he, false);
                 push_txt("\n\n", false);
+                if (m.has_image()) push_img();
                 push_txt(m.content, sup);
                 push_tok(eot, sup);
             }
@@ -225,14 +234,31 @@ std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
 std::vector<i32> encode_chat(const Tokenizer& tk, ChatStyle style,
                               const std::vector<Message>& msgs,
                               bool add_generation_prompt,
-                              std::vector<u8>* loss_mask) {
+                              std::vector<u8>* loss_mask,
+                              std::vector<int>* image_positions,
+                              int image_tokens) {
     std::vector<i32> ids;
     std::vector<u8> mask;
+
+    // The placeholder token the vision features will be written over. When
+    // the vocabulary does not have it, the unknown token is used: the
+    // position still exists, which is what matters.
+    i32 pad_id = tk.token_to_id(kImagePadToken);
+    if (pad_id < 0) pad_id = (tk.unk_id() >= 0) ? tk.unk_id() : 0;
+    const int n_img = (image_tokens > 0) ? image_tokens : 1;
 
     for (const ChatSegment& s : render_chat(tk, style, msgs, add_generation_prompt)) {
         if (s.is_token) {
             ids.push_back(s.token);
             mask.push_back(s.supervised ? 1 : 0);
+            continue;
+        }
+        if (s.is_image) {
+            for (int i = 0; i < n_img; ++i) {
+                if (image_positions) image_positions->push_back(static_cast<int>(ids.size()));
+                ids.push_back(pad_id);
+                mask.push_back(s.supervised ? 1 : 0);
+            }
             continue;
         }
         const std::vector<i32> body = tk.encode(s.text, false, false);

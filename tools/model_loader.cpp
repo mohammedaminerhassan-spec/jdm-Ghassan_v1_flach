@@ -4,9 +4,11 @@
 #include "core/ops.h"
 #include "format/legacy_gai_format.h"
 #include "format/gguf_codec.h"
+#include "vision/vision.h"
 
 #include <filesystem>
 #include <fstream>
+#include <map>
 
 namespace fs = std::filesystem;
 
@@ -187,6 +189,58 @@ const char* chat_style_name(ChatStyle s) {
         case ChatStyle::Mistral: return "mistral";
         default:                 return "native";
     }
+}
+
+std::unique_ptr<VisionTower> load_vision_tower(const std::string& path,
+                                              VisionConfig* out_cfg) {
+    GGUFReader r;
+    if (!r.open(path)) return nullptr;
+
+    VisionConfig cfg;
+    cfg.image_size  = static_cast<int>(r.get_uint("ghassan.vision.image_size", 0));
+    cfg.patch_size  = static_cast<int>(r.get_uint("ghassan.vision.patch_size", 0));
+    cfg.dim         = static_cast<int>(r.get_uint("ghassan.vision.dim", 0));
+    cfg.layers      = static_cast<int>(r.get_uint("ghassan.vision.layers", 0));
+    cfg.heads       = static_cast<int>(r.get_uint("ghassan.vision.heads", 0));
+    cfg.mlp_ratio   = static_cast<int>(r.get_uint("ghassan.vision.mlp_ratio", 4));
+    cfg.out_dim     = static_cast<int>(r.get_uint("ghassan.vision.out_dim", 0));
+    cfg.proj_hidden = static_cast<int>(r.get_uint("ghassan.vision.proj_hidden", 0));
+    cfg.channels    = static_cast<int>(r.get_uint("ghassan.vision.channels", 3));
+
+    if (cfg.image_size <= 0 || cfg.patch_size <= 0 || cfg.dim <= 0 ||
+        cfg.layers <= 0 || cfg.heads <= 0 || cfg.out_dim <= 0) {
+        return nullptr;  // not a multimodal checkpoint
+    }
+    if (cfg.image_size % cfg.patch_size != 0) {
+        log_warn("[vision] the image size is not a multiple of the patch size");
+        return nullptr;
+    }
+    if (cfg.dim % cfg.heads != 0) {
+        log_warn("[vision] the tower width is not a multiple of the head count");
+        return nullptr;
+    }
+
+    std::map<std::string, Tensor> weights;
+    for (const std::string& name : VisionTower::weight_names(cfg)) {
+        const GGUFTensorInfo* ti = r.find_tensor(name);
+        if (!ti) {
+            log_warn("[vision] the file has no tensor '" + name + "'");
+            return nullptr;
+        }
+        Tensor t = r.read_tensor_f32(name);
+        if (!t.defined()) return nullptr;
+        weights[name] = std::move(t);
+    }
+
+    auto tower = std::make_unique<VisionTower>(cfg, weights);
+    if (!tower->valid()) {
+        log_error("[vision] the vision weights do not match the declared config");
+        return nullptr;
+    }
+    if (out_cfg) *out_cfg = cfg;
+    log_info(strfmt("[vision] tower loaded: %d layers, dim %d, %d patches, output %d",
+                    cfg.layers, cfg.dim, cfg.n_patches(), cfg.out_dim));
+    return tower;
 }
 
 }  // namespace gai

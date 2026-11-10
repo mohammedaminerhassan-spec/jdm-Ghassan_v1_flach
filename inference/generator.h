@@ -5,6 +5,7 @@
 #include "tokenizer/chat_template.h"
 #include "inference/kv_cache.h"
 #include "inference/sampler.h"
+#include "vision/vision.h"
 #include <functional>
 
 namespace gai {
@@ -36,7 +37,10 @@ public:
 
     void reset();
 
-    void prefill(const std::vector<i32>& tokens, int front_drop = 0);
+    void prefill(const std::vector<i32>& tokens, int front_drop = 0,
+                 const float* embed_override = nullptr,
+                 const int* override_pos = nullptr,
+                 int n_override = 0);
 
     std::vector<i32> generate(const GenerationConfig& cfg, StreamFn on_token = nullptr);
 
@@ -54,12 +58,24 @@ public:
     KVCache& cache() { return cache_; }
     int context_used() const { return cache_.length(); }
 
+    // Attaches a vision tower. The tower must be configured for the
+    // language model's hidden size.
+    void set_vision(std::unique_ptr<VisionTower> tower) { vision_ = std::move(tower); }
+    bool has_vision() const { return vision_ != nullptr && vision_->valid(); }
+
 private:
 
     float* decode_step(i32 token, int position);
 
     float* decode_step_logits(i32 token, int position);
-    void   forward_prefill(const std::vector<i32>& tokens, int start_pos);
+    void   forward_prefill(const std::vector<i32>& tokens, int start_pos,
+                           const float* embed_override = nullptr,
+                           const int* override_pos = nullptr,
+                           int n_override = 0);
+
+    // The optional vision tower: it turns an image into the embeddings that
+    // replace the image placeholder tokens in the prompt.
+    std::unique_ptr<VisionTower> vision_;
 
     static constexpr int FAST_TOPK_MAX = 128;
     static constexpr int FAST_HIST_MAX = 2048;
