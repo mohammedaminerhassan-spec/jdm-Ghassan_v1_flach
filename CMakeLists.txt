@@ -86,7 +86,8 @@ file(GLOB_RECURSE GAI_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_SOURCE_DIR}/dataset/*.cpp
      ${CMAKE_SOURCE_DIR}/inference/*.cpp
      ${CMAKE_SOURCE_DIR}/quantization/*.cpp
-     ${CMAKE_SOURCE_DIR}/evaluation/*.cpp)
+     ${CMAKE_SOURCE_DIR}/evaluation/*.cpp
+     ${CMAKE_SOURCE_DIR}/server/*.cpp)
 
 add_library(gai_core STATIC ${GAI_SOURCES})
 target_include_directories(gai_core PUBLIC ${CMAKE_SOURCE_DIR})
@@ -148,6 +149,10 @@ endif()
 
 if(WIN32)
     target_compile_definitions(gai_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    if(NOT MSVC)
+        # MinGW needs the Winsock import library spelled out.
+        target_link_libraries(gai_core PUBLIC ws2_32)
+    endif()
 endif()
 
 if(NOT MSVC)
@@ -155,7 +160,8 @@ if(NOT MSVC)
     target_link_libraries(gai_core PUBLIC Threads::Threads)
 endif()
 
-add_executable(ghassan-ai      tools/inference_cli.cpp tools/cli_common.cpp)
+add_executable(ghassan-ai      tools/inference_cli.cpp tools/serve_cli.cpp
+                                 tools/model_loader.cpp tools/cli_common.cpp)
 add_executable(train_tokenizer tools/tokenizer_trainer_cli.cpp tools/cli_common.cpp)
 # corpus_stats disabled: depends on deleted dataset module
 add_executable(gai_train       tools/training_cli.cpp tools/cli_common.cpp)

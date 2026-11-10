@@ -20,13 +20,22 @@ enum class DType : u32 {
     I64  = 9,
 };
 
-constexpr int Q8_BLOCK = 64;
+// GGML block geometry.
+//
+// Q4_0: 32 values per block, 18 bytes (f16 scale + 16 nibbles).
+// Q8_0: 32 values per block, 34 bytes (f16 scale + 32 int8).
+//
+// The Q8_0 block used to be 64 values / 68 bytes with an f32 scale. The byte
+// ratio is identical, so the file size looked right, but the block
+// boundaries did not match GGML: any Q8_0 tensor written through this dtype
+// would have had its scale read from the wrong offset by any GGML reader.
+constexpr int Q8_BLOCK = 32;
 constexpr int Q4_BLOCK = 32;
 
 #pragma pack(push, 1)
 struct BlockQ8_0 {
-    float scale;
-    i8    q[Q8_BLOCK];
+    u16 scale;
+    i8  q[Q8_BLOCK];
 };
 struct BlockQ4_0 {
     u16 scale;
@@ -39,7 +48,7 @@ struct BlockQ4_1 {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(BlockQ8_0) == 4 + Q8_BLOCK, "BlockQ8_0 layout");
+static_assert(sizeof(BlockQ8_0) == 2 + Q8_BLOCK, "BlockQ8_0 layout");
 static_assert(sizeof(BlockQ4_0) == 2 + Q4_BLOCK / 2, "BlockQ4_0 layout");
 static_assert(sizeof(BlockQ4_1) == 4 + Q4_BLOCK / 2, "BlockQ4_1 layout");
 

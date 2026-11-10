@@ -863,12 +863,37 @@ ModelConfig GGUFReader::model_config() const {
         c.z_loss_scale      = get_float("ghassan.z_loss_scale", c.z_loss_scale);
         c.tie_embeddings    = get_bool("ghassan.tie_word_embeddings", true);
     } else {
-
         c.use_moe           = false;
         c.max_seq_len       = static_cast<int>(get_uint("llama.context_length", static_cast<uint64_t>(c.max_seq_len)));
         c.rope_theta        = get_float("llama.rope.freq_base", c.rope_theta);
         c.rms_eps           = get_float("llama.attention.layer_norm_rms_epsilon", c.rms_eps);
         c.tie_embeddings    = get_bool("llama.tie_word_embeddings", true);
+
+        // llama.cpp writes the MoE description for mixture-of-experts
+        // checkpoints. Without this the model would be read as a dense one
+        // and every expert tensor would be missing.
+        const uint64_t ne = get_uint("llama.expert_count", 0);
+        if (ne > 0 && ne <= 64) {
+            c.use_moe        = true;
+            c.num_experts    = static_cast<int>(ne);
+            c.moe_top_k      = static_cast<int>(get_uint("llama.expert_used_count", 2));
+            c.moe_expert_dim = static_cast<int>(get_uint("llama.expert_feed_forward_length",
+                                                         static_cast<uint64_t>(c.intermediate_size)));
+            c.moe_shared     = false;  // llama.cpp has no shared expert
+            c.moe_aux_scale  = get_float("llama.moe.aux_scale", 0.0f);
+        }
+
+        // Qwen3 normalises the query and the key per head before the
+        // attention. llama.cpp writes no flag for it: the presence of the
+        // tensors is the signal.
+        if (!c.use_qk_norm) {
+            for (const auto& ti : tensor_infos_) {
+                if (ti.name.find("attn_q_norm.weight") != std::string::npos) {
+                    c.use_qk_norm = true;
+                    break;
+                }
+            }
+        }
     }
     c.validate();
     return c;
@@ -913,10 +938,48 @@ bool GGUFReader::load_tokenizer(Tokenizer& tk) const {
             merges.emplace_back(m.substr(0, rsp), m.substr(rsp + 1));
         }
     }
-    uint64_t bits = get_uint("ghassan.normalizer.config", 0);
-    NormalizerConfig ncfg = (bits != 0) ? NormalizerConfig::unpack(static_cast<u32>(bits))
-                                        : NormalizerConfig{};
-    tk.build(tokenizer_tokens_, merges, ncfg);
+
+    // A foreign (HuggingFace) vocabulary brings its own pre-tokenizer and
+    // normalization behaviour. Applying the Gai normalizer to it would
+    // strip diacritics / lowercase the text and produce token ids the model
+    // was never trained on: a silent train/serve skew.
+    const std::string pre = get_string("tokenizer.ggml.pre", "gpt-2");
+    Tokenizer::VocabOptions opts;
+    opts.foreign = true;
+    opts.pretok  = (pre == "gpt-2" || pre == "llama3" || pre == "llama-v3")
+                       ? Tokenizer::PreTokMode::Gpt2
+                       : Tokenizer::PreTokMode::Ghassan;
+    opts.add_bos = get_bool("tokenizer.ggml.add_bos_token", false);
+    opts.add_eos = get_bool("tokenizer.ggml.add_eos_token", false);
+    opts.bos_id  = static_cast<i32>(get_uint("tokenizer.ggml.bos_token_id", 0));
+    opts.eos_id  = static_cast<i32>(get_uint("tokenizer.ggml.eos_token_id", 0));
+    opts.pad_id  = static_cast<i32>(get_uint("tokenizer.ggml.padding_token_id", 0));
+    opts.unk_id  = static_cast<i32>(get_uint("tokenizer.ggml.unknown_token_id", 0));
+    opts.default_system = get_string("ghassan.default_system", "");
+
+    // The Gai normalizer must stay off for a foreign vocabulary.
+    NormalizerConfig ncfg;
+    ncfg.strip_diacritics    = false;
+    ncfg.strip_tatweel       = false;
+    ncfg.unify_presentation  = false;
+    ncfg.arabic_digits_ascii = false;
+    ncfg.fold_letters        = false;
+    ncfg.lowercase_latin     = false;
+    ncfg.collapse_whitespace = false;
+    ncfg.strip_control       = false;
+    ncfg.strip_zero_width    = false;
+    ncfg.collapse_repeats    = false;
+    ncfg.fold_fullwidth      = false;
+
+    tk.build(tokenizer_tokens_, merges, ncfg, opts);
+
+    if (!tk.has_byte_map()) {
+        log_error(strfmt("gguf_format: the tokenizer in this file has no byte-level "
+                         "alphabet (pre='%s', vocab=%d). The Gai engine encodes against "
+                         "byte-level BPE only; SentencePiece/unigram vocabularies are "
+                         "not supported yet.", pre.c_str(), tk.vocab_size()));
+        return false;
+    }
     return tk.vocab_size() > 0;
 }
 
@@ -947,6 +1010,10 @@ std::string llama_tensor_name(const std::string& internal) {
     if (rest == "w_gate")    return blk + "ffn_gate.weight";
     if (rest == "w_up")      return blk + "ffn_up.weight";
     if (rest == "w_down")    return blk + "ffn_down.weight";
+    // QK-norm (Qwen3): the query and the key are normalised per head
+    // before the attention. llama.cpp stores them next to the projection.
+    if (rest == "qk_qnorm")  return blk + "attn_q_norm.weight";
+    if (rest == "qk_knorm")  return blk + "attn_k_norm.weight";
     return {};
 }
 
@@ -1033,6 +1100,20 @@ static float fp16_to_f32(uint16_t h) {
     float v; memcpy(&v, &bits, 4); return v;
 }
 
+// Reinterprets a flat CPU tensor as a 3D one without touching the data. The
+// GGUF writer emits the dimensions reversed, so a [a, b, c] tensor becomes
+// GGUF dims [c, b, a] -- which is the llama.cpp layout for the MoE expert
+// tensors.
+static Tensor reshape_3d(const Tensor& src, i64 a, i64 b, i64 c) {
+    GAI_CHECK(src.dtype() == DType::F32 && src.device() == Device::CPU,
+              "gguf_format: reshape_3d expects an f32 CPU tensor");
+    GAI_CHECK(src.numel() == a * b * c, "gguf_format: reshape_3d element count mismatch");
+    Tensor out({a, b, c}, DType::F32, Device::CPU);
+    memcpy(out.data_ptr(), src.data_ptr(), static_cast<size_t>(src.nbytes()));
+    out.set_name(src.name());
+    return out;
+}
+
 Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
     const GGUFTensorInfo* ti = find_tensor(name);
     GAI_CHECK(ti != nullptr, "gguf_format: tensor not found: " + name);
@@ -1071,11 +1152,21 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
     GAI_CHECK(static_cast<size_t>(out.numel()) == nelems, "gguf shape mismatch for " + name);
 
     float* dst = out.f32();
+    // Statistics are accumulated in the same pass that fills the tensor, so
+    // the integrity check costs no extra memory traffic.
+    double sumsq = 0.0;
+    i64   nonfinite = 0;
+    auto acc = [&](float v) {
+        if (!std::isfinite(v)) { ++nonfinite; return; }
+        sumsq += static_cast<double>(v) * static_cast<double>(v);
+    };
+
     if (ti->type == GGMLType::F32) {
         memcpy(dst, raw.data(), nelems * 4);
+        for (size_t i = 0; i < nelems; ++i) acc(dst[i]);
     } else if (ti->type == GGMLType::F16) {
         const uint16_t* src = reinterpret_cast<const uint16_t*>(raw.data());
-        for (size_t i = 0; i < nelems; ++i) dst[i] = fp16_to_f32(src[i]);
+        for (size_t i = 0; i < nelems; ++i) { dst[i] = fp16_to_f32(src[i]); acc(dst[i]); }
     } else if (ti->type == GGMLType::Q8_0) {
         size_t nblocks = (nelems + 31) / 32;
         for (size_t b = 0; b < nblocks; ++b) {
@@ -1083,6 +1174,7 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
             float scale = fp16_to_f32(*reinterpret_cast<const uint16_t*>(block));
             for (size_t i = 0; i < 32 && b*32+i < nelems; ++i) {
                 dst[b*32+i] = static_cast<int8_t>(block[2+i]) * scale;
+                acc(dst[b*32+i]);
             }
         }
     } else if (ti->type == GGMLType::Q4_0) {
@@ -1096,13 +1188,25 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
                 int q0 = static_cast<int>(byte & 0xF) - 8;
                 int q1 = static_cast<int>(byte >> 4) - 8;
                 dst[b*32 + j] = static_cast<float>(q0) * scale;
-                if (b*32 + j + 16 < nelems)
+                acc(dst[b*32 + j]);
+                if (b*32 + j + 16 < nelems) {
                     dst[b*32 + j + 16] = static_cast<float>(q1) * scale;
+                    acc(dst[b*32 + j + 16]);
+                }
             }
         }
     } else {
         GAI_FAIL("gguf_format: unsupported quantization type for reading: " +
                  std::to_string(static_cast<uint32_t>(ti->type)));
+    }
+
+    if (nonfinite > 0) {
+        GAI_FAIL(strfmt("gguf_format: tensor '%s' contains %lld non-finite value(s); "
+                        "the file is corrupt or was written with a different layout",
+                        name.c_str(), static_cast<long long>(nonfinite)));
+    }
+    if (nelems > 0 && sumsq == 0.0) {
+        log_warn(strfmt("gguf_format: tensor '%s' is entirely zero (norm 0)", name.c_str()));
     }
     out.set_name(name);
     return out;
@@ -1118,9 +1222,17 @@ bool load_model_from_gguf(const std::string& path, Model& model) {
         log_error("gguf_format: cannot open: " + path);
         return false;
     }
+    bool lm_head_from_emb = false;
     for (Parameter* p : model.parameters()) {
 
         const GGUFTensorInfo* ti = r.find_weight(p->name);
+        if (!ti && p->name == "lm_head") {
+            // No separate output projection in the file: fall back to the
+            // token embedding, like llama.cpp does for tied checkpoints that
+            // were exported without an output.weight.
+            ti = r.find_weight("tok_embeddings");
+            if (ti) lm_head_from_emb = true;
+        }
         if (!ti) {
             log_error("gguf_format: missing tensor: " + p->name);
             return false;
@@ -1134,6 +1246,10 @@ bool load_model_from_gguf(const std::string& path, Model& model) {
             return false;
         }
         p->w.copy_from(t);
+    }
+    if (lm_head_from_emb) {
+        log_info("[gguf] no output.weight in the file: the token embedding is used "
+                 "as the output projection");
     }
 
     if (model.config().moe_aux_free) {
@@ -1387,21 +1503,28 @@ void export_model_gguf(const std::string& path, Model& model,
                       "gguf_format: no llama_moe name for tensor: " + p->name +
                       " (shared experts / QK-norm have no Ollama equivalent; use native GGUF)");
 
-            if (p->name.find("moe_down") != std::string::npos && cpu.shape().size() == 2) {
-                const i64 rows = cpu.shape()[0], cols = cpu.shape()[1];
+            // The expert tensors must be 3D (one block per expert) to match
+            // llama.cpp:
+            //   ffn_gate_exps / ffn_up_exps : [n_embd, n_ff, n_expert]
+            //   ffn_down_exps               : [n_ff,  n_embd, n_expert]
+            // The Gai layout stores the experts contiguously
+            //   moe_gate / moe_up : [ne*E, d] -> per expert [E, d]
+            //   moe_down          : [ne*d, E] -> per expert [d, E]
+            // which is exactly the per-expert block llama.cpp expects, so the
+            // conversion is a reshape and NOT a transpose.
+            if (p->name.find("moe_gate") != std::string::npos ||
+                p->name.find("moe_up") != std::string::npos) {
                 const i64 ne = cfg.num_experts, E = cfg.moe_expert_dim, d = cfg.hidden_size;
-                GAI_CHECK(rows == ne * d && cols == E,
-                          "gguf_format: unexpected moe_down shape for transpose");
-                Tensor t({ne, E, d}, DType::F32, Device::CPU);
-                const float* s = cpu.f32();
-                float* o = t.f32();
-                for (i64 e = 0; e < ne; ++e)
-                    for (i64 r = 0; r < d; ++r)
-                        for (i64 c = 0; c < E; ++c)
-                            o[(static_cast<size_t>(e) * E + c) * d + r] =
-                                s[(static_cast<size_t>(e) * d + r) * E + c];
-                t.set_name(cpu.name());
-                cpu = std::move(t);
+                GAI_CHECK(cpu.shape().size() == 2 && cpu.shape()[0] == ne * E &&
+                          cpu.shape()[1] == d,
+                          "gguf_format: unexpected moe_gate/moe_up shape for llama_moe export");
+                cpu = reshape_3d(cpu, ne, E, d);
+            } else if (p->name.find("moe_down") != std::string::npos) {
+                const i64 ne = cfg.num_experts, E = cfg.moe_expert_dim, d = cfg.hidden_size;
+                GAI_CHECK(cpu.shape().size() == 2 && cpu.shape()[0] == ne * d &&
+                          cpu.shape()[1] == E,
+                          "gguf_format: unexpected moe_down shape for llama_moe export");
+                cpu = reshape_3d(cpu, ne, d, E);
             }
         }
         size_t est = ggml_nbytes(dt, static_cast<size_t>(p->numel()));

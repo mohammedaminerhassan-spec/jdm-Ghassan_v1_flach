@@ -1,6 +1,7 @@
 build/
 build_test/
 build_cpu/
+build_msys/
 out/
 .vs/
 *.user

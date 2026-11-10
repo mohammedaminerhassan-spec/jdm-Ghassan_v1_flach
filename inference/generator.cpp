@@ -159,10 +159,17 @@ float* Generator::decode_step_logits(i32 token, int position) {
             device_copy(vdst, dev, vp, dev, bytes);
         }
 
-        ops::attention_decode_ring(dev, q_.f32(), cache_.k(l), cache_.v(l), attn_.f32(),
-                                   H, KV, hd, cache_.ring_start(), cache_.pinned_prefix(),
-                                   cache_.length(), cache_.capacity(), scale, scores_.f32(),
-                                   c.sliding_window);
+        {
+            // The pinned prefix is a hint that the first few slots are a
+            // system prompt that must survive eviction. It is only valid
+            // while the cache holds at least that many tokens; a short
+            // prompt would otherwise trip the kernel's range check.
+            const int pinned = std::min(cache_.pinned_prefix(), cache_.length());
+            ops::attention_decode_ring(dev, q_.f32(), cache_.k(l), cache_.v(l), attn_.f32(),
+                                       H, KV, hd, cache_.ring_start(), pinned,
+                                       cache_.length(), cache_.capacity(), scale, scores_.f32(),
+                                       c.sliding_window);
+        }
 
         ops::linear_forward(dev, attn_.f32(), L.wo.w.f32(), proj_.f32(), 1, qd, d);
         ops::add_inplace(dev, x_.f32(), proj_.f32(), d);
@@ -497,7 +504,11 @@ std::string Generator::chat(const std::vector<Message>& msgs, const GenerationCo
     GAI_CHECK(cfg.max_context == 0 || cfg.max_context == max_context_,
               "GenerationConfig::max_context must match the Generator context");
     reset();
-    std::vector<i32> ids = ChatTemplate::encode(tok_, msgs, true, nullptr);
+    // The chat format is a property of the tokenizer, not of the engine:
+    // native Gai checkpoints use <|system|>/<|user|>/<|assistant|>, HF
+    // checkpoints use ChatML / Llama-3 / Mistral markers.
+    const ChatStyle style = detect_chat_style(tok_);
+    std::vector<i32> ids = encode_chat(tok_, style, msgs, true, nullptr);
 
     int budget = max_context_ - cfg.max_new_tokens - 4;
     int drop = 0;

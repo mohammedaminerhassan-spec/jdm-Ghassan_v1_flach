@@ -11,6 +11,9 @@ void utf8_encode(u32 cp, std::string& out);
 std::string utf8_from_cp(u32 cp);
 std::vector<u32> utf8_to_codepoints(const std::string& s);
 std::string codepoints_to_utf8(const std::vector<u32>& cps);
+// Decodes a raw byte buffer as UTF-8. Invalid or truncated sequences are
+// replaced with U+FFFD instead of being dropped.
+std::string utf8_from_bytes(const std::string& bytes);
 size_t utf8_length(const std::string& s);
 bool   utf8_valid(const std::string& s);
 
@@ -31,6 +34,14 @@ bool is_emoji(u32 cp);
 bool is_zero_width(u32 cp);
 bool is_arabizi_digit(u32 cp);
 bool is_control(u32 cp);
+
+// Unicode general categories used by the GPT-2 pre-tokenizer (\p{L}, \p{N}).
+// Table-driven approximations of the full Unicode database: they cover every
+// script the Gai engine trains on (Latin, Greek, Cyrillic, Hebrew, Arabic,
+// Indic, CJK, Hangul, Kana, ...) and degrade to "not a letter" for the long
+// tail instead of shipping a 200 KB table.
+bool is_unicode_letter(u32 cp);
+bool is_unicode_number(u32 cp);
 
 u32  arabic_presentation_to_base(u32 cp);
 u32  arabic_digit_to_ascii(u32 cp);

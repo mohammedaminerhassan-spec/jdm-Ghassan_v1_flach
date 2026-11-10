@@ -37,4 +37,8 @@ void enable_utf8_console();
 
 void apply_common_flags(const Args& a);
 
+// Escapes a string for a JSON string literal. UTF-8 sequences are passed
+// through unchanged (they are valid JSON); control characters become \uXXXX.
+std::string json_escape(const std::string& s);
+
 }

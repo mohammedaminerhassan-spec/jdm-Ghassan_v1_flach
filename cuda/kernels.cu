@@ -201,7 +201,14 @@ __device__ __forceinline__ float block_sum(float v, float* smem) {
     if (wid == 0) v = warp_sum(v);
     if (threadIdx.x == 0) smem[0] = v;
     __syncthreads();
-    return smem[0];
+    float r = smem[0];
+    // The caller may reuse the same buffer for another reduction (e.g. a
+    // max reduction right after a sum reduction). Without this barrier the
+    // next write to smem[0] could land while a lagging warp is still
+    // reading the result, and the reader would observe the other
+    // reduction's partial value.
+    __syncthreads();
+    return r;
 }
 
 __device__ __forceinline__ float block_max(float v, float* smem) {
@@ -215,7 +222,11 @@ __device__ __forceinline__ float block_max(float v, float* smem) {
     if (wid == 0) v = warp_max(v);
     if (threadIdx.x == 0) smem[0] = v;
     __syncthreads();
-    return smem[0];
+    float r = smem[0];
+    // See block_sum: the buffer is released only once every thread has read
+    // the result.
+    __syncthreads();
+    return r;
 }
 
 static const char* cublas_status_name(cublasStatus_t s) {

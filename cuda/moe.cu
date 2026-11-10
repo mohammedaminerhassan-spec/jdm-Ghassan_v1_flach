@@ -119,7 +119,9 @@ __global__ void k_route(const float* logits, float* probs, i32* idx, float* w,
 
     const float* lg = logits + t * ne;
     const bool train = (probs != nullptr);
-    __shared__ float sred[256];
+    // See k_route_bias: the max and the sum must not share a staging buffer.
+    __shared__ float smax[256];
+    __shared__ float ssum[256];
 
     float lmx = -FLT_MAX;
     for (int e = tid; e < ne; e += W) {
@@ -127,10 +129,10 @@ __global__ void k_route(const float* logits, float* probs, i32* idx, float* w,
         if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
         if (v > lmx) lmx = v;
     }
-    sred[tid] = lmx;
+    smax[tid] = lmx;
     __syncthreads();
-    float mx = sred[0];
-    for (int i = 1; i < W; ++i) mx = fmaxf(mx, sred[i]);
+    float mx = smax[0];
+    for (int i = 1; i < W; ++i) mx = fmaxf(mx, smax[i]);
 
     float lsum = 0.0f;
     for (int e = tid; e < ne; e += W) {
@@ -138,10 +140,10 @@ __global__ void k_route(const float* logits, float* probs, i32* idx, float* w,
         if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
         lsum += expf(v - mx);
     }
-    sred[tid] = lsum;
+    ssum[tid] = lsum;
     __syncthreads();
     float sum = 0.0f;
-    for (int i = 0; i < W; ++i) sum += sred[i];
+    for (int i = 0; i < W; ++i) sum += ssum[i];
     const float inv = sum > 1e-8f ? (1.0f / sum) : 0.0f;
 
     if (probs) {
@@ -195,27 +197,33 @@ __global__ void k_route_bias(const float* logits, const float* bias,
     if (t >= N) return;
     const float* lg = logits + t * ne;
     const bool train = (probs != nullptr);
-    __shared__ float sred[256];
+    // Two separate staging buffers. With a single buffer the write of the
+    // softmax sum (ssum[tid]) is unordered with respect to the read of the
+    // softmax max (smax[i]) by other warps: a fast warp could overwrite the
+    // max it is still reading and every thread would end up with a
+    // different mx, so the row would no longer be a proper softmax.
+    __shared__ float smax[256];
+    __shared__ float ssum[256];
     float lmx = -FLT_MAX;
     for (int e = tid; e < ne; e += W) {
         float v = lg[e];
         if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
         if (v > lmx) lmx = v;
     }
-    sred[tid] = lmx;
+    smax[tid] = lmx;
     __syncthreads();
-    float mx = sred[0];
-    for (int i = 1; i < W; ++i) mx = fmaxf(mx, sred[i]);
+    float mx = smax[0];
+    for (int i = 1; i < W; ++i) mx = fmaxf(mx, smax[i]);
     float lsum = 0.0f;
     for (int e = tid; e < ne; e += W) {
         float v = lg[e];
         if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
         lsum += expf(v - mx);
     }
-    sred[tid] = lsum;
+    ssum[tid] = lsum;
     __syncthreads();
     float sum = 0.0f;
-    for (int i = 0; i < W; ++i) sum += sred[i];
+    for (int i = 0; i < W; ++i) sum += ssum[i];
     const float inv = sum > 1e-8f ? (1.0f / sum) : 0.0f;
     if (probs) {
         float* pr = probs + t * ne;

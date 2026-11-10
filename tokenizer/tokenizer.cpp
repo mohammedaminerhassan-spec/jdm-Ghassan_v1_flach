@@ -22,6 +22,64 @@ const std::vector<std::string>& special_token_strings() {
 static constexpr u32 GTOK_MAGIC   = 0x4B4F5447u;
 static constexpr u32 GTOK_VERSION = 1u;
 
+// ---------------------------------------------------------------------------
+// GPT-2 byte-level alphabet
+// ---------------------------------------------------------------------------
+// Reference implementation (GPT-2 encoder.py):
+//   bs = printable ASCII + 0xA1..0xAC + 0xAE..0xFF
+//   every byte not in bs is appended, in increasing order, to the private-use
+//   area starting at 0x100.
+const std::string& gpt2_byte_token(u8 b) {
+    static std::array<std::string, 256> table;
+    static bool built = false;
+    if (!built) {
+        bool in_set[256] = {false};
+        auto mark = [&](int lo, int hi) {
+            for (int v = lo; v <= hi; ++v) in_set[v] = true;
+        };
+        mark(0x21, 0x7E);
+        mark(0xA1, 0xAC);
+        mark(0xAE, 0xFF);
+
+        int n = 0;
+        for (int v = 0; v < 256; ++v) {
+            if (in_set[v]) {
+                if (v < 0x80) {
+                    table[v] = std::string(1, static_cast<char>(v));
+                } else {
+                    // The reference table holds CODEPOINTS, so a byte like
+                    // 0xA1 is the character U+00A1 and must be UTF-8 encoded
+                    // (2 bytes), not emitted as a raw latin-1 byte.
+                    std::string s;
+                    utf8_encode(static_cast<u32>(v), s);
+                    table[v] = s;
+                }
+            } else {
+                // 0x100 + n, encoded as UTF-8
+                u32 cp = static_cast<u32>(256 + n);
+                ++n;
+                std::string s;
+                utf8_encode(cp, s);
+                table[v] = s;
+            }
+        }
+        built = true;
+    }
+    return table[b];
+}
+
+// Inverse of gpt2_byte_token(): maps the single character a byte-level
+// token is made of back to the raw byte it stands for.
+const std::unordered_map<std::string, u8>& gpt2_byte_decoder() {
+    static std::unordered_map<std::string, u8> table;
+    static bool built = false;
+    if (!built) {
+        for (int b = 0; b < 256; ++b) table[gpt2_byte_token(static_cast<u8>(b))] = static_cast<u8>(b);
+        built = true;
+    }
+    return table;
+}
+
 void Tokenizer::init_empty(const NormalizerConfig& ncfg) {
     vocab_.clear();
     token_ids_.clear();
@@ -31,14 +89,38 @@ void Tokenizer::init_empty(const NormalizerConfig& ncfg) {
     for (const auto& s : special_token_strings()) vocab_.push_back(s);
     for (int b = 0; b < 256; ++b) vocab_.push_back(std::string(1, static_cast<char>(b)));
     finalize_index();
+    add_bos_ = true;
+    rebuild_byte_map();
 }
 
 void Tokenizer::build(const std::vector<std::string>& vocab,
                       const std::vector<std::pair<std::string, std::string>>& merges,
                       const NormalizerConfig& ncfg) {
+    VocabOptions o;
+    o.foreign = false;
+    o.pretok  = PreTokMode::Ghassan;
+    o.add_bos = true;
+    o.add_eos = false;
+    build(vocab, merges, ncfg, o);
+}
+
+void Tokenizer::build(const std::vector<std::string>& vocab,
+                      const std::vector<std::pair<std::string, std::string>>& merges,
+                      const NormalizerConfig& ncfg,
+                      const VocabOptions& opts) {
     vocab_ = vocab;
     norm_.set_config(ncfg);
     finalize_index();
+
+    foreign_       = opts.foreign;
+    pretok_mode_   = opts.pretok;
+    add_bos_       = opts.add_bos;
+    add_eos_       = opts.add_eos;
+    bos_id_        = opts.bos_id;
+    eos_id_        = opts.eos_id;
+    pad_id_        = opts.pad_id;
+    unk_id_        = opts.unk_id;
+    default_system_ = opts.default_system;
 
     merges_.clear();
     merges_.reserve(merges.size() * 2);
@@ -64,6 +146,101 @@ void Tokenizer::build(const std::vector<std::string>& vocab,
         }
     }
     { std::lock_guard<std::mutex> lk(*cache_mu_); cache_.clear(); }
+    rebuild_byte_map();
+    if (foreign_ && !missing_bytes_.empty()) {
+        // Only printable ASCII matters in practice; control characters and
+        // the rare Latin-1 letters that a pruned alphabet lacks are not worth
+        // a warning on every load.
+        std::string list;
+        size_t printable_missing = 0;
+        for (int b : missing_bytes_) {
+            if (b >= 0x20 && b <= 0x7E) {
+                ++printable_missing;
+                if (list.size() < 64) list += strfmt("0x%02X ", b);
+            }
+        }
+        if (printable_missing > 0) {
+            log_warn(strfmt("[tokenizer] %zu printable byte(s) have no byte-level entry in "
+                            "this vocabulary (%s) and will map to the unknown token",
+                            printable_missing, list.c_str()));
+        }
+    }
+}
+
+// Build the byte -> token id table for a byte-level BPE vocabulary.
+//
+// Two layouts are supported:
+//   1. the native Gai layout: token id 16+b is the single byte b
+//   2. the GPT-2 layout: the token whose text is gpt2_byte_token(b)
+//
+// Layout 2 is what every HuggingFace byte-level vocabulary uses (GPT-2,
+// Qwen, Llama-3, ...). Without this table the BPE merge table can never
+// match: merges are keyed on real token ids but the base nodes were
+// addressed as 16+byte, so every merge lookup missed and the encoder
+// emitted raw byte ids that decode to unrelated characters.
+void Tokenizer::rebuild_byte_map() {
+    byte_to_id_.fill(-1);
+    byte_map_valid_ = false;
+    missing_bytes_.clear();
+
+    // Layout 1: native .gtok layout (specials, then the 256 raw bytes).
+    bool native_ok = vocab_.size() >= static_cast<size_t>(special::COUNT) + 256;
+    if (native_ok) {
+        for (int b = 0; b < 256; ++b) {
+            const std::string& t = vocab_[static_cast<size_t>(special::COUNT) + b];
+            if (t.size() != 1 || static_cast<u8>(t[0]) != static_cast<u8>(b)) {
+                native_ok = false;
+                break;
+            }
+            byte_to_id_[static_cast<size_t>(b)] = special::COUNT + b;
+        }
+    }
+    if (native_ok) {
+        byte_map_valid_ = true;
+        digits_individual_ = false;
+        return;
+    }
+
+    // Layout 2: GPT-2 byte-level alphabet. The encoded form of a byte is a
+    // single character, so it can only collide with another byte's encoding
+    // if the mapping is not injective -- it is, by construction.
+    bool printable_ok = true;
+    for (int b = 0; b < 256; ++b) {
+        const std::string& enc = gpt2_byte_token(static_cast<u8>(b));
+        auto it = token_ids_.find(enc);
+        if (it == token_ids_.end()) {
+            if (b >= 0x20 && b <= 0x7E) printable_ok = false;
+            missing_bytes_.push_back(b);
+            continue;
+        }
+        byte_to_id_[static_cast<size_t>(b)] = it->second;
+    }
+    // A vocabulary is usable when every printable ASCII byte is
+    // representable. Missing bytes (rare, e.g. a pruned alphabet) fall back
+    // to the unknown token, exactly like a HuggingFace tokenizer that has no
+    // byte-level entry for them.
+    byte_map_valid_ = printable_ok;
+    digits_individual_ = detect_digits_individual();
+}
+
+// A byte-level BPE vocabulary that was trained with HuggingFace's
+// `Digits(individual_digits=true)` pre-tokenizer contains the ten single
+// digits and no multi-digit token at all. A vocabulary whose trainer did
+// merge digits contains multi-digit tokens.
+bool Tokenizer::detect_digits_individual() const {
+    for (char c = '0'; c <= '9'; ++c) {
+        if (token_ids_.find(std::string(1, c)) == token_ids_.end()) return false;
+    }
+    for (const auto& kv : token_ids_) {
+        const std::string& t = kv.first;
+        if (t.size() < 2) continue;
+        bool all_digits = true;
+        for (char c : t) {
+            if (c < '0' || c > '9') { all_digits = false; break; }
+        }
+        if (all_digits) return false;
+    }
+    return true;
 }
 
 void Tokenizer::finalize_index() {
@@ -138,7 +315,11 @@ void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const
     std::vector<Node> nodes;
     nodes.reserve(piece.size());
     for (size_t i = 0; i < piece.size(); ++i) {
-        i32 id = special::COUNT + static_cast<i32>(static_cast<u8>(piece[i]));
+        const u8 b = static_cast<u8>(piece[i]);
+        // Foreign (byte-level) vocabularies address their byte tokens by
+        // the real vocab id, not by the native 16+byte convention.
+        i32 id = byte_map_valid_ ? byte_to_id_[b] : (special::COUNT + static_cast<i32>(b));
+        if (id < 0) id = (unk_id_ >= 0) ? unk_id_ : special::UNK;
         nodes.push_back(Node{id, static_cast<int>(i) - 1,
                              (i + 1 < piece.size()) ? static_cast<int>(i) + 1 : -1, true});
     }
@@ -198,12 +379,20 @@ void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const
 
 std::vector<i32> Tokenizer::encode(const std::string& text, bool add_bos, bool add_eos) const {
     std::vector<i32> out;
-    if (add_bos) out.push_back(special::BOS);
+    // A foreign vocabulary ships its own normalization behaviour (usually
+    // none beyond the byte-level pre-tokenizer). Running the Gai normalizer
+    // over its text would strip diacritics / lowercase it and produce token
+    // ids the model was never trained on -- a silent train/serve skew.
+    if (add_bos) out.push_back(foreign_ ? bos_id_ : special::BOS);
 
-    std::string norm = norm_.normalize(text);
-    for (const Chunk& c : pre_tokenize(norm)) bpe_chunk(c.text, out);
+    const std::string norm = foreign_ ? text : norm_.normalize(text);
+    if (pretok_mode_ == PreTokMode::Gpt2) {
+        for (const Chunk& c : pre_tokenize_gpt2(norm, digits_individual_)) bpe_chunk(c.text, out);
+    } else {
+        for (const Chunk& c : pre_tokenize(norm)) bpe_chunk(c.text, out);
+    }
 
-    if (add_eos) out.push_back(special::EOS);
+    if (add_eos) out.push_back(foreign_ ? eos_id_ : special::EOS);
     return out;
 }
 
@@ -264,18 +453,64 @@ i32 Tokenizer::token_to_id(const std::string& tok) const {
 
 std::string Tokenizer::decode_one(i32 id) const { return token_text(id); }
 
-std::string Tokenizer::decode(const std::vector<i32>& ids, bool skip_special) const {
+// Maps the characters of a byte-level token back to the bytes they stand
+// for. A native vocabulary stores plain text, so the text is returned as-is.
+std::string Tokenizer::token_bytes(i32 id) const {
+    const std::string& txt = token_text(id);
+    if (!foreign_) return txt;
+
+    const auto& dec = gpt2_byte_decoder();
     std::string out;
-    out.reserve(ids.size() * 3);
-    for (i32 id : ids) {
-        if (skip_special && is_special(id)) continue;
-        out += token_text(id);
+    out.reserve(txt.size());
+    size_t i = 0;
+    while (i < txt.size()) {
+        const size_t before = i;
+        const u32 cp = utf8_decode(txt, i);
+        if (cp == 0xFFFD && i - before <= 1) {
+            out.push_back(txt[before]);
+            continue;
+        }
+        // Re-encode the codepoint as UTF-8 so it can be looked up as a key.
+        std::string key;
+        utf8_encode(cp, key);
+        auto it = dec.find(key);
+        if (it == dec.end()) {
+            // Not a byte-level character (e.g. a special token): keep it.
+            out.append(key);
+        } else {
+            out.push_back(static_cast<char>(it->second));
+        }
     }
     return out;
 }
 
+std::string Tokenizer::decode(const std::vector<i32>& ids, bool skip_special) const {
+    if (!foreign_) {
+        std::string out;
+        out.reserve(ids.size() * 3);
+        for (i32 id : ids) {
+            if (skip_special && is_special(id)) continue;
+            out += token_text(id);
+        }
+        return out;
+    }
+    // Byte-level vocabulary: every token contributes raw bytes, and the
+    // concatenation is decoded as UTF-8 at the very end (a character can be
+    // split across two tokens).
+    std::string raw;
+    raw.reserve(ids.size() * 3);
+    for (i32 id : ids) {
+        if (skip_special && is_special(id)) continue;
+        raw += token_bytes(id);
+    }
+    return utf8_from_bytes(raw);
+}
+
 std::string Tokenizer::Stream::push(i32 id) {
-    buf_ += tk_.token_text(id);
+    // For a byte-level vocabulary the token contributes raw bytes; a
+    // character may be split across two tokens, so the incomplete tail is
+    // kept in buf_ until it becomes a valid UTF-8 sequence.
+    buf_ += tk_.token_bytes(id);
 
     size_t safe = 0, i = 0;
     while (i < buf_.size()) {
@@ -371,10 +606,6 @@ bool Tokenizer::load(const std::string& path) {
     }
 
     if (vocab_.size() < static_cast<size_t>(special::COUNT) + 256) return false;
-    // [FIX P1-09] encode_with_specials() assumes id == index in
-    // special_token_strings() (it emits static_cast<i32>(s)). A malformed or
-    // incompatible .gtok with the right size but shuffled specials would
-    // otherwise remap BOS/EOS/role tokens silently. Verify the table.
     {
         const auto& specials = special_token_strings();
         for (int s = 0; s < special::COUNT; ++s) {
@@ -387,6 +618,16 @@ bool Tokenizer::load(const std::string& path) {
         if (t.size() != 1 || static_cast<u8>(t[0]) != static_cast<u8>(b)) return false;
     }
     finalize_index();
+
+    // A .gtok file is always a native Gai vocabulary.
+    foreign_     = false;
+    pretok_mode_ = PreTokMode::Ghassan;
+    add_bos_     = true;
+    add_eos_     = false;
+    bos_id_      = special::BOS;
+    eos_id_      = special::EOS;
+    pad_id_      = special::PAD;
+    unk_id_      = special::UNK;
 
     u32 nmerges = 0;
     if (!rd(f, nmerges) || nmerges > 10000000u) return false;
@@ -402,6 +643,7 @@ bool Tokenizer::load(const std::string& path) {
         merges_[(static_cast<u64>(l) << 32) | rr] = {static_cast<i32>(r), it->second};
     }
     { std::lock_guard<std::mutex> lk(*cache_mu_); cache_.clear(); }
+    rebuild_byte_map();
     return true;
 }
 

@@ -57,4 +57,17 @@ struct Chunk {
 
 std::vector<Chunk> pre_tokenize(const std::string& text);
 
+// GPT-2 / Qwen byte-level pre-tokenizer. Reproduces the reference regex
+//
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+//
+// by hand: std::regex (ECMAScript) has no lookahead, and the reference
+// `regex` module is not available in C++. Used for foreign (HF) vocabs whose
+// pre-tokenizer is declared as "gpt-2" in the GGUF metadata.
+//
+// split_digits mirrors HuggingFace's `Digits(individual_digits=true)`
+// pre-tokenizer, which some byte-level vocabularies (Qwen2/Qwen3) put in
+// front of the ByteLevel regex.
+std::vector<Chunk> pre_tokenize_gpt2(const std::string& text, bool split_digits = false);
+
 }

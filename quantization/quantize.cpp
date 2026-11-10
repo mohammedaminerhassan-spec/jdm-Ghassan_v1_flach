@@ -27,13 +27,14 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
             if (a > amax) amax = a;
         }
         if (bad) {
-            out[b].scale = 0.0f;
+            out[b].scale = fp32_to_fp16(0.0f);
             std::memset(out[b].q, 0, sizeof(out[b].q));
             continue;
         }
         float scale = amax / 127.0f;
         float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
-        out[b].scale = scale;
+        // GGML stores the Q8_0 scale as f16.
+        out[b].scale = fp32_to_fp16(scale);
         for (int i = 0; i < Q8_BLOCK; ++i) {
             int q = static_cast<int>(std::lround(x[i] * inv));
             out[b].q[i] = static_cast<i8>(std::clamp(q, -127, 127));
@@ -50,13 +51,13 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
             if (a > amax) amax = a;
         }
         if (bad) {
-            out[full].scale = 0.0f;
+            out[full].scale = fp32_to_fp16(0.0f);
             std::memset(out[full].q, 0, sizeof(out[full].q));
             return;
         }
         float scale = amax / 127.0f;
         float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
-        out[full].scale = scale;
+        out[full].scale = fp32_to_fp16(scale);
         for (i64 i = 0; i < rem; ++i) {
             int q = static_cast<int>(std::lround(x[i] * inv));
             out[full].q[i] = static_cast<i8>(std::clamp(q, -127, 127));
@@ -70,14 +71,14 @@ void dequantize_q8_0(const void* src, float* dst, i64 n) {
     const BlockQ8_0* in = static_cast<const BlockQ8_0*>(src);
     const i64 full = n / Q8_BLOCK;
     for (i64 b = 0; b < full; ++b) {
-        float s = in[b].scale;
+        float s = fp16_to_fp32(in[b].scale);
         float* o = dst + b * Q8_BLOCK;
         for (int i = 0; i < Q8_BLOCK; ++i) o[i] = static_cast<float>(in[b].q[i]) * s;
     }
     const i64 rem = n % Q8_BLOCK;
     if (rem > 0) {
         float tmp[Q8_BLOCK];
-        float s = in[full].scale;
+        float s = fp16_to_fp32(in[full].scale);
         for (int i = 0; i < Q8_BLOCK; ++i) tmp[i] = static_cast<float>(in[full].q[i]) * s;
         for (i64 i = 0; i < rem; ++i) dst[full * Q8_BLOCK + i] = tmp[i];
     }

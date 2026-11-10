@@ -1,5 +1,7 @@
 #include "tokenizer/normalizer.h"
 
+#include <cstring>
+
 namespace gai {
 
 u32 NormalizerConfig::pack() const {
@@ -229,6 +231,117 @@ std::vector<Chunk> pre_tokenize(const std::string& text) {
             }
         }
         out.push_back(std::move(c));
+    }
+    return out;
+}
+
+std::vector<Chunk> pre_tokenize_gpt2(const std::string& text, bool split_digits) {
+    std::vector<u32> cps = utf8_to_codepoints(text);
+    std::vector<Chunk> out;
+    const size_t n = cps.size();
+    size_t i = 0;
+
+    // Contractions, longest first. The reference regex lists them as
+    // 's|'t|'re|'ve|'m|'ll|'d; none is a prefix of another, so longest-match
+    // is equivalent to the ordered alternation.
+    static const char* kContractions[] = {"'ll", "'re", "'ve", "'s", "'t", "'m", "'d"};
+
+    auto emit = [&](size_t from, size_t to) {
+        if (to <= from) return;
+        Chunk c;
+        for (size_t k = from; k < to; ++k) utf8_encode(cps[k], c.text);
+        // Classify on the first non-space codepoint so " hello" is a Latin
+        // chunk rather than a Space chunk.
+        size_t probe = from;
+        while (probe < to && cps[probe] == ' ') ++probe;
+        c.kind = (probe >= to) ? ChunkKind::Space : classify(cps[probe]);
+        out.push_back(std::move(c));
+    };
+
+    while (i < n) {
+        const size_t before = i;
+
+        // --- alternative 1: contractions ---
+        if (cps[i] == '\'' && i + 1 < n) {
+            bool matched = false;
+            for (const char* con : kContractions) {
+                const size_t len = std::strlen(con);
+                if (i + len > n) continue;
+                bool ok = true;
+                for (size_t k = 0; k < len; ++k) {
+                    if (cps[i + k] != static_cast<u32>(static_cast<unsigned char>(con[k]))) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) continue;
+                emit(i, i + len);
+                i += len;
+                matched = true;
+                break;
+            }
+            if (matched) continue;
+        }
+
+        // --- alternatives 2/3/4: optional single space + a run of one class ---
+        {
+            size_t j = i;
+            const bool spaced = (cps[j] == ' ');
+            if (spaced) ++j;
+            if (j < n) {
+                const u32 c0 = cps[j];
+                const bool letter = is_unicode_letter(c0);
+                const bool number = is_unicode_number(c0);
+                const bool other = !is_whitespace(c0) && !letter && !number;
+                if (number && split_digits) {
+                    // HuggingFace `Digits(individual_digits=true)`: every digit
+                    // becomes its own pre-token. The leading space stays on
+                    // its own so it cannot be merged with a digit.
+                    size_t k = i;
+                    if (spaced) { emit(k, k + 1); k += 1; }
+                    while (k < n && is_unicode_number(cps[k])) { emit(k, k + 1); ++k; }
+                    i = k;
+                    continue;
+                }
+                if (letter || number || other) {
+                    size_t k = j;
+                    while (k < n) {
+                        const u32 c = cps[k];
+                        const bool same = letter ? is_unicode_letter(c)
+                                       : number ? is_unicode_number(c)
+                                                 : (!is_whitespace(c) && !is_unicode_letter(c) &&
+                                                    !is_unicode_number(c));
+                        if (!same) break;
+                        ++k;
+                    }
+                    emit(i, k);
+                    i = k;
+                    continue;
+                }
+            }
+        }
+
+        // --- alternatives 5/6: whitespace runs ---
+        {
+            size_t k = i;
+            while (k < n && is_whitespace(cps[k])) ++k;
+            // \s+(?!\S) matches the run minus its last char when the run is
+            // followed by a non-space (that trailing space gets glued to the
+            // next token instead). A run of a single character cannot be
+            // shortened (the backtrack would leave it empty, so the
+            // alternative fails and \s+ takes the whole run).
+            if (k < n && (k - i) >= 2) {
+                emit(i, k - 1);
+                i = k - 1;
+            } else {
+                emit(i, k);
+                i = k;
+            }
+        }
+
+        // Safety net: a branch that fails to consume anything would spin
+        // forever on a very long text.
+        if (i == before) break;
     }
     return out;
 }

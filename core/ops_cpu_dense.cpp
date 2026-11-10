@@ -144,14 +144,24 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
 
     if (!trans_a && trans_b) {
 
+        // C[m][n] += alpha * dot(A[m], B[n])
+        //
+        // B is the weight matrix: the largest operand by far. The previous
+        // order (m outer) re-read the whole weight matrix once per row of A,
+        // so a prefill of 32 tokens streamed the weights 32 times and the
+        // GEMM became purely memory bound on the weights.
+        //
+        // With n outer, every row of B is read from memory exactly once and
+        // reused across all M rows of A (A stays resident in cache). This is
+        // the single biggest CPU win in the engine.
 #ifdef GAI_OPENMP
-        #pragma omp parallel for if(M * static_cast<long long>(N) > 4096) schedule(static)
+        #pragma omp parallel for if(N > 64) schedule(static)
 #endif
-        for (int m = 0; m < M; ++m) {
-            const float* a = A + static_cast<size_t>(m) * lda;
-            float*       c = C + static_cast<size_t>(m) * ldc;
-            for (int n = 0; n < N; ++n) {
-                c[n] += alpha * dot_f32(a, B + static_cast<size_t>(n) * ldb, K);
+        for (int n = 0; n < N; ++n) {
+            const float* b = B + static_cast<size_t>(n) * ldb;
+            for (int m = 0; m < M; ++m) {
+                const float* a = A + static_cast<size_t>(m) * lda;
+                C[static_cast<size_t>(m) * ldc + n] += alpha * dot_f32(a, b, K);
             }
         }
     } else if (!trans_a && !trans_b) {
