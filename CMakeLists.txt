@@ -164,7 +164,7 @@ endif()
 add_executable(ghassan-ai      tools/inference_cli.cpp tools/serve_cli.cpp
                                  tools/model_loader.cpp tools/cli_common.cpp)
 add_executable(train_tokenizer tools/tokenizer_trainer_cli.cpp tools/cli_common.cpp)
-# corpus_stats disabled: depends on deleted dataset module
+# the dataset/ module is gone: the data pipeline is the Python one (tools/py)
 add_executable(gai_train       tools/training_cli.cpp tools/cli_common.cpp)
 
 foreach(t ghassan-ai train_tokenizer gai_train)

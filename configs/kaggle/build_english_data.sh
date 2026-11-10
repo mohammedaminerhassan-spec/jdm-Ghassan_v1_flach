@@ -100,4 +100,4 @@ find "${OUT_DIR}" -name 'train_*.gbin' -printf '%f\n' 2>/dev/null \
     | sed -E 's/^train_(.*)_[0-9]+\.gbin$/\1/' | sort -u
 
 echo ""
-echo "Done. Next: bash configs/kaggle/train_t4_fast.sh"
+echo "Done. Next: python tools/py/qlora_finetune.py --model <hf-checkpoint> --data ${OUT_DIR}/train.jsonl"

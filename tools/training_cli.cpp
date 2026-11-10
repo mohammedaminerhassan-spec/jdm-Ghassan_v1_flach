@@ -35,9 +35,9 @@ static void usage() {
     std::cout <<
     "gai_train - Ghassan AI training\n\n"
     "usage:\n"
-    "  gai_train --config configs/flash_480m_single.yaml\n"
-    "  gai_train --config configs/flash_480m_single.yaml --max-steps 100 --batch-size 2 --seq-len 256\n"
-    "  gai_train --dry-run --config configs/flash_480m_single.yaml     # report shapes/memory only\n\n"
+    "  gai_train --config <recipe.yaml>\n"
+    "  gai_train --config <recipe.yaml> --max-steps 100 --batch-size 2 --seq-len 256\n"
+    "  gai_train --dry-run --config <recipe.yaml>     # report shapes/memory only\n\n"
     "overrides (all optional, they win over the config file):\n"
     "  --data <dir> --checkpoint-dir <dir> --resume auto|none|<path>\n"
     "  --batch-size --seq-len --grad-accum --max-steps --lr --warmup --seed\n"
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
     if (args.flag("help")) { usage(); return 0; }
 
     try {
-        std::string cfg_path = args.str("config", "configs/flash_480m_single.yaml");
+        std::string cfg_path = args.str("config");
         Config cfg;
         if (fs::exists(cfg_path)) {
             cfg = Config::from_file(cfg_path);
