@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-cpu:
+    name: linux / cpu / ctest
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          sudo update-alternatives --install /usr/bin/gcc g++ $(which g++-12) 2>/dev/null || true
+          cmake --version
+          ninja --version
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DGAI_ENABLE_CUDA=OFF
+          -DGAI_ENABLE_OPENMP=ON
+          -DGAI_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: The CLI answers
+        run: ./build/bin/ghassan-ai --help
+
+  linux-sanitize:
+    name: linux / asan+ubsan
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          cmake --version
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-asan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DGAI_ENABLE_CUDA=OFF
+          -DGAI_ENABLE_OPENMP=OFF
+          -DGAI_BUILD_TESTS=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build-asan --parallel
+
+      - name: Test
+        run: ctest --test-dir build-asan --output-on-failure
+
+  windows-msvc:
+    name: windows / msvc
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DGAI_ENABLE_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  python:
+    name: python / syntax + lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile every script
+        run: python -m compileall -q tools
+
+      - name: Ruff
+        run: |
+          pip install ruff
+          ruff check tools --select=E9,F63,F7,F82 --isolated

@@ -25,6 +25,10 @@ namespace gai {
 //
 // The weights are loaded from a GGUF file, so the same tokenizer/vision
 // pair travels with the language model.
+//
+// Every tensor is shape checked when the tower is built: a checkpoint whose
+// weights do not match the declared config is rejected instead of reading
+// out of bounds during the forward pass.
 
 struct VisionConfig {
     int image_size = 336;
@@ -42,6 +46,8 @@ struct VisionConfig {
     }
     int n_patches() const { return patches_per_side() * patches_per_side(); }
     int patch_dim() const { return patch_size * patch_size * channels; }
+    int head_dim() const { return dim / heads; }
+    int mlp_hidden() const { return dim * mlp_ratio; }
 };
 
 class VisionTower {
@@ -70,10 +76,11 @@ private:
     Tensor pos_embed_;     // [n_patches, dim]
     Tensor post_ln_;       // [dim]
     std::vector<Tensor> norm1_, norm2_, qkv_, proj_, fc1_, fc2_;
+    std::vector<Tensor> norm1_b_, norm2_b_, qkv_b_, proj_b_, fc1_b_, fc2_b_;
     Tensor proj_w_;        // projector
-    Tensor proj_b_;
+    Tensor proj_bias_;
     Tensor proj2_w_;       // optional second projector layer
-    Tensor proj2_b_;
+    Tensor proj2_bias_;
 };
 
 // Reads a binary PPM/PGM image (P6/P5) and returns normalized CHW floats.

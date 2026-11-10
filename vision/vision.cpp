@@ -2,6 +2,7 @@
 
 #include "core/ops.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -10,6 +11,11 @@
 namespace gai {
 
 namespace {
+
+// The tower runs on the CPU: a single image is a one-off cost per request
+// (a few milliseconds), and keeping the weights in host memory avoids a
+// device round trip that would cost more than the encoding itself.
+constexpr Device kDevice = Device::CPU;
 
 // LayerNorm over the last dimension.
 void layer_norm(const float* x, const float* w, const float* b,
@@ -42,16 +48,34 @@ inline float gelu(float x) {
     return 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x3)));
 }
 
-void softmax_row(float* x, int n) {
-    float mx = x[0];
-    for (int i = 1; i < n; ++i) if (x[i] > mx) mx = x[i];
-    double sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        x[i] = std::exp(x[i] - mx);
-        sum += x[i];
+void softmax_rows(float* x, int rows, int cols) {
+    for (int r = 0; r < rows; ++r) {
+        float* row = x + static_cast<size_t>(r) * cols;
+        float mx = row[0];
+        for (int i = 1; i < cols; ++i) if (row[i] > mx) mx = row[i];
+        double sum = 0.0;
+        for (int i = 0; i < cols; ++i) {
+            row[i] = std::exp(row[i] - mx);
+            sum += row[i];
+        }
+        const float inv = (sum > 0.0) ? static_cast<float>(1.0 / sum) : 0.0f;
+        for (int i = 0; i < cols; ++i) row[i] *= inv;
     }
-    const float inv = (sum > 0.0) ? static_cast<float>(1.0 / sum) : 0.0f;
-    for (int i = 0; i < n; ++i) x[i] *= inv;
+}
+
+// y[M,N] = x[M,K] * w[N,K]^T + bias[N]
+void linear_bias(const float* x, const float* w, const float* b,
+                 float* y, int M, int K, int N) {
+    ops::linear_forward(kDevice, x, w, y, M, K, N);
+    if (!b) return;
+    for (int m = 0; m < M; ++m) {
+        float* row = y + static_cast<size_t>(m) * N;
+        for (int n = 0; n < N; ++n) row[n] += b[n];
+    }
+}
+
+bool has_shape(const Tensor& t, i64 n) {
+    return t.defined() && t.numel() == n;
 }
 
 }  // namespace
@@ -100,35 +124,74 @@ VisionTower::VisionTower(VisionConfig cfg, const std::map<std::string, Tensor>& 
     if (!get("vision.pos_embed.weight", &pos_embed_)) return;
     if (!get("vision.post_ln.weight", &post_ln_)) return;
 
-    norm1_.resize(cfg_.layers);
-    norm2_.resize(cfg_.layers);
-    qkv_.resize(cfg_.layers);
-    proj_.resize(cfg_.layers);
-    fc1_.resize(cfg_.layers);
-    fc2_.resize(cfg_.layers);
+    norm1_.resize(static_cast<size_t>(cfg_.layers));
+    norm2_.resize(static_cast<size_t>(cfg_.layers));
+    qkv_.resize(static_cast<size_t>(cfg_.layers));
+    proj_.resize(static_cast<size_t>(cfg_.layers));
+    fc1_.resize(static_cast<size_t>(cfg_.layers));
+    fc2_.resize(static_cast<size_t>(cfg_.layers));
+    norm1_b_.resize(static_cast<size_t>(cfg_.layers));
+    norm2_b_.resize(static_cast<size_t>(cfg_.layers));
+    qkv_b_.resize(static_cast<size_t>(cfg_.layers));
+    proj_b_.resize(static_cast<size_t>(cfg_.layers));
+    fc1_b_.resize(static_cast<size_t>(cfg_.layers));
+    fc2_b_.resize(static_cast<size_t>(cfg_.layers));
 
     for (int i = 0; i < cfg_.layers; ++i) {
+        const size_t k = static_cast<size_t>(i);
         const std::string p = "vision.layers." + std::to_string(i) + ".";
         const bool ok =
-            get(p + "norm1.weight", &norm1_[static_cast<size_t>(i)]) &&
-            get(p + "qkv.weight", &qkv_[static_cast<size_t>(i)]) &&
-            get(p + "proj.weight", &proj_[static_cast<size_t>(i)]) &&
-            get(p + "norm2.weight", &norm2_[static_cast<size_t>(i)]) &&
-            get(p + "fc1.weight", &fc1_[static_cast<size_t>(i)]) &&
-            get(p + "fc2.weight", &fc2_[static_cast<size_t>(i)]);
+            get(p + "norm1.weight", &norm1_[k]) &&
+            get(p + "norm1.bias", &norm1_b_[k]) &&
+            get(p + "qkv.weight", &qkv_[k]) &&
+            get(p + "qkv.bias", &qkv_b_[k]) &&
+            get(p + "proj.weight", &proj_[k]) &&
+            get(p + "proj.bias", &proj_b_[k]) &&
+            get(p + "norm2.weight", &norm2_[k]) &&
+            get(p + "norm2.bias", &norm2_b_[k]) &&
+            get(p + "fc1.weight", &fc1_[k]) &&
+            get(p + "fc1.bias", &fc1_b_[k]) &&
+            get(p + "fc2.weight", &fc2_[k]) &&
+            get(p + "fc2.bias", &fc2_b_[k]);
         if (!ok) return;
     }
 
     if (!get("vision.projector.weight", &proj_w_)) return;
+    if (!get("vision.projector.bias", &proj_bias_)) return;
     if (cfg_.proj_hidden > 0) {
         if (!get("vision.projector.2.weight", &proj2_w_)) return;
+        if (!get("vision.projector.2.bias", &proj2_bias_)) return;
     }
 
     // Shape checks: a mismatch here means the weights belong to another
-    // vision config and would silently produce garbage.
-    if (patch_embed_.numel() != static_cast<i64>(cfg_.dim) * cfg_.patch_dim()) return;
-    if (pos_embed_.numel() != static_cast<i64>(cfg_.n_patches()) * cfg_.dim) return;
-    if (proj_w_.numel() != static_cast<i64>(cfg_.out_dim) * cfg_.dim) return;
+    // vision config and would silently produce garbage (or read out of
+    // bounds). Reject the checkpoint instead.
+    const i64 D = cfg_.dim;
+    const i64 P = cfg_.n_patches();
+    const i64 hidden = cfg_.mlp_hidden();
+    const i64 O = cfg_.out_dim;
+
+    if (!has_shape(patch_embed_, D * cfg_.patch_dim())) return;
+    if (!has_shape(pos_embed_, P * D)) return;
+    if (!has_shape(post_ln_, D)) return;
+    if (!has_shape(proj_w_, O * D)) return;
+    if (!has_shape(proj_bias_, O)) return;
+
+    for (int i = 0; i < cfg_.layers; ++i) {
+        const size_t k = static_cast<size_t>(i);
+        if (!has_shape(norm1_[k], D) || !has_shape(norm1_b_[k], D)) return;
+        if (!has_shape(qkv_[k], 3 * D * D) || !has_shape(qkv_b_[k], 3 * D)) return;
+        if (!has_shape(proj_[k], D * D) || !has_shape(proj_b_[k], D)) return;
+        if (!has_shape(norm2_[k], D) || !has_shape(norm2_b_[k], D)) return;
+        if (!has_shape(fc1_[k], hidden * D) || !has_shape(fc1_b_[k], hidden)) return;
+        if (!has_shape(fc2_[k], D * hidden) || !has_shape(fc2_b_[k], D)) return;
+    }
+
+    if (cfg_.proj_hidden > 0) {
+        const i64 inter = cfg_.proj_hidden;
+        if (!has_shape(proj2_w_, O * inter)) return;
+        if (!has_shape(proj2_bias_, O)) return;
+    }
 
     valid_ = true;
 }
@@ -139,144 +202,95 @@ void VisionTower::encode_patches(const float* pixels, std::vector<float>& out) c
     const int pd = cfg_.patch_dim();
     const int ps = cfg_.patch_size;
     const int C = cfg_.channels;
+    const int H = cfg_.heads;
+    const int hd = cfg_.head_dim();
+    const int hidden = cfg_.mlp_hidden();
 
     out.assign(static_cast<size_t>(P) * D, 0.0f);
 
-    // Patchify and project.
-    std::vector<float> patch(pd);
-    std::vector<float> row(D);
+    // --- patchify ---
+    // The patches are laid out as a [P, patch_dim] matrix so the projection
+    // is a single GEMM instead of one per patch.
+    std::vector<float> patches(static_cast<size_t>(P) * pd);
     for (int p = 0; p < P; ++p) {
         const int py = (p / cfg_.patches_per_side()) * ps;
         const int px = (p % cfg_.patches_per_side()) * ps;
+        float* dst = patches.data() + static_cast<size_t>(p) * pd;
         int k = 0;
         for (int c = 0; c < C; ++c) {
             for (int y = 0; y < ps; ++y) {
                 for (int x = 0; x < ps; ++x) {
-                    patch[static_cast<size_t>(k++)] =
-                        pixels[static_cast<size_t>((static_cast<size_t>(c) * cfg_.image_size +
-                                                   static_cast<size_t>(py + y)) * cfg_.image_size +
-                                                   static_cast<size_t>(px + x))];
+                    dst[k++] = pixels[static_cast<size_t>(
+                        (static_cast<size_t>(c) * cfg_.image_size +
+                         static_cast<size_t>(py + y)) * cfg_.image_size +
+                        static_cast<size_t>(px + x))];
                 }
             }
         }
-        // row = W * patch  (the weight is [dim, patch_dim], row major)
-        const float* w = patch_embed_.f32();
-        for (int i = 0; i < D; ++i) {
-            const float* wr = w + static_cast<size_t>(i) * pd;
-            float s = 0.0f;
-            for (int j = 0; j < pd; ++j) s += wr[j] * patch[static_cast<size_t>(j)];
-            row[static_cast<size_t>(i)] = s;
-        }
-        // + position embedding
-        const float* pe = pos_embed_.f32() + static_cast<size_t>(p) * D;
-        float* dst = out.data() + static_cast<size_t>(p) * D;
-        for (int i = 0; i < D; ++i) dst[i] = row[static_cast<size_t>(i)] + pe[i];
     }
 
-    // Transformer blocks.
-    const int H = cfg_.heads;
-    const int hd = D / H;
-    const int hidden = D * cfg_.mlp_ratio;
+    // --- patch projection + position embedding ---
+    std::vector<float> x(static_cast<size_t>(P) * D, 0.0f);
+    linear_bias(patches.data(), patch_embed_.f32(), nullptr, x.data(), P, pd, D);
 
-    std::vector<float> x = out;
-    std::vector<float> h(D), qkv(3 * D), att(P), ctx(D), y(D), mlp(hidden);
+    const float* pe = pos_embed_.f32();
+    for (int p = 0; p < P; ++p) {
+        float* row = x.data() + static_cast<size_t>(p) * D;
+        const float* per = pe + static_cast<size_t>(p) * D;
+        for (int i = 0; i < D; ++i) row[i] += per[i];
+    }
+
+    // --- transformer blocks ---
+    std::vector<float> h(static_cast<size_t>(P) * D);
+    std::vector<float> qkv(static_cast<size_t>(P) * 3 * D);
+    std::vector<float> ctx(static_cast<size_t>(P) * D, 0.0f);
+    std::vector<float> scores(static_cast<size_t>(P) * P);
+    std::vector<float> proj_out(static_cast<size_t>(P) * D);
+    std::vector<float> mlp(static_cast<size_t>(P) * hidden);
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
     for (int l = 0; l < cfg_.layers; ++l) {
+        const size_t k = static_cast<size_t>(l);
+
         // --- attention ---
-        layer_norm(x.data(), norm1_[static_cast<size_t>(l)].f32(), nullptr,
+        layer_norm(x.data(), norm1_[k].f32(), norm1_b_[k].f32(),
                    h.data(), P, D, 1e-5f);
-        {
-            const float* w = qkv_[static_cast<size_t>(l)].f32();
-            const float* b = nullptr;
-            for (int p = 0; p < P; ++p) {
-                const float* hr = h.data() + static_cast<size_t>(p) * D;
-                float* qr = qkv.data() + static_cast<size_t>(p) * 3 * D;
-                for (int i = 0; i < 3 * D; ++i) {
-                    const float* wr = w + static_cast<size_t>(i) * D;
-                    float s = 0.0f;
-                    for (int j = 0; j < D; ++j) s += wr[j] * hr[j];
-                    qr[i] = s;
-                }
-            }
-            (void)b;
-        }
+        linear_bias(h.data(), qkv_[k].f32(), qkv_b_[k].f32(),
+                    qkv.data(), P, D, 3 * D);
+
         // Bidirectional attention: every patch sees every patch (a vision
-        // tower has no causal mask).
-        const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+        // tower has no causal mask). The scores and the context are two
+        // GEMMs per head.
+        std::fill(ctx.begin(), ctx.end(), 0.0f);
         for (int hh = 0; hh < H; ++hh) {
-            const float* qbase = qkv.data() + hh * hd;
-            const float* kbase = qkv.data() + D + hh * hd;
-            const float* vbase = qkv.data() + 2 * D + hh * hd;
-            std::fill(ctx.begin(), ctx.end(), 0.0f);
-            for (int i = 0; i < P; ++i) {
-                const float* qi = qbase + static_cast<size_t>(i) * 3 * D;
-                for (int j = 0; j < P; ++j) {
-                    const float* kj = kbase + static_cast<size_t>(j) * 3 * D;
-                    float s = 0.0f;
-                    for (int c = 0; c < hd; ++c) s += qi[c] * kj[c];
-                    att[static_cast<size_t>(j)] = s * scale;
-                }
-                softmax_row(att.data(), P);
-                for (int j = 0; j < P; ++j) {
-                    const float* vj = vbase + static_cast<size_t>(j) * 3 * D;
-                    const float aj = att[static_cast<size_t>(j)];
-                    float* ci = ctx.data() + static_cast<size_t>(i) * hd;
-                    for (int c = 0; c < hd; ++c) ci[c] += aj * vj[c];
-                }
-            }
-            // write the head output back into the context rows
-            for (int i = 0; i < P; ++i) {
-                float* ci = ctx.data() + static_cast<size_t>(i) * hd;
-                float* xi = h.data() + static_cast<size_t>(i) * D + hh * hd;
-                for (int c = 0; c < hd; ++c) xi[c] = ci[c];
-            }
+            const float* qh = qkv.data() + hh * hd;
+            const float* kh = qkv.data() + D + hh * hd;
+            const float* vh = qkv.data() + 2 * D + hh * hd;
+
+            // scores[p, j] = dot(q_p, k_j) * scale
+            ops::gemm(kDevice, false, true, P, P, hd, scale,
+                      qh, 3 * D, kh, 3 * D, 0.0f, scores.data(), P);
+            softmax_rows(scores.data(), P, P);
+            // ctx[p, :] = sum_j scores[p, j] * v_j
+            ops::gemm(kDevice, false, false, P, hd, P, 1.0f,
+                      scores.data(), P, vh, 3 * D, 0.0f, ctx.data() + hh * hd, hd);
         }
+
         // output projection + residual
-        {
-            const float* w = proj_[static_cast<size_t>(l)].f32();
-            for (int p = 0; p < P; ++p) {
-                const float* hr = h.data() + static_cast<size_t>(p) * D;
-                float* yr = y.data() + static_cast<size_t>(p) * D;
-                for (int i = 0; i < D; ++i) {
-                    const float* wr = w + static_cast<size_t>(i) * D;
-                    float s = 0.0f;
-                    for (int j = 0; j < D; ++j) s += wr[j] * hr[j];
-                    yr[i] = s;
-                }
-            }
-        }
-        for (size_t i = 0; i < x.size(); ++i) x[i] += y[i];
+        linear_bias(ctx.data(), proj_[k].f32(), proj_b_[k].f32(),
+                    proj_out.data(), P, D, D);
+        for (size_t i = 0; i < x.size(); ++i) x[i] += proj_out[i];
 
         // --- MLP ---
-        layer_norm(x.data(), norm2_[static_cast<size_t>(l)].f32(), nullptr,
+        layer_norm(x.data(), norm2_[k].f32(), norm2_b_[k].f32(),
                    h.data(), P, D, 1e-5f);
-        {
-            const float* w = fc1_[static_cast<size_t>(l)].f32();
-            for (int p = 0; p < P; ++p) {
-                const float* hr = h.data() + static_cast<size_t>(p) * D;
-                float* mr = mlp.data() + static_cast<size_t>(p) * hidden;
-                for (int i = 0; i < hidden; ++i) {
-                    const float* wr = w + static_cast<size_t>(i) * D;
-                    float s = 0.0f;
-                    for (int j = 0; j < D; ++j) s += wr[j] * hr[j];
-                    mr[i] = gelu(s);
-                }
-            }
-        }
-        {
-            const float* w = fc2_[static_cast<size_t>(l)].f32();
-            for (int p = 0; p < P; ++p) {
-                const float* mr = mlp.data() + static_cast<size_t>(p) * hidden;
-                float* yr = y.data() + static_cast<size_t>(p) * D;
-                for (int i = 0; i < D; ++i) {
-                    const float* wr = w + static_cast<size_t>(i) * hidden;
-                    float s = 0.0f;
-                    for (int j = 0; j < hidden; ++j) s += wr[j] * mr[j];
-                    yr[i] = s;
-                }
-            }
-        }
-        for (size_t i = 0; i < x.size(); ++i) x[i] += y[i];
+        linear_bias(h.data(), fc1_[k].f32(), fc1_b_[k].f32(),
+                    mlp.data(), P, D, hidden);
+        for (float& v : mlp) v = gelu(v);
+        linear_bias(mlp.data(), fc2_[k].f32(), fc2_b_[k].f32(),
+                    proj_out.data(), P, hidden, D);
+        for (size_t i = 0; i < x.size(); ++i) x[i] += proj_out[i];
     }
 
     // final norm
@@ -290,43 +304,21 @@ void VisionTower::encode(const float* pixels, std::vector<float>& out) const {
     const int P = cfg_.n_patches();
     const int D = cfg_.dim;
     const int O = cfg_.out_dim;
+    const int inter = (cfg_.proj_hidden > 0) ? cfg_.proj_hidden : O;
 
     out.assign(static_cast<size_t>(P) * O, 0.0f);
 
-    const float* w = proj_w_.f32();
-    std::vector<float> tmp;
-    const int inter = (cfg_.proj_hidden > 0) ? cfg_.proj_hidden : O;
+    std::vector<float> tmp(static_cast<size_t>(P) * inter, 0.0f);
+    linear_bias(patches.data(), proj_w_.f32(), proj_bias_.f32(),
+                tmp.data(), P, D, inter);
 
-    tmp.assign(static_cast<size_t>(P) * inter, 0.0f);
-    for (int p = 0; p < P; ++p) {
-        const float* pr = patches.data() + static_cast<size_t>(p) * D;
-        float* tr = tmp.data() + static_cast<size_t>(p) * inter;
-        for (int i = 0; i < inter; ++i) {
-            const float* wr = w + static_cast<size_t>(i) * D;
-            float s = 0.0f;
-            for (int j = 0; j < D; ++j) s += wr[j] * pr[j];
-            tr[i] = s;
-        }
-    }
     if (cfg_.proj_hidden > 0) {
         for (float& v : tmp) v = gelu(v);
-        const float* w2 = proj2_w_.f32();
-        for (int p = 0; p < P; ++p) {
-            const float* tr = tmp.data() + static_cast<size_t>(p) * inter;
-            float* orow = out.data() + static_cast<size_t>(p) * O;
-            for (int i = 0; i < O; ++i) {
-                const float* wr = w2 + static_cast<size_t>(i) * inter;
-                float s = 0.0f;
-                for (int j = 0; j < inter; ++j) s += wr[j] * tr[j];
-                orow[i] = s;
-            }
-        }
+        linear_bias(tmp.data(), proj2_w_.f32(), proj2_bias_.f32(),
+                    out.data(), P, inter, O);
     } else {
-        for (int p = 0; p < P; ++p) {
-            const float* tr = tmp.data() + static_cast<size_t>(p) * O;
-            float* orow = out.data() + static_cast<size_t>(p) * O;
-            std::memcpy(orow, tr, sizeof(float) * static_cast<size_t>(O));
-        }
+        std::memcpy(out.data(), tmp.data(),
+                    sizeof(float) * static_cast<size_t>(P) * O);
     }
 }
 
@@ -362,37 +354,54 @@ bool load_ppm(const std::string& path, float* out, int C, int H, int W) {
     char magic[3] = {0, 0, 0};
     f.read(magic, 2);
     if (magic[0] != 'P') return false;
-    const bool binary = (magic[1] == '6');
-    if (!binary && magic[1] != '5') return false;
+    const bool color = (magic[1] == '6');
+    if (!color && magic[1] != '5') return false;
 
     int w = 0, h = 0, maxv = 0;
     if (!read_int(w) || !read_int(h) || !read_int(maxv)) return false;
     if (w != W || h != H) return false;
+    if (maxv <= 0) return false;
 
-    if (binary) {
-        f.get();  // the single whitespace after the header
-        const int chans = (magic[1] == '6') ? 3 : 1;
+    // The header ends with exactly one whitespace character, but a writer
+    // that uses CRLF puts two. Consume one, and the second only when it is
+    // the other half of the same line ending.
+    {
+        const int c = f.get();
+        if (c == '\r' && f.peek() == '\n') f.get();
+        else if (c < 0) return false;
+    }
+
+    const int src_channels = color ? 3 : 1;
+    const float scale = 1.0f / static_cast<float>(maxv);
+
+    auto store = [&](int x, int y, int c, float v) {
+        // A grayscale image is broadcast to every channel, so the engine
+        // always receives a proper CHW tensor.
+        const size_t base = static_cast<size_t>(y) * W + x;
+        if (src_channels == 3) {
+            out[static_cast<size_t>(c) * H * W + base] = v;
+        } else {
+            for (int cc = 0; cc < C; ++cc) out[static_cast<size_t>(cc) * H * W + base] = v;
+        }
+    };
+
+    if (magic[1] == '6') {
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
-                for (int c = 0; c < chans; ++c) {
+                for (int c = 0; c < 3; ++c) {
                     const int v = f.get();
                     if (v < 0) return false;
-                    const float norm = static_cast<float>(v) / static_cast<float>(maxv ? maxv : 255);
-                    // to CHW
-                    const int cc = (chans == 3) ? c : 0;
-                    out[static_cast<size_t>(cc) * H * W + static_cast<size_t>(y) * W + x] = norm;
+                    store(x, y, c, static_cast<float>(v) * scale);
                 }
             }
         }
     } else {
+        // P5: one sample per pixel, in ASCII.
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
-                for (int c = 0; c < 3; ++c) {
-                    int v = 0;
-                    if (!read_int(v)) return false;
-                    const float norm = static_cast<float>(v) / static_cast<float>(maxv ? maxv : 255);
-                    out[static_cast<size_t>(c) * H * W + static_cast<size_t>(y) * W + x] = norm;
-                }
+                int v = 0;
+                if (!read_int(v)) return false;
+                store(x, y, 0, static_cast<float>(v) * scale);
             }
         }
     }
