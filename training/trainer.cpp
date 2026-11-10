@@ -228,6 +228,15 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     t.pack_sequences = c.get_bool("training.pack_sequences", false);
     t.ddp = c.get_bool("training.ddp", false);
     t.ddp_grad_compression = c.get_bool("training.ddp_grad_compression", false);
+    if (t.ddp_grad_compression) {
+        // The no-sync reduction path has no gradient compression. Accepting
+        // the flag and silently ignoring it would run a different training
+        // than the config asks for, so refuse it here instead of failing
+        // halfway through the first step.
+        GAI_FAIL("training.ddp_grad_compression=true is not implemented: the "
+                 "no-sync reduction path has no compressor. Remove the flag "
+                 "or implement one in the reduce step.");
+    }
 
     if (c.has("data.train_glob") || c.has("data.val_glob")) {
         std::string tdir, tpre, vdir, vpre;

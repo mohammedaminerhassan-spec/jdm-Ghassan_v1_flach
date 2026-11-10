@@ -367,20 +367,5 @@ DistributedContext::Config distributed_config_from_env(int default_world_size) {
     return cfg;
 }
 
-ScopedDistributed::ScopedDistributed(const DistributedContext::Config& cfg) {
-    ctx_.init(cfg);
-}
-
-ScopedDistributed::ScopedDistributed(int world_size, int local_rank) {
-    DistributedContext::Config cfg;
-    cfg.world_size = world_size;
-    cfg.local_rank = local_rank;
-    cfg.global_rank = local_rank;
-    ctx_.init(cfg);
-}
-
-ScopedDistributed::~ScopedDistributed() {
-    ctx_.finalize();
-}
 
 }

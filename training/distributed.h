@@ -85,16 +85,5 @@ private:
 
 DistributedContext::Config distributed_config_from_env(int default_world_size = 1);
 
-class ScopedDistributed {
-public:
-    explicit ScopedDistributed(const DistributedContext::Config& cfg);
-    explicit ScopedDistributed(int world_size = 1, int local_rank = 0);
-    ~ScopedDistributed();
-    DistributedContext& ctx() { return ctx_; }
-    operator bool() const { return ctx_.initialized(); }
-
-private:
-    DistributedContext ctx_;
-};
 
 }

@@ -227,8 +227,22 @@ def _obj_to_doc(obj):
     return _doc_from_row(obj)
 
 
+def domain_kind(name):
+    """The domain a source file belongs to, from its name.
+
+    The trainer addresses the shards by domain (data.mix in the configs
+    says english_chat: 0.80, english_instruction: 0.20), and the shard
+    names have to carry it: train_<prefix>_<kind>_NNNN.gbin.
+    """
+    low = os.path.basename(name).lower()
+    for kind in ("chat", "instruction", "behavior", "qa"):
+        if kind in low:
+            return kind
+    return "text"
+
+
 def collect_docs(args):
-    """Yields (domain, kind, payload)."""
+    """Yields (kind, payload_kind, payload)."""
     sources = []
 
     if args.lake:
@@ -248,19 +262,19 @@ def collect_docs(args):
     for kind, path in sources:
         name = os.path.basename(path)
         if path.endswith(".parquet"):
-            domain = "chat" if "chat" in name else ("instruction" if "instruction" in name else "text")
+            domain = domain_kind(name)
             for row in _rows_from_parquet(path):
                 d = _doc_from_row(row)
                 if d[0]:
                     yield domain, d[0], d[1]
         elif path.endswith(".jsonl"):
-            domain = "qa" if "qa" in name else "chat"
+            domain = domain_kind(name)
             for obj in read_jsonl(path):
                 d = _obj_to_doc(obj)
                 if d[0]:
                     yield domain, d[0], d[1]
         elif path.endswith(".json"):
-            domain = "qa" if "qa" in name else "chat"
+            domain = domain_kind(name)
             for obj in read_json(path):
                 d = _obj_to_doc(obj)
                 if d[0]:
@@ -270,7 +284,7 @@ def collect_docs(args):
                 for line in f:
                     line = line.strip()
                     if line:
-                        yield "text", "text", line
+                        yield domain_kind(name), "text", line
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +379,13 @@ def main():
     ap.add_argument("--val-ratio", type=float, default=0.005)
     ap.add_argument("--shard-tokens", type=int, default=50_000_000)
     ap.add_argument("--max-docs", type=int, default=0, help="0 = no limit")
-    ap.add_argument("--domain", default=None, help="force the domain name")
+    ap.add_argument("--domain", default=None,
+                    help="force the domain name (overrides the one derived "
+                         "from the file name)")
+    ap.add_argument("--domain-prefix", default="english",
+                    help="prefix of the shard domain names; the configs "
+                         "address the shards as english_chat, "
+                         "english_instruction, ... (default: english)")
     ap.add_argument("--jsonl-out", default=None,
                     help="also write the tokenized documents as jsonl "
                          "(default: <out>/train.jsonl)")
@@ -399,13 +419,13 @@ def main():
 
     print("=== reading the corpus ===")
     n_docs = 0
-    for domain, kind, payload in collect_docs(args):
+    for kind, doc_kind, payload in collect_docs(args):
         if args.max_docs and n_docs >= args.max_docs:
             break
-        if args.domain:
-            domain = args.domain
+        domain = args.domain or (
+            f"{args.domain_prefix}_{kind}" if args.domain_prefix else kind)
 
-        if kind == "chat":
+        if doc_kind == "chat":
             ids, mask = tb.encode_chat(payload)
             text = "".join(payload)
         else:

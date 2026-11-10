@@ -12,7 +12,7 @@ namespace gai {
 
 static constexpr u32 CKPT_MAGIC   = 0x54504B47u;
 
-static constexpr u32 CKPT_VERSION = 12u;
+static constexpr u32 CKPT_VERSION = 13u;
 static constexpr u8 OPT_ADAMW = 0u;
 static constexpr u8 OPT_LION  = 1u;
 static constexpr u8 OPT_MUON  = 2u;
@@ -88,6 +88,10 @@ static void wr_config(std::ostream& o, const ModelConfig& c) {
     wr(o, auxfree);
     wr(o, c.rope_yarn_low); wr(o, c.rope_yarn_high);
     wr(o, c.sliding_window); wr(o, c.rope_type);
+    // moe_allow_dense is part of the architecture: a checkpoint written with
+    // it must be resumed with it, or the "exact" resume check has to see it.
+    u8 dense_ok = c.moe_allow_dense ? 1 : 0;
+    wr(o, dense_ok);
 }
 static bool rd_config_v6(std::istream& i, ModelConfig& c) {
     u8 tie = 0, moe = 0, sh = 0, qk = 0;
@@ -127,6 +131,16 @@ static bool rd_config_v9(std::istream& i, ModelConfig& c) {
     if (!rd(i, c.sliding_window)) return false;
     if (!rd(i, c.rope_type)) return false;
     c.moe_aux_free = auxfree != 0;
+    return true;
+}
+
+// v13 adds moe_allow_dense, which the v9 reader dropped: a run that was
+// configured with it could never be resumed with resume_mode=exact.
+static bool rd_config_v13(std::istream& i, ModelConfig& c) {
+    if (!rd_config_v9(i, c)) return false;
+    u8 dense_ok = 0;
+    if (!rd(i, dense_ok)) return false;
+    c.moe_allow_dense = dense_ok != 0;
     return true;
 }
 static bool rd_config_v5(std::istream& i, ModelConfig& c) {
@@ -511,7 +525,9 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
 
     ModelConfig cfg{};
-    if (version >= 9u) {
+    if (version >= 13u) {
+        if (!rd_config_v13(f, cfg)) return false;
+    } else if (version >= 9u) {
         if (!rd_config_v9(f, cfg)) return false;
     } else if (version >= 6u) {
         if (!rd_config_v6(f, cfg)) return false;
@@ -637,7 +653,9 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
-    if (version >= 9u) {
+    if (version >= 13u) {
+        if (!rd_config_v13(f, cfg)) return false;
+    } else if (version >= 9u) {
         if (!rd_config_v9(f, cfg)) return false;
     } else if (version >= 6u) {
         if (!rd_config_v6(f, cfg)) return false;
@@ -761,7 +779,9 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
-    if (version >= 9u) {
+    if (version >= 13u) {
+        if (!rd_config_v13(f, cfg)) return false;
+    } else if (version >= 9u) {
         if (!rd_config_v9(f, cfg)) return false;
     } else if (version >= 6u) {
         if (!rd_config_v6(f, cfg)) return false;
@@ -877,7 +897,9 @@ bool Checkpoint::peek(const std::string& path, ModelConfig& cfg, TrainState& sta
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
-    if (version >= 9u) {
+    if (version >= 13u) {
+        if (!rd_config_v13(f, cfg)) return false;
+    } else if (version >= 9u) {
         if (!rd_config_v9(f, cfg)) return false;
     } else if (version >= 6u) {
         if (!rd_config_v6(f, cfg)) return false;

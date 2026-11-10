@@ -1,5 +1,4 @@
 #include "training/dataloader.h"
-#include "tokenizer/tokenizer.h"
 
 #include <cstdio>
 #include <fstream>
@@ -389,6 +388,7 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
     if (mix.empty()) return false;
 
     double wsum = 0.0;
+    std::vector<std::string> missing;
     for (const auto& [domain, w] : mix) {
         if (!std::isfinite(w) || !(w > 0.0)) continue;
 
@@ -400,7 +400,7 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
             return name.rfind(exact_prefix, 0) != 0;
         }), paths.end());
         if (paths.empty()) {
-            log_warn("dataloader: mix domain '" + domain + "' has no shards (" + prefix + "*.gbin), skipped");
+            missing.push_back(domain);
             continue;
         }
         DomainGroup g;
@@ -427,6 +427,23 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
         groups_.push_back(std::move(g));
     }
     if (groups_.empty()) {
+        total_tokens_ = 0;
+        return false;
+    }
+
+    // A declared domain without shards would silently change the mixture
+    // (the remaining domains are re-weighted below), so the run would train
+    // on something else than the config asks for. Refuse it instead.
+    if (!missing.empty()) {
+        std::string list;
+        for (size_t i = 0; i < missing.size(); ++i) {
+            if (i) list += ", ";
+            list += missing[i];
+        }
+        log_error("dataloader: the mixture declares the domain(s) [" + list +
+                  "] but there are no shards for them in " + dir +
+                  " (expected train_<domain>_*.gbin). Build the shards with "
+                  "tools/py/prepare_dataset.py, or fix data.mix in the config.");
         total_tokens_ = 0;
         return false;
     }

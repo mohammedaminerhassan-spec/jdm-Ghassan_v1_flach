@@ -125,7 +125,7 @@ if [[ "${WITH_PARQUET}" == "ON" ]]; then
     else
         echo ""
         echo "[ERROR] Apache Arrow C++ install failed, but the project is PARQUET-ONLY:"
-        echo "[ERROR] data_pipeline parquet (the Hermes lake) cannot build without it."
+        echo "[ERROR] the parquet lake cannot be read without pyarrow (pip install -r requirements.txt)."
         echo "[ERROR] Fixes: Kaggle Settings -> Internet ON, then re-run setup.sh --with-parquet."
         exit 1
     fi
@@ -283,7 +283,7 @@ elif [[ -n "${LAKE_DIR}" ]]; then
     echo "[tokenizer] Step 1/2: lake -> BPE corpus (keep-case)..."
     mkdir -p "${REPO_DIR}/artifacts/tokenizer" "${REPO_DIR}/artifacts/corpus"
     CORPUS_LIMIT="${PARQUET_CORPUS_LIMIT:-400000}"
-    "${BUILD_DIR}/bin/data_pipeline" parquet-corpus \
+    python3 tools/py/lake_to_corpus.py \
         --lake "${LAKE_DIR}" \
         --out "${REPO_DIR}/artifacts/corpus/corpus_en.txt" \
         --limit "${CORPUS_LIMIT}" || {
@@ -323,7 +323,7 @@ if [[ "${SKIP_DATA}" -eq 1 && -z "${TOK_PATH}" ]]; then
     echo "[tokenizer] --skip-data: vocab gate deferred (no tokenizer yet, data cell will train it)"
 else
 {
-TOK_VOCAB=$("${BUILD_DIR}/bin/data_pipeline" tok-info --tokenizer "${TOK_PATH}" 2>/dev/null \
+TOK_VOCAB=$("${BUILD_DIR}/bin/ghassan-ai" tokenizer-info --tokenizer "${TOK_PATH}" 2>/dev/null \
     | grep -oE 'vocab_size=[0-9]+' | cut -d= -f2 || true)
 if [[ "${TOK_VOCAB}" != "32000" ]]; then
     echo "[ERROR] tokenizer ${TOK_PATH} has vocab_size=${TOK_VOCAB:-unreadable}, need 32000."
@@ -346,12 +346,12 @@ if [[ "${SKIP_DATA}" -eq 0 ]]; then
         exit 1
     fi
     echo "[data] lake: ${LAKE_DIR}"
-    "${BUILD_DIR}/bin/data_pipeline" parquet --probe >/dev/null || {
-        echo "[ERROR] data_pipeline has no Arrow backend (setup built PARQUET=OFF?)."
-        echo "[ERROR] Re-run: bash configs/kaggle/setup.sh --with-parquet"
+    python3 -c "import pyarrow.parquet" 2>/dev/null || {
+        echo "[ERROR] pyarrow is missing (the shard builder needs it)."
+        echo "[ERROR] Re-run: pip install -r requirements.txt"
         exit 1
     }
-    echo "[data] Arrow backend: native (probe ok)"
+    echo "[data] parquet backend: pyarrow (ok)"
     if [[ ! -f "${TOK_PATH}" ]]; then
         echo "[ERROR] Tokenizer missing at ${TOK_PATH} (step 9 should have trained it)."
         exit 1
@@ -371,11 +371,12 @@ echo ""
 echo "  Next cell (shards — the long one, then Save Version):"
 echo "    bash configs/kaggle/build_english_data.sh"
 echo ""
-echo "  Then (train, on the recipe that fits one 2xT4 session):"
-echo "    SESSION_SPENT_MIN=<minutes setup+shards took> bash configs/kaggle/run_kaggle_en.sh"
 echo ""
-echo "  (en_compact_2xt4: 109M params, 4.05 GiB of the 15 GiB per-GPU"
-echo "   budget, 2.70 GiB projected output. The 1B recipes cannot be"
-echo "   trained in a 12h session — D/N ~0.02 — and the 1B output"
-echo "   projection alone leaves 630 MB for shards it needs ~0.9 GB of.)"
+echo "  Then (fine-tune with safetensors, on a 16 GB T4):"
+echo "    python tools/py/qlora_finetune.py --model <hf-checkpoint> \\"
+echo "      --data artifacts/shards_en/train.jsonl --out runs/exp1 \\"
+echo "      --qlora --merge --export-gguf artifacts/my-model.gguf"
+echo ""
+echo "  And serve it:"
+echo "    ./build/bin/ghassan-ai serve --model artifacts/my-model.gguf --port 8080"
 echo "============================================================"

@@ -349,9 +349,14 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
                                        Ch.data(), CUDA_R_32F, ldcArr,
                                        1, gs, CUBLAS_COMPUTE_32F);
     } else {
+        // Same operand swap as the fp16 branch: the cublas A-operand carries
+        // the row-major B matrix (with B's leading dimension) and the cublas
+        // B-operand carries the row-major A matrix (with A's leading
+        // dimension). Passing them the other way round mixes the strides and
+        // the transpose flags, which corrupts the result under GQA strides.
         std::vector<const void*> Ap(nB), Bp(nB);
         std::vector<void*> Cp(nB);
-        for (int i = 0; i < nB; ++i) { Ap[i] = A[i]; Bp[i] = B[i]; Cp[i] = C[i]; }
+        for (int i = 0; i < nB; ++i) { Ap[i] = B[i]; Bp[i] = A[i]; Cp[i] = C[i]; }
         s = cublasGemmGroupedBatchedEx(h, topA, topB, marr, narr, karr, alp,
                                        Ap.data(), CUDA_R_32F, ldaArr,
                                        Bp.data(), CUDA_R_32F, ldbArr, bet,
@@ -660,9 +665,12 @@ __global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restr
             const float* pr = probs + ((size_t(b) * H + gh) * T + t) * T;
             const float* go = dout + size_t(b) * qs + (size_t(t) * H + gh) * hd;
             const float* qh = q + size_t(b) * qs + (size_t(t) * H + gh) * hd;
+            // The previous iteration may still be reading s_go on a slower
+            // lane: the write needs a barrier in front of it, not only
+            // behind it.
+            __syncwarp();
             for (int c = lane; c < hd; c += WARP_A) s_go[c] = go[c];
             __syncwarp();
-
             // Row dot was computed exactly once by the dq kernel; read it.
             const float dot_pg = dots ? dots[((size_t)b * H + gh) * T + t] : 0.0f;
 
@@ -819,7 +827,12 @@ void attention_backward_ex(const float* q, const float* k, const float* v,
     const int group = H / KV;
     const int BH = B * H;
     // dS/dP staging (transient).
-    attn_pool_ensure(0, (size_t)BH * T * hd, (size_t)BH * T * T);
+    //
+    // The expanded buffer holds the per-head dk AND dv before the group
+    // reduce: the dk half lives at [0, BH*T*hd) and the dv half at
+    // [BH*T*hd, 2*BH*T*hd). Asking for one half would let the dv half run
+    // past the end of the allocation.
+    attn_pool_ensure(0, (size_t)2 * BH * T * hd, (size_t)BH * T * T);
     float* dS = g_attn_dsb;
     float* dE = g_attn_exp;  // expanded per-h dk/dv, then group-reduced
     // dP = dO * V^T into dS.

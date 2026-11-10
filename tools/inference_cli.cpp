@@ -46,6 +46,7 @@ static void usage() {
     "  ghassan-ai quantize  --model in.gguf --out out.gguf --profile q4_0\n"
     "  ghassan-ai bench     --model model.gguf [--tokens 128]\n"
     "  ghassan-ai tokenize  --model model.gguf --text \"شنو خبارك\"\n"
+    "  ghassan-ai tokenizer-info --tokenizer tok.gtok\n"
     "  ghassan-ai eval      --model model.gguf --suite evaluation/en\n"
     "  ghassan-ai perplexity --model model.gguf (--text \"held out\" | --shards artifacts/shards_en --prefix val_)\n"
     "  ghassan-ai export    --checkpoint last.ckpt --tokenizer tok.gtok --out model.gguf [--profile fp16|q8_k|q4_0] [--compat native|llama|llama_moe]\n"
@@ -422,6 +423,22 @@ static int cmd_bench(const Args& args) {
     return 0;
 }
 
+static int cmd_tokenizer_info(const Args& args) {
+    Tokenizer tk;
+    const std::string tp = args.str("tokenizer");
+    GAI_CHECK(!tp.empty(), "--tokenizer is required");
+    GAI_CHECK(tk.load(tp), "cannot load tokenizer: " + tp);
+
+    // The key=value form is what the Kaggle scripts grep for.
+    std::cout << "path=" << tp << "\n";
+    std::cout << "vocab_size=" << tk.vocab_size() << "\n";
+    std::cout << "foreign=" << (tk.foreign() ? 1 : 0) << "\n";
+    std::cout << "byte_map=" << (tk.has_byte_map() ? 1 : 0) << "\n";
+    std::cout << "add_bos=" << (tk.add_bos() ? 1 : 0) << "\n";
+    std::cout << "add_eos=" << (tk.add_eos() ? 1 : 0) << "\n";
+    return 0;
+}
+
 static int cmd_tokenize(const Args& args) {
     Tokenizer tk;
     std::string tp = args.str("tokenizer");
@@ -674,6 +691,7 @@ int main(int argc, char** argv) {
         if (cmd == "quantize") return cmd_quantize(args);
         if (cmd == "bench")    return cmd_bench(args);
         if (cmd == "tokenize") return cmd_tokenize(args);
+        if (cmd == "tokenizer-info") return cmd_tokenizer_info(args);
         if (cmd == "export")   return cmd_export(args);
         if (cmd == "eval")     return cmd_eval(args);
         if (cmd == "perplexity") return cmd_perplexity(args);
