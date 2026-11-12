@@ -17,6 +17,18 @@ granite-4.0-h-tiny/
 The deliverable is a **self-contained GGUF named "Ghassan v1 Flash"**: the vocabulary,
 the merges and the chat template are embedded, so it runs with `ghassan-ai` alone.
 
+## The one cell (Kaggle)
+
+Everything (the CUDA build, the checks, the CPU/GPU comparison, the export,
+the reload) is in one script:
+
+```bash
+!bash "kaggle configue/kaggle_granite_run.sh"
+```
+
+It needs the dataset attached (`granite-4.0-h-tiny`); override with
+`MODEL=... OUT=... PROFILE=q8_k`.
+
 ## Architecture the engine implements for it
 
 | piece | value |
