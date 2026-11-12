@@ -83,23 +83,65 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     topk_ids_host_.assign(FAST_TOPK_MAX, 0);
     logits_host_.assign(static_cast<size_t>(c.vocab_size), 0.0f);
 
-    // The Mamba-2 layers keep their own recurrent state.
+    // The Mamba-2 layers keep their own recurrent state. The state vectors
+    // live on the host and the tiny per-layer weights are staged once here,
+    // so the per-token decode never touches the heap and never reads device
+    // memory from the host.
     {
         const int d_inner  = c.mamba_expand * c.hidden_size;
         const int conv_dim = d_inner + 2 * c.mamba_n_groups * c.mamba_d_state;
         const int conv_k   = c.mamba_d_conv;
         const int conv_win = conv_k > 1 ? conv_k - 1 : 1;
+        const int proj     = d_inner + conv_dim + c.mamba_n_heads;
+        // Stage a device or host tensor into a plain host vector (once).
+        auto stage = [](const Tensor& t) -> std::vector<float> {
+            std::vector<float> out;
+            if (!t.defined()) return out;
+            out.resize(static_cast<size_t>(t.numel()));
+            if (t.device() == Device::CPU) {
+                std::memcpy(out.data(), t.f32(), out.size() * sizeof(float));
+            } else {
+                device_copy(out.data(), Device::CPU, t.f32(), t.device(),
+                            out.size() * sizeof(float));
+            }
+            return out;
+        };
         mamba_states_.clear();
+        mamba_host_conv_w_.clear();
+        mamba_host_conv_b_.clear();
+        mamba_host_dt_bias_.clear();
+        mamba_host_a_log_.clear();
+        mamba_host_D_.clear();
+        mamba_host_norm_.clear();
+        const bool has_mamba =
+            c.arch == ModelConfig::ArchGranite &&
+            std::any_of(c.layer_types.begin(), c.layer_types.end(),
+                        [](int k) { return k == 0; });
+        if (has_mamba) {
+            mamba_proj_dev_   = Tensor::empty({(i64)proj}, DType::F32, dev);
+            mamba_norm_dev_   = Tensor::empty({(i64)d_inner}, DType::F32, dev);
+            mamba_proj_host_.assign(static_cast<size_t>(proj), 0.0f);
+            mamba_normed_host_.assign(static_cast<size_t>(d_inner), 0.0f);
+            mamba_bc_out_host_.assign(static_cast<size_t>(conv_dim), 0.0f);
+            mamba_y_host_.assign(static_cast<size_t>(d_inner), 0.0f);
+        }
+        kv_stage_k_.assign(static_cast<size_t>(c.kv_dim()), 0.0f);
+        kv_stage_v_.assign(static_cast<size_t>(c.kv_dim()), 0.0f);
         for (int l = 0; l < c.num_layers; ++l) {
             const bool is_mamba = (c.arch == ModelConfig::ArchGranite) &&
                                   l < static_cast<int>(c.layer_types.size()) &&
                                   c.layer_types[static_cast<size_t>(l)] == 0;
             if (!is_mamba) continue;
+            const LayerParams& L = model_.layer(l);
             MambaState st;
-            st.conv = Tensor::zeros({conv_dim, conv_win}, DType::F32, dev);
-            st.ssm  = Tensor::zeros({c.mamba_n_heads, c.mamba_d_head, c.mamba_d_state}, DType::F32, dev);
             st.conv_host.assign(static_cast<size_t>(conv_dim) * conv_win, 0.0f);
             st.ssm_host.assign(static_cast<size_t>(c.mamba_n_heads) * c.mamba_d_head * c.mamba_d_state, 0.0f);
+            mamba_host_conv_w_.push_back(stage(L.mamba_conv_w.w));
+            mamba_host_conv_b_.push_back(stage(L.mamba_conv_b.w));
+            mamba_host_dt_bias_.push_back(stage(L.mamba_dt_bias.w));
+            mamba_host_a_log_.push_back(stage(L.mamba_A_log.w));
+            mamba_host_D_.push_back(stage(L.mamba_D.w));
+            mamba_host_norm_.push_back(stage(L.mamba_norm.w));
             mamba_states_.push_back(std::move(st));
         }
         mamba_states_ready_ = !mamba_states_.empty();
@@ -234,12 +276,24 @@ float* Generator::decode_step_logits(i32 token, int position) {
         {
             if (cache_.fp16()) {
                 // Store fp16: half the cache memory and half the decode
-                // bandwidth at long contexts.
+                // bandwidth at long contexts. The K/V activations live on
+                // the device, so stage them through the host before the
+                // fp32 -> fp16 conversion.
                 u16 kh[static_cast<size_t>(kvd)];
                 u16 vh[static_cast<size_t>(kvd)];
+                const float* kp_src = kp;
+                const float* vp_src = vp;
+                if (dev != Device::CPU) {
+                    device_copy(kv_stage_k_.data(), Device::CPU, kp, dev,
+                                sizeof(float) * static_cast<size_t>(kvd));
+                    device_copy(kv_stage_v_.data(), Device::CPU, vp, dev,
+                                sizeof(float) * static_cast<size_t>(kvd));
+                    kp_src = kv_stage_k_.data();
+                    vp_src = kv_stage_v_.data();
+                }
                 for (int i = 0; i < kvd; ++i) {
-                    kh[i] = fp32_to_fp16(kp[i]);
-                    vh[i] = fp32_to_fp16(vp[i]);
+                    kh[i] = fp32_to_fp16(kp_src[i]);
+                    vh[i] = fp32_to_fp16(vp_src[i]);
                 }
                 u16* kdst = cache_.k_f16(l) + static_cast<size_t>(slot) * kvd;
                 u16* vdst = cache_.v_f16(l) + static_cast<size_t>(slot) * kvd;
@@ -347,24 +401,32 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
     }
     MambaState& st = mamba_states_[si];
 
-    // ---- 1) in_proj
-    std::vector<float> proj_buf(static_cast<size_t>(proj));
-    ops::linear_forward(dev, x_in, L.mamba_in_proj.w.f32(), proj_buf.data(), 1, d, proj);
+    // ---- 1) in_proj on the device into the persistent scratch
+    const size_t proj_n = static_cast<size_t>(proj);
+    ops::linear_forward(dev, x_in, L.mamba_in_proj.w.f32(), mamba_proj_dev_.f32(), 1, d, proj);
+    // Stage back to the host; the tiny recurrent update runs on the host for
+    // both backends, so the numbers are identical on CPU and CUDA.
+    device_copy(mamba_proj_host_.data(), Device::CPU, mamba_proj_dev_.f32(), dev,
+                sizeof(float) * proj_n);
+    const float* proj_buf = mamba_proj_host_.data();
 
     // ---- 2) split
-    const float* gate = proj_buf.data();
+    const float* gate = proj_buf;
     const float* bc   = gate + d_inner;
     const float* dt_r = bc + conv_dim;
 
     // ---- 3) causal depthwise conv1d over the carried window + SiLU
-    std::vector<float> bc_out(static_cast<size_t>(conv_dim));
+    const std::vector<float>& conv_w = mamba_host_conv_w_[si];
+    const std::vector<float>& conv_b = mamba_host_conv_b_[si];
+    float* bc_out = mamba_bc_out_host_.data();
     for (int ch = 0; ch < conv_dim; ++ch) {
-        float acc = L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32()[ch] : 0.0f;
+        float acc = conv_b.empty() ? 0.0f : conv_b[static_cast<size_t>(ch)];
+        const float* w_ch = conv_w.data() + static_cast<size_t>(ch) * conv_k;
         for (int j = 0; j < conv_k; ++j) {
             // The window holds the previous (conv_k-1) values, oldest first.
             const float v = (j == conv_k - 1) ? bc[ch]
                                                : st.conv_host[static_cast<size_t>(ch) * conv_win + j];
-            acc += L.mamba_conv_w.w.f32()[static_cast<size_t>(ch) * conv_k + j] * v;
+            acc += w_ch[j] * v;
         }
         bc_out[static_cast<size_t>(ch)] = acc / (1.0f + std::exp(-acc));
     }
@@ -379,15 +441,15 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
                 bc[static_cast<size_t>(ch)];
 
     // ---- 4) split bc -> x, B, C
-    const float* xs  = bc_out.data();
+    const float* xs  = bc_out;
     const float* Bm  = xs + d_inner;
     const float* Cm  = Bm + n_groups * d_state;
 
     // ---- 5) recurrent SSM update
-    std::vector<float> y(static_cast<size_t>(d_inner));
-    const float* A_log = L.mamba_A_log.w.f32();
-    const float* dt_bias = L.mamba_dt_bias.w.f32();
-    const float* D = L.mamba_D.w.f32();
+    const std::vector<float>& A_log   = mamba_host_a_log_[si];
+    const std::vector<float>& dt_bias = mamba_host_dt_bias_[si];
+    const std::vector<float>& D       = mamba_host_D_[si];
+    float* y = mamba_y_host_.data();
     for (int h = 0; h < n_heads; ++h) {
         const float a = -std::exp(A_log[h]);
         float dtb = dt_r[h] + dt_bias[h];
@@ -408,8 +470,9 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
     }
 
     // ---- 6) gated RMSNorm + out_proj
-    std::vector<float> normed(static_cast<size_t>(d_inner));
-    const float* nw = L.mamba_norm.w.f32();
+    const std::vector<float>& norm_w = mamba_host_norm_[si];
+    const float* nw = norm_w.data();
+    float* normed = mamba_normed_host_.data();
     double var = 0.0;
     for (int i = 0; i < d_inner; ++i) {
         const float g = gate[i] / (1.0f + std::exp(-gate[i]));
@@ -422,7 +485,11 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
     for (int i = 0; i < d_inner; ++i)
         normed[static_cast<size_t>(i)] = normed[static_cast<size_t>(i)] * inv * nw[i];
 
-    ops::linear_forward(dev, normed.data(), L.mamba_out_proj.w.f32(), out, 1, d_inner, d);
+    // Stage the normed vector back to the device; the out_proj GEMM runs
+    // there and writes the caller's `out` buffer.
+    device_copy(mamba_norm_dev_.f32(), dev, normed, Device::CPU,
+                sizeof(float) * static_cast<size_t>(d_inner));
+    ops::linear_forward(dev, mamba_norm_dev_.f32(), L.mamba_out_proj.w.f32(), out, 1, d_inner, d);
 }
 
 float* Generator::decode_step(i32 token, int position) {
@@ -781,7 +848,10 @@ std::string Generator::complete(const std::string& prompt, const GenerationConfi
     GAI_CHECK(cfg.max_context == 0 || cfg.max_context == max_context_,
               "GenerationConfig::max_context must match the Generator context");
     reset();
-    std::vector<i32> ids = tok_.encode(prompt, true, false);
+    // The pre-tokenizer/bos behavior follows the loaded checkpoint's tokenizer
+    // (e.g. Granite does NOT prepend <|end_of_text|>); hardcoding add_bos
+    // here made the served prompt differ from what the model was trained on.
+    std::vector<i32> ids = tok_.encode(prompt, tok_.add_bos(), false);
     prefill(ids);
     std::vector<i32> gen = generate(cfg, on_token);
     std::string text = tok_.decode(gen, true);

@@ -109,13 +109,34 @@ private:
     //   ssm_state  : [n_heads, d_head, d_state] the recurrent SSM state
     // They are updated once per decoded token and reset with the cache.
     struct MambaState {
-        Tensor conv;   // [conv_dim, d_conv-1]
-        Tensor ssm;    // [n_heads, d_head, d_state]
         std::vector<float> conv_host;
         std::vector<float> ssm_host;
     };
     std::vector<MambaState> mamba_states_;
     bool mamba_states_ready_ = false;
+
+    // Mamba decode scratch, allocated once at construction and reused every
+    // token (no per-token heap traffic). The big in_proj / out_proj GEMMs run
+    // on the device; the tiny recurrent update runs on the host for both
+    // backends so the numerics are identical, which needs the projection and
+    // the normed vector staged host<->device. The per-layer tiny weights
+    // (A_log, dt_bias, D, conv_w/b, norm_w) are staged once at construction -
+    // the per-token SSM must never dereference device memory.
+    Tensor mamba_proj_dev_;   // [proj]
+    Tensor mamba_norm_dev_;   // [d_inner]
+    std::vector<float> mamba_proj_host_;   // proj
+    std::vector<float> mamba_normed_host_; // d_inner
+    std::vector<float> mamba_bc_out_host_; // conv_dim
+    std::vector<float> mamba_y_host_;      // d_inner
+    std::vector<std::vector<float>> mamba_host_conv_w_;
+    std::vector<std::vector<float>> mamba_host_conv_b_;
+    std::vector<std::vector<float>> mamba_host_dt_bias_;
+    std::vector<std::vector<float>> mamba_host_a_log_;
+    std::vector<std::vector<float>> mamba_host_D_;
+    std::vector<std::vector<float>> mamba_host_norm_;
+    // Host staging for the fp16 KV store (the raw K/V live on the device).
+    std::vector<float> kv_stage_k_;
+    std::vector<float> kv_stage_v_;
 
     std::vector<float> logits_host_;
     std::vector<i32>   history_;

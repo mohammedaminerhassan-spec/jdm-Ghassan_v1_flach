@@ -14,6 +14,7 @@ public:
     KVCache(const ModelConfig& cfg, int max_len, Device dev);
     KVCache(KVCache&& o) noexcept
         : k_(std::move(o.k_)), v_(std::move(o.v_)),
+          layer_to_cache_(std::move(o.layer_to_cache_)),
           max_len_(o.max_len_), kv_dim_(o.kv_dim_),
           layers_(o.layers_), len_(o.len_),
           pinned_(o.pinned_), start_(o.start_) {
@@ -25,6 +26,7 @@ public:
         if (this != &o) {
             k_ = std::move(o.k_);
             v_ = std::move(o.v_);
+            layer_to_cache_ = std::move(o.layer_to_cache_);
             max_len_ = o.max_len_;
             kv_dim_ = o.kv_dim_;
             layers_ = o.layers_;
@@ -92,16 +94,18 @@ public:
     // difference is 7.0 GiB (fp32) vs 3.5 GiB (fp16) - the difference
     // between fitting and OOM on a 16 GB T4. `k()`/`v()` return the fp32
     // view used by the kernels; `k_f16()`/`v_f16()` the packed storage.
-    float* k(int layer) { return k_[static_cast<size_t>(layer)].f32(); }
-    float* v(int layer) { return v_[static_cast<size_t>(layer)].f32(); }
-    const float* k(int layer) const { return k_[static_cast<size_t>(layer)].f32(); }
-    const float* v(int layer) const { return v_[static_cast<size_t>(layer)].f32(); }
+    // `layer` is the MODEL layer index; granite mamba layers have no cache
+    // slot and trap loudly if touched.
+    float* k(int layer) { return k_[static_cast<size_t>(cache_index(layer))].f32(); }
+    float* v(int layer) { return v_[static_cast<size_t>(cache_index(layer))].f32(); }
+    const float* k(int layer) const { return k_[static_cast<size_t>(cache_index(layer))].f32(); }
+    const float* v(int layer) const { return v_[static_cast<size_t>(cache_index(layer))].f32(); }
 
     // Packed fp16 storage (what the kernels actually read).
-    u16* k_f16(int layer) { return k_[static_cast<size_t>(layer)].ptr<u16>(); }
-    u16* v_f16(int layer) { return v_[static_cast<size_t>(layer)].ptr<u16>(); }
-    const u16* k_f16(int layer) const { return k_[static_cast<size_t>(layer)].ptr<u16>(); }
-    const u16* v_f16(int layer) const { return v_[static_cast<size_t>(layer)].ptr<u16>(); }
+    u16* k_f16(int layer) { return k_[static_cast<size_t>(cache_index(layer))].ptr<u16>(); }
+    u16* v_f16(int layer) { return v_[static_cast<size_t>(cache_index(layer))].ptr<u16>(); }
+    const u16* k_f16(int layer) const { return k_[static_cast<size_t>(cache_index(layer))].ptr<u16>(); }
+    const u16* v_f16(int layer) const { return v_[static_cast<size_t>(cache_index(layer))].ptr<u16>(); }
 
     // When true the cache keeps fp32 values (used by the training path and
     // by the CPU reference kernels).
@@ -111,7 +115,10 @@ public:
     size_t bytes() const;
 
 private:
+    int cache_index(int layer) const;
     std::vector<Tensor> k_, v_;
+    // Model layer index -> compact cache index (-1 for mamba layers).
+    std::vector<int> layer_to_cache_;
     int max_len_ = 0;
     int kv_dim_  = 0;
     int layers_  = 0;

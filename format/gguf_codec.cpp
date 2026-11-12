@@ -827,13 +827,15 @@ bool GGUFReader::load_tokenizer(Tokenizer& tk) const {
         }
     }
 
-    // A byte-level BPE vocabulary (GPT-2/Qwen/Llama-3 family). The normalizer
+    // A byte-level BPE vocabulary (GPT-2/Qwen/Granite family). The normalizer
     // is gone: text goes through the byte-level pre-tokenizer verbatim.
     const std::string pre = get_string("tokenizer.ggml.pre", "gpt-2");
     VocabOptions opts;
     {
         if (pre == "qwen2" || pre == "qwen-2" || pre == "qwen" || pre == "qwen2.5")
             opts.pretok = PreTokKind::Qwen;
+        else if (pre == "granite" || pre == "granite-4" || pre == "granite-4.0")
+            opts.pretok = PreTokKind::Granite;
         else
             opts.pretok = PreTokKind::Gpt2;
     }
@@ -1460,7 +1462,15 @@ void export_model_gguf(const std::string& path, Model& model,
     }
 
     w.set_tokenizer_model("gpt2");
-    w.set_tokenizer_pre(tok.pretok_kind() == PreTokKind::Qwen ? "qwen2" : "gpt-2");
+    // The exporter must round-trip the pre-tokenizer the model was trained
+    // with: Granite splits digits in groups of up to 3 (\p{N}{1,3}), GPT-2 and
+    // Qwen do not. Writing "gpt-2" for a Granite tokenizer re-encodes digits
+    // wrongly after a reload.
+    switch (tok.pretok_kind()) {
+        case PreTokKind::Qwen:   w.set_tokenizer_pre("qwen2"); break;
+        case PreTokKind::Granite: w.set_tokenizer_pre("granite"); break;
+        default:                 w.set_tokenizer_pre("gpt-2"); break;
+    }
     w.set_tokenizer_tokens(tok.vocab_entries());
     {
         std::vector<float> scores(static_cast<size_t>(tok.vocab_size()), 0.0f);
@@ -1491,15 +1501,44 @@ void export_model_gguf(const std::string& path, Model& model,
     w.set_tokenizer_pad_id(static_cast<uint32_t>(tok.pad_id()));
     w.set_tokenizer_add_bos(tok.add_bos());
     w.set_tokenizer_add_eos(tok.add_eos());
-    // ChatML template (Qwen-compatible): llama.cpp reads tokenizer.chat_template.
-    w.set_tokenizer_chat_template(
-        "{%- for message in messages %}"
-        "{{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
-        "{%- endfor %}"
-        "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}");
+    {
+        // The chat template must match the architecture: Granite speaks the
+        // role-tag format (<|start_of_role|>...<|end_of_role|>), Qwen speaks
+        // ChatML. Hardcoding ChatML made every Granite GGUF reload with a
+        // prompt format the model never saw in training.
+        std::string tmpl =
+            "{%- for message in messages %}"
+            "{{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
+            "{%- endfor %}"
+            "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}";
+        if (cfg.arch == ModelConfig::ArchGranite) {
+            // The role-tag format, exactly what the engine's encode_granite
+            // renders: an optional system turn (the default sentence when the
+            // caller supplies none), one turn per message, always closed by
+            // <|end_of_text|>.
+            tmpl =
+                "{%- if messages[0]['role'] == 'system' %}{%- else %}"
+                "{{- '<|start_of_role|>system<|end_of_role|>You are a helpful assistant. "
+                "Please ensure responses are professional, accurate, and safe.<|end_of_text|>\\n' }}"
+                "{%- endif %}"
+                "{%- for message in messages %}"
+                "{{- '<|start_of_role|>' + message['role'] + '<|end_of_role|>' + "
+                "message['content'] + '<|end_of_text|>\\n' }}"
+                "{%- endfor %}"
+                "{%- if add_generation_prompt %}{{- '<|start_of_role|>assistant<|end_of_role|>' }}{%- endif %}";
+        }
+        w.set_tokenizer_chat_template(tmpl);
+    }
 
-    w.add_custom_metadata("ghassan.tokenizer.pre_tokenizer",
-                          std::string("byte_bpe:gpt2_pretokenizer,byte_fallback"));
+    {
+        const char* pretok_name = "byte_bpe:gpt2_pretokenizer,byte_fallback";
+        if (tok.pretok_kind() == PreTokKind::Qwen)
+            pretok_name = "byte_bpe:qwen_pretokenizer,byte_fallback";
+        else if (tok.pretok_kind() == PreTokKind::Granite)
+            pretok_name = "byte_bpe:granite_pretokenizer(\\p{N}{1,3}),byte_fallback";
+        w.add_custom_metadata("ghassan.tokenizer.pre_tokenizer",
+                              std::string(pretok_name));
+    }
     w.add_custom_metadata("ghassan.tokenizer.specials",
                           static_cast<uint64_t>(tok.special_ids().size()));
 

@@ -248,10 +248,12 @@ struct Activations {
     Tensor proj;
     Tensor gate, up, act;
 
-    // The Mamba-2 recurrent state: [B, n_heads, d_head, d_state]. It is
-    // allocated with the activations and shared by the prefill and the decode
-    // steps that follow it.
-    Tensor mamba_state;
+    // The Mamba-2 recurrent states: one independent state per mamba layer,
+    // in layer order. [B, n_heads, d_head, d_state] each (the conv window is
+    // carried inside the scan implementation). They are allocated with the
+    // activations and shared by the prefill and the decode steps that
+    // follow. For Granite-4.0-H-Tiny that is 36 states, one per SSM layer.
+    std::vector<Tensor> mamba_states;
 
     Tensor moe_gate, moe_up, moe_act;
     Tensor moe_probs;

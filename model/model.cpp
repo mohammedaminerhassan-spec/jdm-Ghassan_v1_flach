@@ -352,6 +352,22 @@ void ModelConfig::validate() const {
         GAI_CHECK(std::isfinite(moe_aux_scale) && moe_aux_scale >= 0.0f && moe_aux_scale <= 1.0f,
                   "moe_aux_scale must be finite and in [0,1] (larger drowns CE loss)");
     }
+    // IBM Granite-4.0 hybrid: the layer kinds are part of the architecture.
+    // A missing/short/unknown layer_types list would silently build a dense
+    // transformer with attention weights on mamba layers (or the reverse).
+    if (arch == ArchGranite) {
+        GAI_CHECK(static_cast<int>(layer_types.size()) == num_layers,
+                  strfmt("granite layer_types must have exactly num_layers (%d) entries, got %zu",
+                         num_layers, layer_types.size()));
+        int n_mamba = 0, n_attn = 0;
+        for (int k : layer_types) {
+            GAI_CHECK(k == 0 || k == 1,
+                      "granite layer_types entries must be 0 (mamba) or 1 (attention)");
+            (k == 0 ? n_mamba : n_attn)++;
+        }
+        GAI_CHECK(n_mamba > 0, "granite layer_types declares no mamba layers");
+        GAI_CHECK(n_attn > 0, "granite layer_types declares no attention layers");
+    }
     // Attention kernel shared memory limit (T4: 48KB). The flash-style kernel
     // uses shared memory: sQ[hd] + sK[KV_TILE*hd] + sV[KV_TILE*hd] + sS[KV_TILE] + sAcc[hd]
     // and backward: s_dk[KV_TILE*hd] + s_dv[KV_TILE*hd] + s_dot[group].
@@ -787,22 +803,24 @@ void Model::forward_mamba_layer(Device dev, int l, Activations& act, i64 N) {
     const int d_state_tot = n_groups * d_state;   // 128 for n_groups=1
     const int conv_dim    = d_inner + 2 * d_state_tot;
 
-    // The mamba scratch buffers are allocated from the CONFIG (see
-    // make_activations), so they must exist for every mamba layer.
-    GAI_CHECK(act.mamba_state.defined() || true,
-              "granite mamba: the activation buffers are missing (rebuild the Activations)");    GAI_CHECK(L.mamba_in_proj.w.defined() && L.mamba_out_proj.w.defined() &&
+    // The recurrent states live in the activations (one per mamba layer,
+    // each per batch element), so a prefill and the following decode steps
+    // share them. The ordinal of this layer among the mamba layers is the
+    // index into the vector.
+    GAI_CHECK(L.mamba_in_proj.w.defined() && L.mamba_out_proj.w.defined() &&
                   L.mamba_conv_w.w.defined() && L.mamba_norm.w.defined() &&
                   L.mamba_A_log.w.defined() && L.mamba_D.w.defined() &&
                   L.mamba_dt_bias.w.defined(),
               "granite mamba: the layer weights are missing (load the checkpoint first)");
-
-    // The recurrent state lives in the activation (one per batch element), so
-    // a prefill and the following decode steps share it.
     const int state_rows = B * n_heads * d_head;
-    Tensor st = act.mamba_state;
+    size_t si = 0;
+    for (int k = 0; k < l && k < static_cast<int>(cfg_.layer_types.size()); ++k)
+        if (cfg_.layer_types[static_cast<size_t>(k)] == 0) ++si;
+    GAI_CHECK(si < act.mamba_states.size(),
+              "granite mamba: the recurrent state is missing for this layer");
+    Tensor& st = act.mamba_states[si];
     if (!st.defined() || st.numel() < static_cast<i64>(state_rows) * d_state) {
         st = Tensor::zeros({static_cast<i64>(state_rows) * d_state}, DType::F32, dev);
-        act.mamba_state = st;
     }
 
     ops::mamba2_forward(dev,
@@ -1443,21 +1461,23 @@ Activations Model::make_activations(int B, int T, bool with_grad, int ce_chunks)
         a.up      = mk({N, F},  device_, acc);
         a.act     = mk({N, F},  device_, acc);
     }
-    // Granite hybrid: the mamba layer scratch. The layer itself allocates
-    // its own temporaries (see ops::mamba2_forward); what the activations
-    // keep is the recurrent state, which lives across the prefill and the
-    // decode steps.
+    // Granite hybrid: the mamba layer scratch. One recurrent state per
+    // mamba layer (36 on Granite-4.0-H-Tiny); sharing a single buffer
+    // corrupted every prompt after the first mamba layer.
     {
-        bool has_mamba = false;
+        int mamba_layers = 0;
         if (cfg_.arch == ModelConfig::ArchGranite) {
-            for (int k : cfg_.layer_types) if (k == 0) { has_mamba = true; break; }
+            for (int k : cfg_.layer_types) if (k == 0) ++mamba_layers;
         }
-        if (has_mamba) {
-            const i64 d_inner = static_cast<i64>(cfg_.mamba_expand) * d;
+        if (mamba_layers > 0) {
             const i64 state_rows = static_cast<i64>(B) * cfg_.mamba_n_heads * cfg_.mamba_d_head;
-            a.mamba_state = Tensor::zeros({state_rows * cfg_.mamba_d_state}, DType::F32, device_);
-            a.bytes += a.mamba_state.nbytes();
-            (void)d_inner;
+            const i64 per = state_rows * cfg_.mamba_d_state;
+            a.mamba_states.reserve(static_cast<size_t>(mamba_layers));
+            for (int i = 0; i < mamba_layers; ++i) {
+                Tensor st = Tensor::zeros({per}, DType::F32, device_);
+                acc += st.nbytes();
+                a.mamba_states.push_back(std::move(st));
+            }
         }
     }
     a.ffn_out = mk({N, d},  device_, acc);

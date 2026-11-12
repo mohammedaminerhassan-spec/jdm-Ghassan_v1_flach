@@ -28,7 +28,7 @@ model:
   moe_shared: true
   arch: 1                        # granite
   position_embedding: 1           # NoPE
-  layer_types: "mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba"
+  layer_types: "mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba"
   embedding_multiplier: 12.0
   residual_multiplier: 0.22
   attention_multiplier: 0.0078125
