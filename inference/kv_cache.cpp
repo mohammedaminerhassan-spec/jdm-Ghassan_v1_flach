@@ -12,8 +12,14 @@ KVCache::KVCache(const ModelConfig& cfg, int max_len, Device dev)
     k_.resize(static_cast<size_t>(layers_));
     v_.resize(static_cast<size_t>(layers_));
     for (int i = 0; i < layers_; ++i) {
-        k_[static_cast<size_t>(i)] = Tensor::zeros({max_len_, kv_dim_}, DType::F32, dev);
-        v_[static_cast<size_t>(i)] = Tensor::zeros({max_len_, kv_dim_}, DType::F32, dev);
+        if (fp16_) {
+            // fp16 storage: half the bytes of the fp32 cache.
+            k_[static_cast<size_t>(i)] = Tensor::zeros({max_len_, kv_dim_}, DType::F16, dev);
+            v_[static_cast<size_t>(i)] = Tensor::zeros({max_len_, kv_dim_}, DType::F16, dev);
+        } else {
+            k_[static_cast<size_t>(i)] = Tensor::zeros({max_len_, kv_dim_}, DType::F32, dev);
+            v_[static_cast<size_t>(i)] = Tensor::zeros({max_len_, kv_dim_}, DType::F32, dev);
+        }
     }
 }
 

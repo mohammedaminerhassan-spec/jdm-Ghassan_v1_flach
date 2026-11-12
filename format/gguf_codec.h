@@ -91,14 +91,16 @@ public:
     void set_tokenizer_pre(const std::string& pre);
     void set_tokenizer_chat_template(const std::string& tmpl);
 
-    void set_u32(const std::string& key, uint32_t v);
+    void add_custom_metadata(const std::string& key, const std::string& value);
+    void add_custom_metadata(const std::string& key, uint64_t value);
+    void add_custom_metadata(const std::string& key, float value);
+    void add_custom_metadata(const std::string& key, bool value);
 
-    void set_general_type(const std::string& t);
     void set_quantization_version(uint32_t v);
     void set_size_label(const std::string& s);
+    void set_u32(const std::string& key, uint32_t v);
+    void set_general_type(const std::string& t);
 
-    void set_gtok_blob(const std::vector<uint8_t>& blob);
-    void set_normalizer_config(uint32_t bits);
     void set_tokenizer_bos_id(uint32_t id);
     void set_tokenizer_eos_id(uint32_t id);
     void set_tokenizer_unk_id(uint32_t id);
@@ -108,10 +110,6 @@ public:
     void set_quantization_profile(const std::string& profile);
     void set_file_type(uint32_t type);
     void set_description(const std::string& desc);
-    void add_custom_metadata(const std::string& key, const std::string& value);
-    void add_custom_metadata(const std::string& key, uint64_t value);
-    void add_custom_metadata(const std::string& key, float value);
-    void add_custom_metadata(const std::string& key, bool value);
 
     void add_tensor(const std::string& name, const Tensor& t, GGMLType dtype = GGMLType::F16);
     void write();
@@ -122,9 +120,6 @@ private:
     std::vector<std::pair<std::string, std::pair<Tensor, GGMLType>>> tensors_;
     std::vector<GGUFTensorInfo> tensor_infos_;
 
-    void write_metadata(std::ostream& os);
-    void write_tensor_info(std::ostream& os);
-    void write_tensor_data(std::ostream& os);
     static uint64_t align_up(uint64_t x, uint64_t alignment = 32);
     template<typename T> static void write_pod(std::ostream& os, const T& v);
     static void write_string(std::ostream& os, const std::string& s);
@@ -142,7 +137,9 @@ public:
     float get_float(const std::string& key, float def = 0.0f) const;
     bool get_bool(const std::string& key, bool def = false) const;
 
-    std::vector<uint8_t> get_blob(const std::string& key) const;
+    // Stop-token ids declared in the file (tokenizer.ggml.eos_token_id);
+    // empty when not present.
+    std::vector<i32> eos_ids() const;
 
     ModelConfig model_config() const;
     bool has_tokenizer() const;
@@ -167,7 +164,6 @@ private:
     std::vector<std::string> tokenizer_merges_;
     std::vector<float> tokenizer_scores_;
     std::vector<int32_t> tokenizer_token_types_;
-    std::vector<uint8_t> gtok_blob_;
     uint64_t file_size_ = 0;
 
     uint64_t data_start_ = 0;
@@ -181,18 +177,22 @@ private:
 
 bool load_model_from_gguf(const std::string& path, Model& model);
 
+// 8-bit is the maximum precision this engine exports at (the model ships to
+// Kaggle T4s, which have no spare VRAM for fp16 weights at load time and
+// whose serving path is an 8-bit GGUF by design). Smaller (q4_0) is fine;
+// fp16/fp32 are not accepted.
 struct ExportProfileGGUF {
-    GGMLType default_type = GGMLType::F16;
-    GGMLType embedding_type = GGMLType::F16;
+    GGMLType default_type = GGMLType::Q8_0;
+    GGMLType embedding_type = GGMLType::Q8_0;
     GGMLType norm_type = GGMLType::F32;
-    GGMLType output_type = GGMLType::F16;
-    std::string name = "fp16";
+    GGMLType output_type = GGMLType::Q8_0;
+    std::string name = "q8_k";
 };
 
 ExportProfileGGUF gguf_profile_for(const std::string& name);
 
 void export_model_gguf(const std::string& path, Model& model,
-                      const std::string& tokenizer_path,
+                      const Tokenizer&    tokenizer,
                       const ExportProfileGGUF& profile,
                       const std::map<std::string, std::string>& extra_meta = {},
                       const std::string& compat = "native");
@@ -202,6 +202,9 @@ bool llama_compat_ok(const ModelConfig& cfg, std::string* reason);
 std::string llama_tensor_name(const std::string& internal);
 
 bool llama_moe_compat_ok(const ModelConfig& cfg, std::string* reason);
+// Stop-token ids declared in the file (tokenizer.ggml.eos_token_id).
+// Empty when the key is absent.
+std::vector<i32> gguf_stop_ids(const class GGUFReader& r);
 std::string llama_moe_tensor_name(const std::string& internal);
 
 inline uint64_t GGUFWriter::align_up(uint64_t x, uint64_t alignment) {

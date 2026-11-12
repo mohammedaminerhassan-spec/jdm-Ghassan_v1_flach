@@ -8,16 +8,20 @@
 namespace gai {
 
 struct PerplexityResult {
-    double mean_nll = 0.0;
+    double mean_nll  = 0.0;
     double perplexity = 0.0;
-    i64 tokens = 0;
-    i64 batches = 0;
+    i64    tokens    = 0;
+    i64    batches   = 0;
 };
 
 PerplexityResult evaluate_perplexity(Generator& generator,
                                       const std::vector<i32>& tokens,
                                       const std::vector<u8>* mask = nullptr,
                                       const std::vector<i32>* segment_ids = nullptr);
+
+// Held-out perplexity over .gbin shards (val_*). This is the only cheap
+// quality signal worth keeping for a single-model workflow: it tells you in
+// minutes whether a training run actually regressed on unseen text.
 PerplexityResult evaluate_shard_perplexity(Generator& generator,
                                             const std::string& shard_dir,
                                             const std::string& prefix,

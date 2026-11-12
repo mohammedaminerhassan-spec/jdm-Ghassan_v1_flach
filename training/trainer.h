@@ -81,6 +81,10 @@ struct TrainerConfig {
 
     std::string pretrained_checkpoint;
 
+    // The pretrained weights are already in the model (the CLI loaded them
+    // from the --model checkpoint): the trainer must not load them twice.
+    bool  pretrained_loaded     = false;
+
     bool  allow_no_pretrained  = false;
     bool  freeze_embeddings    = false;
 

@@ -1,113 +1,64 @@
 #include "inference/chat.h"
 
-
 #include <iostream>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <limits>
 
 namespace gai {
 
 ChatSession::ChatSession(Generator& gen, ChatOptions opts)
     : gen_(gen), opts_(std::move(opts)) {
     GAI_CHECK(opts_.max_history_turns >= 0, "chat history turns must be >= 0");
-    GAI_CHECK(opts_.retrieve_top_k >= 0, "retrieve top_k must be >= 0");
     GAI_CHECK(opts_.gen.max_new_tokens >= 0, "chat max tokens must be >= 0");
-    if (opts_.system.empty()) {
-
-        opts_.system = (opts_.persona == "en" || opts_.persona == "english")
-                           ? ChatTemplate::default_system_english()
-                           : ChatTemplate::default_system();
-        custom_system_ = false;
-    } else {
-        custom_system_ = true;
+    // A system message is rendered only when one was explicitly configured.
+    // The checkpoint speaks as it was trained to speak.
+    if (!opts_.system.empty()) {
+        history_.push_back({Role::System, opts_.system});
     }
-    history_.push_back({Role::System, opts_.system});
 }
 
 void ChatSession::clear() {
-    std::string sys;
-    if (!history_.empty()) {
-        sys = history_[0].content;
-    } else if (opts_.persona == "en" || opts_.persona == "english") {
-        sys = ChatTemplate::default_system_english();
-    } else {
-        sys = ChatTemplate::default_system();
-    }
     history_.clear();
-    history_.push_back({Role::System, sys});
+    if (!opts_.system.empty()) {
+        history_.push_back({Role::System, opts_.system});
+    }
 }
 
 void ChatSession::set_system(const std::string& s) {
     opts_.system = s;
-    custom_system_ = true;
-    if (!history_.empty() && history_[0].role == Role::System) history_[0].content = s;
-    else history_.insert(history_.begin(), {Role::System, s});
-}
-
-void ChatSession::apply_script_policy(const std::string& user_message) {
-    if (history_.empty() || history_[0].role != Role::System) return;
-
-    if (opts_.persona == "en" || opts_.persona == "english") return;
-    ReplyScript script = ChatTemplate::detect_script(user_message);
-    if (!custom_system_) {
-
-        history_[0].content = ChatTemplate::system_for_script(script);
-        opts_.system = history_[0].content;
+    if (s.empty()) {
+        if (!history_.empty() && history_.front().role == Role::System)
+            history_.erase(history_.begin());
+        return;
+    }
+    if (!history_.empty() && history_.front().role == Role::System) {
+        history_.front().content = s;
     } else {
-
-        const std::string dir = ChatTemplate::script_directive(script);
-        if (history_[0].content.find(dir) == std::string::npos) {
-            history_[0].content += std::string("\n") + dir;
-        }
+        history_.insert(history_.begin(), {Role::System, s});
     }
 }
 
 void ChatSession::trim_history() {
+    // Keep: optional system message (if any) + at most max_history_turns
+    // user/assistant pairs.
+    const size_t sys = (!history_.empty() && history_.front().role == Role::System) ? 1 : 0;
+    const size_t max_msgs = sys + static_cast<size_t>(2 * opts_.max_history_turns);
+    if (history_.size() <= max_msgs) return;
 
-    if (static_cast<int>(history_.size()) <= 1 + 2 * opts_.max_history_turns) return;
-    size_t keep_from = history_.size() - static_cast<size_t>(2 * opts_.max_history_turns);
-
-    while (keep_from > 1 && history_[keep_from].role == Role::Assistant) --keep_from;
     std::vector<Message> trimmed;
-    trimmed.push_back(history_[0]);
+    if (sys) trimmed.push_back(history_.front());
+    const size_t keep_from = history_.size() - static_cast<size_t>(2 * opts_.max_history_turns);
     for (size_t i = keep_from; i < history_.size(); ++i) trimmed.push_back(history_[i]);
     history_ = std::move(trimmed);
 }
 
-bool ChatSession::try_retrieve(const std::string& /*user_message*/, std::string& /*out*/) const {
-    // Retrieval/RAG removed along with the dataset module; no-op.
-    return false;
-}
-
-
-
 std::string ChatSession::send(const std::string& user_message) {
-
-    apply_script_policy(user_message);
-
-    if (opts_.retrieve_direct) {
-        std::string retrieved;
-        if (try_retrieve(user_message, retrieved)) {
-            history_.push_back({Role::User, user_message});
-            trim_history();
-            if (opts_.stream) std::cout << retrieved << std::endl;
-            history_.push_back({Role::Assistant, retrieved});
-            return retrieved;
-        }
-    }
     history_.push_back({Role::User, user_message});
-
-    if (!opts_.retrieve_direct && !opts_.retrieve_index.empty()) {
-        std::string retrieved;
-        if (try_retrieve(user_message, retrieved)) {
-
-            history_.insert(history_.end() - 1,
-                            {Role::System, "Context (from dataset): " + retrieved});
-        }
-    }
     trim_history();
 
+    GenerationConfig turn_cfg = opts_.gen;
     std::string reply;
     Generator::StreamFn cb = nullptr;
     if (opts_.stream) {
@@ -116,7 +67,6 @@ std::string ChatSession::send(const std::string& user_message) {
             return true;
         };
     }
-    GenerationConfig turn_cfg = opts_.gen;
     reply = gen_.chat(history_, turn_cfg, cb);
     if (opts_.stream) std::cout << std::endl;
 
@@ -125,19 +75,10 @@ std::string ChatSession::send(const std::string& user_message) {
 }
 
 void ChatSession::run_repl() {
-
-    const bool en = (opts_.persona == "en" || opts_.persona == "english");
-    if (en) {
-        std::cout <<
-            "\n  Ghassan AI - chat (English)\n"
-            "  Type your message. Commands: /help /clear /system <text> /stats /quit\n"
-            "  ------------------------------------------------------------------\n\n";
-    } else {
-        std::cout <<
-            "\n  Ghassan AI - chat\n"
-            "  اكتب رسالتك بالدارجة. الأوامر: /help /clear /system <text> /stats /quit\n"
-            "  ------------------------------------------------------------------\n\n";
-    }
+    std::cout <<
+        "\n  Ghassan AI — chat\n"
+        "  /help  /clear  /system <text>  /stats  /quit\n"
+        "  ------------------------------------------------------------------\n\n";
 
     std::string line;
     while (true) {
@@ -154,8 +95,10 @@ void ChatSession::run_repl() {
             if (cmd == "quit" || cmd == "exit" || cmd == "q") break;
             if (cmd == "clear") { clear(); std::cout << "  [history cleared]\n"; continue; }
             if (cmd == "system") {
-                if (arg.empty()) std::cout << "  system: " << opts_.system << "\n";
-                else { set_system(arg); std::cout << "  [system prompt updated]\n"; }
+                if (arg.empty()) {
+                    const std::string cur = opts_.system.empty() ? "(none)" : opts_.system;
+                    std::cout << "  system: " << cur << "\n";
+                } else { set_system(arg); std::cout << "  [system prompt updated]\n"; }
                 continue;
             }
             if (cmd == "stats") {
@@ -172,7 +115,7 @@ void ChatSession::run_repl() {
                         if (t < 0.0f) t = 0.0f;
                         if (t > 5.0f) t = 5.0f;
                         opts_.gen.sampling.temperature = t;
-                        std::cout << "  [temperature = " << opts_.gen.sampling.temperature << "]\n";
+                        std::cout << "  [temperature = " << t << "]\n";
                     } catch (const std::exception&) {
                         std::cout << "  invalid temperature (want 0..5)\n";
                     }
@@ -182,7 +125,7 @@ void ChatSession::run_repl() {
             if (cmd == "help") {
                 std::cout <<
                     "  /clear          reset the conversation\n"
-                    "  /system <text>  set the system prompt\n"
+                    "  /system <text>  set the system prompt (empty = none)\n"
                     "  /temp <f>       set the sampling temperature\n"
                     "  /stats          show timing and context usage\n"
                     "  /quit           exit\n";
@@ -196,7 +139,7 @@ void ChatSession::run_repl() {
         send(line);
         if (opts_.show_stats) std::cout << "  [" << gen_.stats().summary() << "]\n";
     }
-    std::cout << (en ? "\n  Goodbye!\n" : "\n  بسلامة!\n");
+    std::cout << "\n  Goodbye!\n";
 }
 
 }

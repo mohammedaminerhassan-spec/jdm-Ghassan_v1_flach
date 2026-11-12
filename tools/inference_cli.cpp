@@ -1,16 +1,13 @@
 #include "tools/cli_common.h"
 #include "tools/model_loader.h"
-#include "tools/serve_cli.h"
 #include "core/device.h"
 #include "core/ops.h"
-#include "format/legacy_gai_format.h"
 #include "format/gguf_codec.h"
+#include "format/hf_checkpoint.h"
 #include "inference/chat.h"
-#include "quantization/quantize.h"
-#include "evaluation/benchmark.h"
 #include "evaluation/perplexity.h"
+#include "quantization/quantize.h"
 #include "training/checkpoint.h"
-
 
 #include <iostream>
 #include <fstream>
@@ -27,57 +24,49 @@
 namespace fs = std::filesystem;
 using namespace gai;
 
-static unsigned long long this_pid() {
-#ifdef _WIN32
-    return static_cast<unsigned long long>(_getpid());
-#else
-    return static_cast<unsigned long long>(::getpid());
-#endif
+static void apply_eos(GenerationConfig& g, const LoadedModel& lm) {
+    if (g.stop_tokens.empty() && !lm.eos_ids.empty()) g.stop_tokens = lm.eos_ids;
 }
 
 static void usage() {
     std::cout <<
-    "ghassan-ai - Ghassan language model (GGUF-only)\n\n"
+    "ghassan-ai - Ghassan language model engine\n\n"
     "usage:\n"
-    "  ghassan-ai chat      --model model.gguf\n"
-    "  ghassan-ai serve     --model model.gguf [--port 8080] [--host 127.0.0.1]\n"
-    "  ghassan-ai generate  --model model.gguf --prompt \"شنو هو C++؟\"\n"
-    "  ghassan-ai info      --model model.gguf\n"
-    "  ghassan-ai quantize  --model in.gguf --out out.gguf --profile q4_0\n"
-    "  ghassan-ai bench     --model model.gguf [--tokens 128]\n"
-    "  ghassan-ai tokenize  --model model.gguf --text \"شنو خبارك\"\n"
-    "  ghassan-ai tokenizer-info --tokenizer tok.gtok\n"
-    "  ghassan-ai eval      --model model.gguf --suite evaluation/en\n"
-    "  ghassan-ai perplexity --model model.gguf (--text \"held out\" | --shards artifacts/shards_en --prefix val_)\n"
-    "  ghassan-ai export    --checkpoint last.ckpt --tokenizer tok.gtok --out model.gguf [--profile fp16|q8_k|q4_0] [--compat native|llama|llama_moe]\n"
+    "  ghassan-ai chat       --model <hf-dir|model.gguf>\n"
+    "  ghassan-ai generate   --model <hf-dir|model.gguf> --prompt \"hello\"\n"
+    "  ghassan-ai info       --model <model.gguf|hf-dir>\n"
+    "  ghassan-ai quantize   --model <hf-dir|model.gguf> --out out.gguf [--profile q8_k|q4_0]\n"
+    "  ghassan-ai bench      --model <model.gguf|hf-dir> [--tokens 64]\n"
+    "  ghassan-ai tokenize   --model <hf-dir|model.gguf> --text \"salam\"\n"
+    "                          [--ids \"1 2 3\"]  decode an explicit token sequence\n"
+    "  ghassan-ai tokenizer-info --tokenizer <hf-dir|tokenizer.json>\n"
+    "  ghassan-ai export     --checkpoint last.ckpt --tokenizer <hf-dir|tokenizer.json> --out model.gguf\n"
+    "                          [--model-name \"Ghassan v1 Flash\"] [--profile q8_k|q4_0|fp16]\n"
+    "  ghassan-ai perplexity --model <model.gguf|hf-dir> (--text \"held out\" | --shards dir --prefix val_)\n"
     "  ghassan-ai devices\n"
-    "  ghassan-ai logits    --model model.gguf --prompt \"salam\" [--out logits.f32]\n\n"
+    "  ghassan-ai logits     --model <model.gguf|hf-dir> --prompt \"hi\" [--out logits.f32]\n"
+    "                          [--ids \"1 2 3\"]  an explicit token sequence (no tokenizer)\n\n"
     "formats:\n"
-    "  GGUF is the ONLY deploy format (self-contained: weights+tokenizer+config).\n"
-    "  Legacy .gai files still load for backward compat but are deprecated.\n\n"
+    "  Serve-time formats: HuggingFace checkpoint directory (config.json + safetensors\n"
+    "  + tokenizer.json) or a self-contained .gguf. Training checkpoints live in .ckpt.\n\n"
     "generation options:\n"
     "  --temp <f>        temperature            [0.8]\n"
     "  --top-k <n>       top-k                  [40]\n"
     "  --top-p <f>       nucleus                [0.92]\n"
     "  --min-p <f>       min-p                  [0.05]\n"
     "  --repeat <f>      repetition penalty     [1.12]\n"
-    "  --no-repeat-ngram <n>  ban seen n-grams  [0=off, 3 recommended for Darija]\n"
+    "  --no-repeat-ngram <n>  ban seen n-grams  [0=off]\n"
     "  --max-tokens <n>  max new tokens         [256]\n"
     "  --seed <n>        rng seed (0 = random)\n"
     "  --greedy          deterministic decoding\n"
-  "  --no-fast-sample  disable GPU fast sampling (legacy full-vocab path)\n"
-    "  --system <text>   system prompt\n"
-    "  --persona <name>  darija (default, ScriptRouter) | en (English persona)\n"
-    "  --no-adaptive     disable English dialog-act sampling presets\n"
+    "  --no-fast-sample  disable GPU fast sampling (legacy full-vocab path)\n"
+    "  --system <text>   system prompt (default: none)\n"
     "  --no-stream       print the reply at once\n"
+    "  --print-ids      print the generated token ids (verification)\n"
     "  --device auto|cpu|cuda  (metal/vulkan fall back to portable CPU)\n"
     "  --gemm-fp16 0|1        CUDA tensor-core GEMMs (default 1; 0 = pure fp32)\n"
     "  --no-fp16-cache        disable persistent FP16 inference weights\n"
-    "  --mmap              zero-copy file-backed weights (.gai, CPU inference;\n"
-    "                      weak PCs: no heap commit for F32 tensors)\n"
-    "  --retrieve-index <path>  RAG grounding: QA dir or train-*.json (paraphrase-aware)\n"
-    "  --retrieve-threshold <f> min score to use retrieved answer [3.0]\n"
-    "  --retrieve-augment       inject hit as context instead of direct answer\n";
+    "  --ctx <n>              KV cache context size (default: model max_seq_len)\n";
 }
 static std::string ggml_type_str(GGMLType t) {
     switch (t) {
@@ -103,18 +92,13 @@ static int cmd_chat(const Args& args) {
     LoadedModel lm = load_model(args);
     ChatOptions opts;
     opts.gen = make_gen_config(args);
-    opts.adaptive_dialog = !args.flag("no-adaptive", false);
     opts.gen.max_context = args.num_int("ctx", 0);
     GAI_CHECK(opts.gen.max_context >= 0, "--ctx must be >= 0");
+    apply_eos(opts.gen, lm);
     Generator gen(*lm.model, lm.tokenizer, opts.gen.max_context);
     opts.stream = !args.flag("no-stream");
     opts.show_stats = args.flag("stats");
     if (args.has("system")) opts.system = args.str("system");
-
-    if (args.has("persona")) opts.persona = args.str("persona");
-    if (args.has("retrieve-index")) opts.retrieve_index = args.str("retrieve-index");
-    if (args.has("retrieve-threshold")) opts.retrieve_threshold = args.real("retrieve-threshold", 3.0);
-    if (args.flag("retrieve-augment")) opts.retrieve_direct = false;
 
     ChatSession session(gen, opts);
     session.run_repl();
@@ -122,11 +106,11 @@ static int cmd_chat(const Args& args) {
 }
 
 static int cmd_generate(const Args& args) {
-
     LoadedModel lm = load_model(args);
     GenerationConfig g = make_gen_config(args);
     g.max_context = args.num_int("ctx", 0);
     GAI_CHECK(g.max_context >= 0, "--ctx must be >= 0");
+    apply_eos(g, lm);
     Generator gen(*lm.model, lm.tokenizer, g.max_context);
 
     std::string prompt = args.str("prompt");
@@ -136,45 +120,49 @@ static int cmd_generate(const Args& args) {
     GAI_CHECK(!prompt.empty(), "--prompt is required");
 
     bool stream = !args.flag("no-stream");
+    const bool print_ids = args.flag("print-ids", false);
+    std::vector<i32> gen_ids;
+    auto on_piece = [&](const std::string& p, i32 id) {
+        if (stream) std::cout << p << std::flush;
+        if (print_ids) gen_ids.push_back(id);
+        return true;
+    };
+    Generator::StreamFn on_tok =
+        (stream || print_ids) ? Generator::StreamFn(on_piece) : nullptr;
 
     std::string out;
     if (args.flag("raw")) {
-
-        out = gen.complete(prompt, g, stream ? Generator::StreamFn([](const std::string& p, i32) {
-            std::cout << p << std::flush;
-            return true;
-        }) : nullptr);
+        out = gen.complete(prompt, g, on_tok);
     } else {
         std::vector<Message> msgs;
-
-        std::string persona = args.str("persona", "en");
-        std::string sys = args.str("system", "");
-        if (sys.empty()) {
-            sys = ChatTemplate::system_for_persona(persona, ChatTemplate::detect_script(prompt));
-        } else if (persona == "en" || persona == "english") {
-
-        } else {
-            sys += std::string("\n") + ChatTemplate::script_directive(
-                ChatTemplate::detect_script(prompt));
-        }
-        msgs.push_back({Role::System, sys});
+        const std::string sys = args.str("system", "");
+        if (!sys.empty()) msgs.push_back({Role::System, sys});
         msgs.push_back({Role::User, prompt});
         if (args.flag("dump-prompt", false)) {
-            // Show exactly what the engine feeds the model, so a chat format
-            // mismatch is visible instead of mysterious.
-            const ChatStyle style = detect_chat_style(lm.tokenizer);
-            const std::vector<i32> ids = encode_chat(lm.tokenizer, style, msgs, true, nullptr);
-            log_info(strfmt("[prompt] chat style %d | %d tokens",
-                            static_cast<int>(style), static_cast<int>(ids.size())));
+            // The chat format follows the vocabulary (Granite role tags vs
+            // ChatML).
+            const ChatTemplate tmpl =
+                (lm.tokenizer.token_to_id("<|start_of_role|>") >= 0 &&
+                 lm.tokenizer.token_to_id("<|end_of_role|>") >= 0)
+                    ? ChatTemplate::Granite : ChatTemplate::ChatML;
+            const std::vector<i32> ids = encode_chat(lm.tokenizer, tmpl, msgs, true, nullptr);
+            log_info(strfmt("[prompt] %s | %d tokens",
+                            tmpl == ChatTemplate::Granite ? "granite" : "chatml",
+                            static_cast<int>(ids.size())));
             log_info("[prompt] " + lm.tokenizer.decode(ids, true));
         }
-        out = gen.chat(msgs, g, stream ? Generator::StreamFn([](const std::string& p, i32) {
-            std::cout << p << std::flush;
-            return true;
-        }) : nullptr);
+        out = gen.chat(msgs, g, on_tok);
     }
     if (stream) std::cout << std::endl;
     else std::cout << out << std::endl;
+    if (print_ids) {
+        std::cout << "  ids     : ";
+        for (size_t i = 0; i < gen_ids.size(); ++i) {
+            if (i) std::cout << " ";
+            std::cout << gen_ids[i];
+        }
+        std::cout << "\n";
+    }
 
     if (args.flag("stats")) std::cerr << "  " << gen.stats().summary() << "\n";
     return 0;
@@ -194,7 +182,7 @@ static int cmd_info(const Args& args) {
         std::cout << "  quant       : " << r.get_string("ghassan.quantization.profile",
                      r.get_string("general.quantization_version", "?")) << "\n";
         std::cout << "  arch        : " << r.get_string("general.architecture", "?") << "\n";
-        std::cout << "  tokenizer   : " << (r.has_tokenizer() ? "embedded (self-contained)" : "external .gtok") << "\n";
+        std::cout << "  tokenizer   : " << (r.has_tokenizer() ? "embedded (self-contained)" : "external") << "\n";
         std::cout << "\n  -- config --\n";
         std::cout << r.model_config().summary() << "\n";
 
@@ -239,143 +227,83 @@ static int cmd_info(const Args& args) {
         return 0;
     }
 
-    GaiReader r;
-    GAI_CHECK(r.open(path), "not a valid .gai file: " + path);
-
-    std::cout << "\n  file        : " << path << "\n";
-    std::cout << "  size        : " << human_bytes(r.file_size()) << "\n";
-    std::cout << "  tokenizer   : " << (r.has_tokenizer() ? "embedded" : "external") << "\n";
-    std::cout << "\n  -- metadata --\n";
-    for (const auto& [k, v] : r.meta()) std::cout << strfmt("    %-20s %s\n", k.c_str(), v.c_str());
-
-    std::cout << "\n  -- tensors (" << r.tensors().size() << ") --\n";
-    std::map<std::string, std::pair<u64, u64>> by_dtype;
-    u64 total_bytes = 0, total_params = 0;
-    for (const auto& e : r.tensors()) {
-        i64 n = 1;
-        for (i64 d : e.dims) n *= d;
-        total_params += static_cast<u64>(n);
-        total_bytes += e.nbytes;
-        auto& slot = by_dtype[dtype_name(e.dtype)];
-        slot.first++;
-        slot.second += e.nbytes;
+    // HuggingFace checkpoint directory
+    if (fs::is_directory(path)) {
+        HFCheckpoint hf;
+        GAI_CHECK(hf.open(path), "not a usable HuggingFace checkpoint: " + path);
+        const ModelConfig& c = hf.config();
+        std::cout << "\n  dir         : " << path << "\n";
+        std::cout << "  format      : HuggingFace safetensors\n";
+        std::cout << "  weights     : " << hf.weight_files().size() << " file(s)\n";
+        std::cout << "\n  -- config --\n";
+        std::cout << c.summary() << "\n";
+        std::cout << "\n  parameters  : " << human_count(Model::count_parameters(c)) << "\n";
+        std::cout << "  tie_embeddings: " << (c.tie_embeddings ? "yes" : "no") << "\n\n";
+        return 0;
     }
-    for (const auto& [dt, s] : by_dtype)
-        std::cout << strfmt("    %-6s %4llu tensors  %s\n", dt.c_str(),
-                            (unsigned long long)s.first, human_bytes(s.second).c_str());
-    std::cout << strfmt("\n  parameters  : %s (%.2f M)\n",
-                        human_count(total_params).c_str(), double(total_params) / 1e6);
-    std::cout << strfmt("  weight bytes: %s (%.2f bits/param)\n",
-                        human_bytes(total_bytes).c_str(),
-                        total_params ? 8.0 * double(total_bytes) / double(total_params) : 0.0);
 
-    if (args.flag("tensors")) {
-        std::cout << "\n  -- tensor list --\n";
-        for (const auto& e : r.tensors()) {
-            std::string dims;
-            for (size_t i = 0; i < e.dims.size(); ++i) {
-                if (i) dims += "x";
-                dims += std::to_string(e.dims[i]);
-            }
-            std::cout << strfmt("    %-28s %-14s %-6s %10s\n", e.name.c_str(), dims.c_str(),
-                                dtype_name(e.dtype), human_bytes(e.nbytes).c_str());
-        }
-    }
-    std::cout << "\n";
-    return 0;
+    GAI_CHECK(false, "not a valid model: " + path);
 }
 
 static int cmd_quantize(const Args& args) {
     std::string in = args.str("model");
     std::string out = args.str("out");
 
-    std::string prof = args.str("profile", "q4_0");
+    std::string prof = args.str("profile", "q8_k");
     GAI_CHECK(!in.empty() && !out.empty(), "--model and --out are required");
 
     const bool in_gguf = is_gguf_file(in);
     ModelConfig cfg;
     std::string tok_path = args.str("tokenizer");
-    std::string tmp_tok;
+    Tokenizer embedded_tok;
+    bool have_embedded = false;
+
     if (in_gguf) {
         GGUFReader r;
         GAI_CHECK(r.open(in), "not a valid .gguf file: " + in);
         cfg = r.model_config();
-
         if (tok_path.empty() && r.has_tokenizer()) {
             Tokenizer tk;
             GAI_CHECK(r.load_tokenizer(tk), "GGUF tokenizer payload corrupt; pass --tokenizer");
-
-            static std::atomic<unsigned long long> quant_tmp_ctr{0};
-            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-            std::string uniq = "gguf_requant_" +
-                std::to_string(this_pid() + (unsigned long long)now +
-                               quant_tmp_ctr++) + ".gtok";
-            fs::path tmp = fs::temp_directory_path() / uniq;
-            tk.save(tmp.string());
-            tmp_tok = tmp.string();
-            tok_path = tmp_tok;
+            embedded_tok = std::move(tk);
+            have_embedded = true;
+        }
+    } else if (fs::is_directory(in)) {
+        HFCheckpoint hf;
+        GAI_CHECK(hf.open(in), "not a usable HuggingFace checkpoint: " + in);
+        cfg = hf.config();
+        if (tok_path.empty()) {
+            GAI_CHECK(hf.load_tokenizer(embedded_tok),
+                      "cannot build the tokenizer from " + in + "/tokenizer.json");
+            have_embedded = true;
         }
     } else {
-        log_warn("[quant] legacy .gai input detected (deprecated) — converting to GGUF-only output");
-        GaiReader r;
-        GAI_CHECK(r.open(in), "not a valid model file: " + in + " (expected .gguf, legacy .gai accepted)");
-        cfg = r.model_config();
-        if (tok_path.empty() && r.has_tokenizer()) {
-            Tokenizer tk;
-            if (r.load_tokenizer(tk)) {
-                static std::atomic<unsigned long long> gai_tmp_ctr{0};
-                const auto now2 = std::chrono::steady_clock::now().time_since_epoch().count();
-                std::string uniq = "gai_to_gguf_" +
-                    std::to_string(this_pid() + (unsigned long long)now2 +
-                                   gai_tmp_ctr++) + ".gtok";
-                fs::path tmp = fs::temp_directory_path() / uniq;
-                tk.save(tmp.string());
-                tmp_tok = tmp.string();
-                tok_path = tmp_tok;
-            }
-        }
+        GAI_CHECK(false, "not a valid model for quantize: " + in);
     }
-    GAI_CHECK(!tok_path.empty(), "--tokenizer is required when the input has no embedded tokenizer");
+    GAI_CHECK(!tok_path.empty() || have_embedded,
+              "--tokenizer is required when the input has no embedded tokenizer");
 
     Model model(cfg, Device::CPU);
     if (in_gguf) {
         GAI_CHECK(load_model_from_gguf(in, model), "failed to load weights from: " + in);
     } else {
-        GAI_CHECK(load_model_from_gai(in, model), "failed to load legacy weights from: " + in);
+        HFCheckpoint hf;
+        GAI_CHECK(hf.open(in), "cannot reopen HuggingFace checkpoint: " + in);
+        GAI_CHECK(hf.load_model(model), "failed to load the weights of: " + in);
     }
 
-    if (args.flag("measure")) {
+    log_info(strfmt("[quant] %s -> %s   profile=%s (GGUF, 8-bit max)", in.c_str(), out.c_str(), prof.c_str()));
 
-        double worst_rel = 0.0;
-        std::string worst_name;
-        ExportProfileGGUF pp = gguf_profile_for(prof);
-        for (Parameter* p : model.parameters()) {
-            Tensor cpu = p->w.to(Device::CPU);
-            if (cpu.dtype() != DType::F32) cpu = quant::dequantize(cpu, DType::F32);
-            bool is_norm = p->name.find("norm") != std::string::npos;
-            if (is_norm) continue;
-            DType want = (p->name == "tok_embeddings" || p->name == "lm_head")
-                ? DType::F16 : DType::Q4_0;
-            if (pp.default_type == GGMLType::Q8_0) want = DType::Q4_0;
-            quant::QuantError qe = quant::measure_error(cpu, want);
-            if (qe.rel_rmse > worst_rel) { worst_rel = qe.rel_rmse; worst_name = p->name; }
-        }
-        log_info(strfmt("[quant] worst rel RMSE (Q4 probe): %.4f%% on %s",
-                        worst_rel * 100.0, worst_name.c_str()));
+    const ExportProfileGGUF profile = gguf_profile_for(prof);
+    if (have_embedded) {
+        export_model_gguf(out, model, embedded_tok, profile, {}, args.str("compat", "native"));
+    } else {
+        Tokenizer tk;
+        std::vector<i32> eos_ids;
+        GAI_CHECK(load_tokenizer_auto(args.str("tokenizer"), tk, eos_ids),
+                  "cannot load tokenizer: " + args.str("tokenizer"));
+        export_model_gguf(out, model, tk, profile, {}, args.str("compat", "native"));
     }
-
-    log_info(strfmt("[quant] %s -> %s   profile=%s (GGUF-only)", in.c_str(), out.c_str(), prof.c_str()));
-
-    struct TmpGuard {
-        std::string p;
-        ~TmpGuard() {
-            if (!p.empty()) {
-                std::error_code ec;
-                fs::remove(p, ec);
-            }
-        }
-    } tmp_guard{tmp_tok};
-    export_model_gguf(out, model, tok_path, gguf_profile_for(prof), {}, args.str("compat", "native"));
     return 0;
 }
 
@@ -391,8 +319,8 @@ static int cmd_bench(const Args& args) {
 
     const int vocab = lm.model->config().vocab_size;
     std::vector<i32> prompt;
-    prompt.push_back(special::BOS);
-    for (int i = 1; i < nprompt; ++i) prompt.push_back((300 + (i * 37)) % vocab);
+    prompt.push_back(lm.tokenizer.encode("hello", false, false).front());
+    for (int i = 1; i < nprompt; ++i) prompt.push_back(static_cast<i32>((300 + (i * 37)) % vocab));
 
     log_info(strfmt("[bench] prefill %d tokens, decode %d tokens on %s",
                     nprompt, ntok, device_name(lm.model->device())));
@@ -424,18 +352,19 @@ static int cmd_bench(const Args& args) {
 }
 
 static int cmd_tokenizer_info(const Args& args) {
-    Tokenizer tk;
-    const std::string tp = args.str("tokenizer");
+    std::string tp = args.str("tokenizer");
     GAI_CHECK(!tp.empty(), "--tokenizer is required");
-    GAI_CHECK(tk.load(tp), "cannot load tokenizer: " + tp);
+    Tokenizer tk;
+    std::vector<i32> eos_ids;
+    GAI_CHECK(load_tokenizer_auto(tp, tk, eos_ids), "cannot load tokenizer: " + tp);
 
-    // The key=value form is what the Kaggle scripts grep for.
     std::cout << "path=" << tp << "\n";
     std::cout << "vocab_size=" << tk.vocab_size() << "\n";
-    std::cout << "foreign=" << (tk.foreign() ? 1 : 0) << "\n";
     std::cout << "byte_map=" << (tk.has_byte_map() ? 1 : 0) << "\n";
+    std::cout << "special_tokens=" << tk.special_ids().size() << "\n";
     std::cout << "add_bos=" << (tk.add_bos() ? 1 : 0) << "\n";
     std::cout << "add_eos=" << (tk.add_eos() ? 1 : 0) << "\n";
+    std::cout << "eos_id=" << tk.eos_id() << "\n";
     return 0;
 }
 
@@ -443,27 +372,24 @@ static int cmd_tokenize(const Args& args) {
     Tokenizer tk;
     std::string tp = args.str("tokenizer");
     if (tp.empty() && args.has("model")) {
-
         std::string mp = args.str("model");
+        std::vector<i32> eos_ids;
         if (is_gguf_file(mp)) {
             GGUFReader gr;
             GAI_CHECK(gr.open(mp), "cannot open model");
             GAI_CHECK(gr.has_tokenizer() && gr.load_tokenizer(tk),
                       "model has no embedded tokenizer; pass --tokenizer");
         } else {
-            GaiReader r;
-            GAI_CHECK(r.open(mp), "cannot open model");
-            GAI_CHECK(r.load_tokenizer(tk), "model has no embedded tokenizer");
+            GAI_CHECK(load_tokenizer_auto(mp, tk, eos_ids), "cannot load tokenizer from " + mp);
         }
     } else {
         GAI_CHECK(!tp.empty(), "--tokenizer or --model is required");
-        GAI_CHECK(tk.load(tp), "cannot load tokenizer: " + tp);
+        std::vector<i32> eos_ids;
+        GAI_CHECK(load_tokenizer_auto(tp, tk, eos_ids), "cannot load tokenizer: " + tp);
     }
 
     if (args.has("batch")) {
-        // Batch mode: the file holds [u32 length][utf-8 bytes] records. The
-        // model is loaded once, which keeps the conformance harness cheap
-        // (one 200 MB load instead of one per sample).
+        // Batch mode: the file holds [u32 length][utf-8 bytes] records.
         std::ifstream bf(args.str("batch"), std::ios::binary);
         GAI_CHECK(bf.good(), "cannot open batch file: " + args.str("batch"));
         while (true) {
@@ -472,7 +398,7 @@ static int cmd_tokenize(const Args& args) {
             if (!bf) break;
             std::string s(len, '\0');
             if (len) bf.read(s.data(), len);
-            const std::vector<i32> bids = tk.encode(s);
+            const std::vector<i32> bids = tk.encode_default(s);
             std::cout << "{\"text\":\"" << json_escape(s) << "\",\"ids\":[";
             for (size_t i = 0; i < bids.size(); ++i) {
                 if (i) std::cout << ",";
@@ -484,12 +410,38 @@ static int cmd_tokenize(const Args& args) {
     }
     std::string text = args.str("text");
     if (text.empty() && args.positional().size() > 1) text = args.positional()[1];
+
+    if (args.has("ids")) {
+        // Decode an explicit token sequence (no tokenizer round trip).
+        std::vector<i32> ids;
+        const std::string spec = args.str("ids");
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find_first_of(", ", pos);
+            if (end == std::string::npos) end = spec.size();
+            const std::string tok = spec.substr(pos, end - pos);
+            if (!tok.empty()) ids.push_back(std::atoi(tok.c_str()));
+            pos = end + 1;
+        }
+        GAI_CHECK(!ids.empty(), "--ids is empty");
+        std::cout << "  ids     : ";
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (i) std::cout << " ";
+            std::cout << ids[i];
+        }
+        std::cout << "\n  pieces  : ";
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (i) std::cout << " | ";
+            std::cout << tk.token_text(ids[i]);
+        }
+        std::cout << "\n  decoded : " << tk.decode(ids) << "\n";
+        return 0;
+    }
+
     GAI_CHECK(!text.empty(), "--text is required");
 
-    auto ids = tk.encode(text);
+    auto ids = tk.encode_default(text);
     if (args.flag("json", false)) {
-        // Machine readable form for the conformance harness: the reference
-        // HuggingFace tokenizer must produce exactly these ids.
         std::cout << "{\"text\":\"" << json_escape(text) << "\",\"ids\":[";
         for (size_t i = 0; i < ids.size(); ++i) {
             if (i) std::cout << ",";
@@ -515,10 +467,6 @@ static int cmd_tokenize(const Args& args) {
         std::cout << ids[i];
     }
     std::cout << "\n  decoded : " << tk.decode(ids) << "\n";
-
-    auto f = tk.measure({text});
-    std::cout << strfmt("  fertility: %.3f tokens/word, %.2f bytes/token\n",
-                        f.tokens_per_word, f.bytes_per_token);
     return 0;
 }
 
@@ -535,41 +483,25 @@ static int cmd_export(const Args& args) {
 
     Model model(cfg, Device::CPU);
     TrainState loaded;
-    GAI_CHECK(Checkpoint::load(ckpt, model, static_cast<AdamW*>(nullptr), loaded), "cannot load checkpoint weights");
+    GAI_CHECK(Checkpoint::load(ckpt, model, static_cast<AdamW*>(nullptr), loaded),
+              "cannot load checkpoint weights");
     model.print_parameter_report();
 
-    std::string prof = args.str("profile", "fp16");
+    std::string prof = args.str("profile", "q8_k");
     std::string compat = args.str("compat", "native");
-    std::string tok = args.str("tokenizer");
-    GAI_CHECK(!tok.empty(), "--tokenizer is required for GGUF export (vocab is embedded)");
-    export_model_gguf(out, model, tok, gguf_profile_for(prof),
-                      {{"steps", std::to_string(loaded.step)},
-                       {"val_loss", strfmt("%.6f", loaded.best_val)}},
-                      compat);
-    return 0;
-}
+    std::string tok_path = args.str("tokenizer");
+    GAI_CHECK(!tok_path.empty(), "--tokenizer is required for GGUF export (vocab is embedded)");
+    Tokenizer tok;
+    std::vector<i32> eos_ids;
+    GAI_CHECK(load_tokenizer_auto(tok_path, tok, eos_ids),
+              "cannot load tokenizer: " + tok_path);
 
-static int cmd_eval(const Args& args) {
-    LoadedModel lm = load_model(args);
-    BenchmarkConfig bc;
-    bc.suite_dir = args.str("suite", "evaluation/en");
-    bc.max_prompts = args.num_int("limit", 0);
-    GAI_CHECK(bc.max_prompts >= 0, "--limit must be >= 0");
-    bc.gen = make_gen_config(args);
-    bc.gen.max_context = args.num_int("ctx", 1024);
-    GAI_CHECK(bc.gen.max_context >= 0, "--ctx must be >= 0");
-    Generator gen(*lm.model, lm.tokenizer, bc.gen.max_context);
-    bc.categories = args.str("categories");
-    bc.output_path = args.str("out");
-    bc.verbose = args.flag("show", false);
-
-    Benchmark bench(gen, lm.tokenizer, bc);
-    BenchmarkReport rep = bench.run();
-    std::cout << rep.to_string();
-    if (!bc.output_path.empty()) {
-        rep.write_jsonl(bc.output_path);
-        log_info("[eval] wrote " + bc.output_path);
-    }
+    std::map<std::string, std::string> meta = {
+        {"steps", std::to_string(loaded.step)},
+        {"val_loss", strfmt("%.6f", loaded.best_val)},
+    };
+    if (args.has("model-name")) meta["model_name"] = args.str("model-name");
+    export_model_gguf(out, model, tok, gguf_profile_for(prof), meta, compat);
     return 0;
 }
 
@@ -591,7 +523,7 @@ static int cmd_perplexity(const Args& args) {
     Generator gen(*lm.model, lm.tokenizer, ctx);
     PerplexityResult result;
     if (args.has("text")) {
-        std::vector<i32> tokens = lm.tokenizer.encode(args.str("text"), true, false);
+        std::vector<i32> tokens = lm.tokenizer.encode(args.str("text"), lm.tokenizer.add_bos(), false);
         result = evaluate_perplexity(gen, tokens);
     } else if (args.has("shards")) {
         result = evaluate_shard_perplexity(
@@ -619,11 +551,33 @@ static int cmd_logits(const Args& args) {
     LoadedModel lm = load_model(args);
     std::string prompt = args.str("prompt");
     if (prompt.empty() && args.positional().size() > 1) prompt = args.positional()[1];
-    GAI_CHECK(!prompt.empty(), "--prompt is required");
 
-    std::vector<i32> ids = lm.tokenizer.encode(prompt, true, false);
+    std::vector<i32> ids;
+    if (args.has("ids")) {
+        // An explicit token sequence (no tokenizer round trip): the way to
+        // check the decode path against a full prefill of the same ids.
+        const std::string spec = args.str("ids");
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find_first_of(", ", pos);
+            if (end == std::string::npos) end = spec.size();
+            const std::string tok = spec.substr(pos, end - pos);
+            if (!tok.empty()) {
+                const int v = std::atoi(tok.c_str());
+                GAI_CHECK(v >= 0 && v < lm.model->config().vocab_size,
+                          strfmt("--ids: %d is out of the vocabulary (0..%d)",
+                                 v, lm.model->config().vocab_size - 1));
+                ids.push_back(v);
+            }
+            pos = end + 1;
+        }
+        GAI_CHECK(!ids.empty(), "--ids is empty");
+    } else {
+        GAI_CHECK(!prompt.empty(), "--prompt or --ids is required");
+        ids = lm.tokenizer.encode(prompt, lm.tokenizer.add_bos(), false);
+    }
     const int T = static_cast<int>(ids.size());
-    GAI_CHECK(T > 0, "prompt encodes to zero tokens");
+    GAI_CHECK(T > 0, "the prompt encodes to zero tokens");
 
     GAI_CHECK(T <= 512, "logits prompt too long (T>512 would materialize >64MB); "
                         "split the prompt or use score_tokens/bench instead");
@@ -684,7 +638,6 @@ int main(int argc, char** argv) {
     if (cmd.empty() || args.flag("help") || cmd == "help") { usage(); return cmd.empty() ? 1 : 0; }
 
     try {
-        if (cmd == "serve")    return cmd_serve(args);
         if (cmd == "chat")     return cmd_chat(args);
         if (cmd == "generate") return cmd_generate(args);
         if (cmd == "info")     return cmd_info(args);
@@ -693,7 +646,6 @@ int main(int argc, char** argv) {
         if (cmd == "tokenize") return cmd_tokenize(args);
         if (cmd == "tokenizer-info") return cmd_tokenizer_info(args);
         if (cmd == "export")   return cmd_export(args);
-        if (cmd == "eval")     return cmd_eval(args);
         if (cmd == "perplexity") return cmd_perplexity(args);
         if (cmd == "devices")  return cmd_devices(args);
         if (cmd == "logits")   return cmd_logits(args);

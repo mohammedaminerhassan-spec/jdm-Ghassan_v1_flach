@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/common.h"
 #include "core/signals.h"
+#include "format/hf_checkpoint.h"
 #ifdef GAI_CUDA
 #include <cuda_runtime.h>
 #include "cuda/cuda_ops.h"
@@ -297,10 +298,22 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
             "model.num_experts", "model.moe_top_k", "model.moe_expert_dim",
             "model.moe_shared", "model.moe_aux_scale", "model.moe_jitter",
             "model.moe_allow_dense", "model.moe_aux_free",
-            "model.use_qk_norm", "model.z_loss_scale",
+            "model.use_qk_norm", "model.use_qkv_bias", "model.z_loss_scale",
             "model.rope_scale", "model.rope_yarn_mscale",
             "model.rope_yarn_low", "model.rope_yarn_high",
-            "model.sliding_window", "model.rope_type",
+            "model.sliding_window", "model.rope_type", "model.head_dim",
+            "model.position_embedding", "model.arch",
+            "model.embedding_multiplier", "model.residual_multiplier",
+            "model.attention_multiplier", "model.logits_scaling",
+            "model.layer_types", "model.shared_expert_intermediate_size",
+            "model.mamba_n_heads", "model.mamba_d_head", "model.mamba_d_state",
+            "model.mamba_n_groups", "model.mamba_d_conv", "model.mamba_expand",
+            "model.mamba_chunk_size", "model.mamba_conv_bias", "model.mamba_proj_bias",
+            "model.lora_rank", "model.lora_alpha",
+            "model.lora_target_q", "model.lora_target_k",
+            "model.lora_target_v", "model.lora_target_o",
+            "model.lora_target_gate", "model.lora_target_up",
+            "model.lora_target_down",
             "tokenizer.path", "tokenizer.vocab_size",
             "training.data_dir", "training.batch_size", "training.seq_len",
             "training.grad_accum", "training.max_steps", "training.epochs",
@@ -424,11 +437,19 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
 
     {
         const i64 total_params = model_.num_parameters();
+        // The memory guards below are about the FULL fine-tuning footprint
+        // (weights + grads + AdamW moments). A LoRA run keeps the base
+        // weights frozen, so only the adapters are trained: the moments are
+        // proportional to the adapter size, not to the model size. Applying
+        // the full-FT limits to a LoRA recipe would refuse a run that
+        // actually fits in 16GB.
+        const i64 trainable = model_.trainable_parameters();
+        const bool lora_run = (trainable * 4 < total_params);   // mostly frozen
+
         if (cfg_.optimizer == "adamw" && total_params > 800000000LL &&
-            model_.device() == Device::CUDA) {
+            model_.device() == Device::CUDA && !lora_run) {
             GAI_FAIL(strfmt("optimizer mismatch: %s params with AdamW needs ~%.1fGB extra moments vs Lion and OOMs T4 16GB. "
-                            "Use optimizer: lion for 1B models (see configs/pro_1b_4xt4_legacy.yaml, pro_1b_single.yaml). "
-                            "AdamW is optimal only for <=500M models (flash/pro).",
+                            "Use optimizer: lion for 1B models, or switch to LoRA (model.lora_rank > 0).",
                             human_count(static_cast<u64>(total_params)).c_str(),
                             static_cast<double>(total_params) * 4.0 / 1e9));
         }
@@ -436,7 +457,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
             log_info("[opt ] lion on a <=500M model: memory-saver mode (AdamW gives slightly better final loss here)");
         }
 
-        if (total_params > 800000000LL && model_.device() == Device::CUDA) {
+        if (total_params > 800000000LL && model_.device() == Device::CUDA && !lora_run) {
             if (cfg_.batch_size > 1) {
                 GAI_FAIL(strfmt("1B/T4 recipe: batch_size=%d OOMs 16GB (measured 14.7GB at B=1/T=512/Lion). "
                                 "Use batch_size=1 + grad_accum for throughput (see configs/pro_1b_4xt4_legacy.yaml).",
@@ -447,6 +468,13 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                                 "Use seq_len=512 for 1B on T4 (see configs/pro_1b_4xt4_legacy.yaml).",
                                 cfg_.seq_len));
             }
+        }
+
+        if (lora_run) {
+            log_info(strfmt("[opt ] LoRA run: %s total params, %s trainable "
+                            "(the full fine-tuning memory limits do not apply)",
+                            human_count(static_cast<u64>(total_params)).c_str(),
+                            human_count(static_cast<u64>(trainable)).c_str()));
         }
     }
 
@@ -504,7 +532,48 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
     }
 
     if (cfg_.is_sft()) {
-        if (!cfg_.pretrained_checkpoint.empty()) {
+        if (cfg_.pretrained_loaded) {
+            // The CLI already put the pretrained weights in the model (the
+            // --model route). Loading them again would cost a second full
+            // pass over the shards.
+            log_info("[sft ] the pretrained weights are already in the model "
+                     "(loaded by the caller)");
+        } else if (!cfg_.pretrained_checkpoint.empty()) {
+            // The pretrained weights are either a HuggingFace directory
+            // (config.json + safetensors) or one of the engine's own .ckpt
+            // files. The HF route is the normal one (the checkpoint is
+            // loaded straight into the model, no conversion step).
+            std::error_code ec;
+            const bool is_hf_dir = fs::is_directory(cfg_.pretrained_checkpoint, ec) &&
+                                   (fs::exists(fs::path(cfg_.pretrained_checkpoint) / "config.json", ec) ||
+                                    fs::exists(fs::path(cfg_.pretrained_checkpoint) / "model.safetensors", ec) ||
+                                    fs::exists(fs::path(cfg_.pretrained_checkpoint) / "model.safetensors.index.json", ec));
+            if (is_hf_dir) {
+                // The architecture comes from the checkpoint; make sure it is
+                // the same function as the recipe's model block.
+                HFCheckpoint hf_pretrained;
+                GAI_CHECK(hf_pretrained.open(cfg_.pretrained_checkpoint),
+                          "cannot open the HuggingFace checkpoint: " + cfg_.pretrained_checkpoint);
+                const ModelConfig pt_cfg = hf_pretrained.config();
+                std::string why;
+                if (!pt_cfg.same_architecture_as(model_.config(), &why) && !cfg_.allow_recipe_drift) {
+                    GAI_FAIL("SFT architecture mismatch: " + why +
+                             " (the checkpoint vs the recipe define different model functions; "
+                             "SFT would silently train the wrong architecture. Align model.* with the "
+                             "checkpoint's config.json, or pass --allow-recipe-drift for research). "
+                             "checkpoint=" + pt_cfg.arch_identity() +
+                             " recipe=" + model_.config().arch_identity());
+                }
+                if (!pt_cfg.same_architecture_as(model_.config(), &why))
+                    log_warn("[sft ] proceeding WITH architecture drift (--allow-recipe-drift): " + why);
+                else
+                    log_info("[sft ] architecture parity OK: " + model_.config().arch_identity());
+                GAI_CHECK(hf_pretrained.load_model(model_),
+                          "cannot load the weights of the pretrained checkpoint: " +
+                          cfg_.pretrained_checkpoint);
+                log_info("[sft ] pretrained weights loaded from the HuggingFace checkpoint: " +
+                         cfg_.pretrained_checkpoint);
+            } else {
             {
                 ModelConfig pt_cfg;
                 TrainState pt_peek;
@@ -530,6 +599,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                             cfg_.pretrained_checkpoint.c_str(),
                             static_cast<long long>(pretrained_state.step),
                             pretrained_state.best_val));
+            }
         } else if (!cfg_.allow_no_pretrained) {
             GAI_FAIL("SFT with no pretrained checkpoint: set training.pretrained_checkpoint "
                      "or training.allow_no_pretrained=true (testing only)");
@@ -558,6 +628,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
     BatchSpec spec{cfg_.batch_size, cfg_.seq_len, cfg_.pack_sequences};
     train_loader_.set_vocab_size(model_.config().vocab_size);
     val_loader_.set_vocab_size(model_.config().vocab_size);
+
     bool opened = false;
     if (!cfg_.mix.empty()) {
 
@@ -893,11 +964,10 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                 if (peek_st.tok_fingerprint != 0 && cfg_.tok_fingerprint != 0 &&
                     peek_st.tok_fingerprint != cfg_.tok_fingerprint) {
                     GAI_FAIL(strfmt(
-                        "tokenizer mismatch: checkpoint was trained with .gtok fingerprint %s "
+                        "tokenizer mismatch: checkpoint was trained with tokenizer fingerprint %s "
                         "but the current tokenizer is %s. Same vocab_size does NOT mean same "
                         "merges -> different token ids -> corrupted embeddings. Ship the ORIGINAL "
-                        "tokenizer file (artifacts/tokenizer/english32k.gtok) with the checkpoint, "
-                        "or start a fresh run (--resume none).",
+                        "tokenizer with the checkpoint, or start a fresh run (--resume none).",
                         fingerprint_hex(peek_st.tok_fingerprint).c_str(),
                         fingerprint_hex(cfg_.tok_fingerprint).c_str()));
                 }
@@ -1206,7 +1276,10 @@ void Trainer::log_step(double loss, float lr, double gnorm, double dt, i64 ntok)
     }
     // Phase attribution (ms/step per part; also resets the counters).
     const std::string phases = ops::phase_report(model_.device());
-    log_info(strfmt("step %6lld | loss %7.4f | ema %7.4f | ppl %8.2f | lr %.3e | gnorm %6.3f "
+    // The gradient norm is printed in a general format: a fixed "%6.3f" turned
+    // every LoRA run (norm ~1e-5) into "0.000", which reads like "no
+    // gradient" and hides a real training signal.
+    log_info(strfmt("step %6lld | loss %7.4f | ema %7.4f | ppl %8.2f | lr %.3e | gnorm %-10.4g "
                     "| %7.0f tok/s | %s | eta %s | sup %4.1f%% | ckptq %zu (%s) | perf [%s] | %s",
                     static_cast<long long>(state_.step), loss, ema_loss_,
                     std::exp(std::min(20.0, ema_loss_)), lr, gnorm, tps,
@@ -1324,6 +1397,7 @@ i64 Trainer::planned_total() const { return total_steps_; }
 
 void Trainer::run() {
 
+    wall_.reset();
     signals::install_stop_handlers();
 
     int world_sz = 1;

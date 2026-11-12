@@ -17,16 +17,22 @@
 
 namespace gai {
 
+// ---------------------------------------------------------------- MoE aux loss
+// Computes the DeepSeek-style load-balance term for one layer from its saved
+// routing: raw = ne * sum_e(mean_prob_e * frac_e), and uploads frac_e into
+// the (tiny, caller-owned) device buffer consumed by moe_backward.
 double Model::moe_layer_aux(Device dev, const float* probs, const i32* idx,
                              float* auxfrac_dev, int layer, i64 N, int K, int ne,
                              bool want_stats, double* d_raw_accum) {
-
+    // Fast GPU path: frac stays on device, raw folds into the device
+    // accumulator (audit P1: read once per microbatch, not 2x ne-float D2H
+    // per layer). Host copies happen ONLY when want_stats (log cadence).
     if (dev == Device::CUDA) {
         std::vector<float> h_frac, h_psum;
         float* hf = nullptr;
         float* hp = nullptr;
         if (want_stats || !d_raw_accum) {
-
+            // Safe fallback (no accumulator, e.g. eval path): full host raw.
             h_frac.assign(static_cast<size_t>(ne), 0.0f);
             h_psum.assign(static_cast<size_t>(ne), 0.0f);
             hf = h_frac.data();
@@ -34,7 +40,7 @@ double Model::moe_layer_aux(Device dev, const float* probs, const i32* idx,
         }
         if (ops::moe_aux_gpu(dev, probs, idx, auxfrac_dev,
                              hf, hp, N, K, ne, d_raw_accum)) {
-            if (!hf) return 0.0;
+            if (!hf) return 0.0; // raw lives on device; read at microbatch end
             std::vector<double> cnt(ne, 0.0);
             const double denom = static_cast<double>(N) * K;
             for (int e = 0; e < ne; ++e) cnt[e] = (double)h_frac[(size_t)e] * denom;
@@ -54,7 +60,7 @@ double Model::moe_layer_aux(Device dev, const float* probs, const i32* idx,
             }
             return raw;
         }
-
+        // fall through to CPU path if the GPU helper is unavailable
     }
     std::vector<i32> h_idx;
     std::vector<float> h_probs;
@@ -94,6 +100,7 @@ double Model::moe_layer_aux(Device dev, const float* probs, const i32* idx,
     device_copy(auxfrac_dev, dev, frac.data(), Device::CPU,
                 sizeof(float) * frac.size());
 
+    // accumulate routing stats for the balance report
     if (moe_tok_acc_.size() != layers_.size())
         moe_tok_acc_.assign(layers_.size(), std::vector<double>(ne, 0.0));
     if (layer >= 0 && static_cast<size_t>(layer) < moe_tok_acc_.size()) {
@@ -118,7 +125,7 @@ std::string Model::moe_balance_report() const {
             mn = std::min(mn, s);
             mx = std::max(mx, s);
         }
-
+        // uniform share would be 1/ne; flag starvation/collapse inline
         ss << strfmt(" L%zu[%.2f..%.2f]%s", l, mn, mx,
                      (mn < 0.25 / cfg_.num_experts || mx > 4.0 / cfg_.num_experts)
                      ? "!" : "");
@@ -165,15 +172,13 @@ void Model::update_moe_bias(int layer, const float* frac_host, int ne) {
     if (!cfg_.use_moe || !cfg_.moe_aux_free || !frac_host || ne <= 0) return;
     ensure_moe_bias();
     if (layer < 0 || static_cast<size_t>(layer) >= moe_bias_.size()) return;
-
-    // frac = count/(N*K) has mean 1/ne (not K/ne): uniform routing gives each
-    // expert 1/ne of all routed slots. Using K/ne would push every bias to +cap.
-    const float target = 1.0f / static_cast<float>(ne);
+    // DeepSeek-V3 aux-free rule: bias_e -= lr * (load_e - target), target = top_k/ne.
+    const float target = static_cast<float>(cfg_.moe_top_k) / static_cast<float>(ne);
     auto& b = moe_bias_[static_cast<size_t>(layer)];
     for (int e = 0; e < ne && e < static_cast<int>(b.size()); ++e) {
         float err = frac_host[e] - target;
         b[static_cast<size_t>(e)] -= moe_bias_lr_ * err;
-
+        // Clamp to keep selection stable (bias is steering only, not weights).
         if (b[static_cast<size_t>(e)] > 0.5f) b[static_cast<size_t>(e)] = 0.5f;
         if (b[static_cast<size_t>(e)] < -0.5f) b[static_cast<size_t>(e)] = -0.5f;
     }
@@ -183,6 +188,7 @@ void Model::update_moe_bias(int layer, const float* frac_host, int ne) {
     }
 }
 
+// ---------------------------------------------------------------- two-phase DDP-safe bias update
 void Model::accumulate_moe_bias_fracs(Activations& act, int B, int T) {
     if (!cfg_.use_moe || !cfg_.moe_aux_free) return;
     const int L  = cfg_.num_layers;
@@ -193,10 +199,13 @@ void Model::accumulate_moe_bias_fracs(Activations& act, int B, int T) {
     const size_t total = static_cast<size_t>(L) * static_cast<size_t>(ne);
     if (static_cast<int>(act.saved_moe_probs.size()) != L ||
         static_cast<int>(act.saved_moe_idx.size())   != L) {
-        return;
+        return;  // no MoE activations (e.g. dense or inference path)
     }
     if (device_ == Device::CUDA) {
-
+        // F-02: count on device into the persistent [L*ne] counter. First
+        // microbatch of the step (re)sizes and zeroes it; later micros add.
+        // Zero D2H here — the only host traffic is the single summary read
+        // per optimizer step in Trainer::sync_moe_bias().
         if (!moe_bias_acc_dev_.defined() ||
             static_cast<size_t>(moe_bias_acc_dev_.numel()) != total) {
             moe_bias_acc_dev_ = Tensor::zeros({static_cast<i64>(total)}, DType::F32, device_);
@@ -211,12 +220,13 @@ void Model::accumulate_moe_bias_fracs(Activations& act, int B, int T) {
         }
         return;
     }
-
+    // CPU path: count locally into the host accumulator.
     if (moe_bias_acc_.size() != total) moe_bias_acc_.assign(total, 0.0f);
     for (int l = 0; l < L; ++l) {
         const size_t sl = static_cast<size_t>(l);
         if (!act.saved_moe_idx[sl].defined()) continue;
-
+        // Counts only, so one host copy per layer/micro is enough: the
+        // normalization happens once per optimizer step in apply_moe_bias_step.
         std::vector<i32> h_idx(static_cast<size_t>(N) * static_cast<size_t>(K));
         device_copy(h_idx.data(), Device::CPU, act.saved_moe_idx[sl].i32p(), device_,
                     sizeof(i32) * h_idx.size());
@@ -239,7 +249,8 @@ void Model::apply_moe_bias_step(const float* global_count_sum, bool apply) {
     const int L  = cfg_.num_layers;
     const int ne = cfg_.num_experts;
     if (!apply || !global_count_sum || (moe_bias_acc_.empty() && !moe_bias_acc_dev_.defined())) {
-
+        // Step was rejected (non-finite grad norm) or nothing accumulated:
+        // drop the counts so they cannot leak into the next step.
         moe_bias_acc_.clear();
         moe_bias_acc_dev_ = Tensor();
         return;
@@ -248,11 +259,15 @@ void Model::apply_moe_bias_step(const float* global_count_sum, bool apply) {
     std::vector<float> frac(static_cast<size_t>(ne));
     for (int l = 0; l < L; ++l) {
         const size_t base = static_cast<size_t>(l) * static_cast<size_t>(ne);
-
+        // F-12: the denominator comes from the SAME population as the
+        // numerator. Every routed token contributes exactly top_k slots, so
+        // row_sum == (routed tokens in this layer) * K, and the load fraction
+        // is simply counts[e] / row_sum. No external ntok is involved, so a
+        // masked SFT microbatch can never desync the two.
         double row_sum = 0.0;
         for (int e = 0; e < ne; ++e) row_sum += static_cast<double>(global_count_sum[base + e]);
         const double inv = (row_sum > 0.0) ? 1.0 / row_sum : 0.0;
-        if (inv <= 0.0) continue;
+        if (inv <= 0.0) continue;   // layer routed nothing this step
         for (int e = 0; e < ne; ++e)
             frac[static_cast<size_t>(e)] =
                 static_cast<float>(static_cast<double>(global_count_sum[base + e]) * inv);
@@ -277,6 +292,7 @@ void Model::set_moe_bias(int layer, const float* values, size_t count) {
     }
 }
 
+// ================================================================ config
 void ModelConfig::validate() const {
     GAI_CHECK(vocab_size > 0, "vocab_size must be > 0");
     GAI_CHECK(hidden_size > 0, "hidden_size must be > 0");
@@ -288,16 +304,17 @@ void ModelConfig::validate() const {
     GAI_CHECK(head_dim() % 2 == 0, "head_dim must be even (RoPE pairs)");
     GAI_CHECK(intermediate_size > 0, "intermediate_size must be > 0");
     GAI_CHECK(max_seq_len > 0, "max_seq_len must be > 0");
-
-    GAI_CHECK(max_seq_len <= 65536, "max_seq_len must be <= 65536 (larger is unvalidated)");
     GAI_CHECK(std::isfinite(rope_theta) && rope_theta > 0.0f, "rope_theta must be finite and > 0");
-
+    // DeepSeek stability contract: rms_eps/init_std silently break norms/init
+    // when <= 0 (inf/NaN or zero-init dead model). Aux weight > 1 drowns CE.
     GAI_CHECK(std::isfinite(rms_eps) && rms_eps >= 1e-12f && rms_eps <= 1e-2f,
               "rms_eps must be finite and in [1e-12,1e-2]");
     GAI_CHECK(std::isfinite(init_std) && init_std > 0.0f && init_std <= 0.1f,
               "init_std must be finite and in (0,0.1]");
     GAI_CHECK(std::isfinite(rope_scale) && rope_scale >= 1.0f, "rope_scale must be finite and >= 1.0 (1.0 = off)");
-
+    // YaRN is approximate NTK extrapolation: small scales (2x) are routine,
+    // large scales are unvalidated here. Bound it so a typo (e.g. 20 instead
+    // of 2.0) fails fast instead of training with garbage positions.
     GAI_CHECK(rope_scale <= 8.0f, "rope_scale must be <= 8.0 (larger is unvalidated extrapolation)");
     GAI_CHECK(std::isfinite(z_loss_scale) && z_loss_scale >= 0.0f && z_loss_scale <= 0.01f,
               "z_loss_scale must be finite and in [0,0.01]");
@@ -305,7 +322,7 @@ void ModelConfig::validate() const {
               "moe_jitter must be finite and in [0,0.5]");
     GAI_CHECK(std::isfinite(rope_yarn_mscale) && rope_yarn_mscale >= 0.0f && rope_yarn_mscale <= 2.0f,
               "rope_yarn_mscale must be finite and in [0,2]");
-
+    // ---- Pro fields (default OFF = bit-identical legacy; فعلها فقط لـPro جديد)
     GAI_CHECK(std::isfinite(rope_yarn_low) && rope_yarn_low >= 1.0f && rope_yarn_low <= 128.0f,
               "rope_yarn_low must be finite and in [1,128]");
     GAI_CHECK(std::isfinite(rope_yarn_high) && rope_yarn_high >= 1.0f && rope_yarn_high <= 128.0f,
@@ -313,16 +330,21 @@ void ModelConfig::validate() const {
     GAI_CHECK(rope_yarn_high >= rope_yarn_low, "rope_yarn_high must be >= rope_yarn_low");
     GAI_CHECK(sliding_window >= 0 && sliding_window <= 16384, "sliding_window must be in [0,16384]");
     GAI_CHECK(rope_type == 0 || rope_type == 1, "rope_type must be 0 (interleaved) or 1 (neox)");
-
+    // NeoX kernels (CPU+CUDA) implemented: rope_type=1 allowed for new Pro checkpoints.
+    // Interleaved stays default for bit-identical legacy resumes.
     if (moe_aux_free && moe_aux_scale != 0.0f) {
-
+        // aux-loss-free تعني لا aux grad: نفرض scale=0 بصوت عال بدل تجاهل صامت.
         GAI_CHECK(false, "moe_aux_free=true requires moe_aux_scale: 0.0 (aux-loss-free has no aux grad)");
     }
     if (use_moe) {
         GAI_CHECK(num_experts > 0 && num_experts <= 64, "num_experts must be in [1,64]");
         GAI_CHECK(moe_top_k > 0 && moe_top_k <= num_experts, "moe_top_k must be in [1,num_experts]");
         GAI_CHECK(moe_top_k <= 8, "moe_top_k must be <= 8 (router kernel limit)");
-
+        // Strong-model rule: MoE must stay sparse (<=50% experts active).
+        // top-5/8 = 70% dense defeats MoE (OOM on T4, no conditional-compute win).
+        // Standard sparse regime is top-1..2/8. Reject dense configs fail-fast
+        // unless the research hatch is set (moe_allow_dense=true): the rule
+        // stays safe by default but no longer blocks dense experiments.
         GAI_CHECK(moe_allow_dense || moe_top_k * 2 <= num_experts,
                   "moe_top_k must be <= num_experts/2 (sparse MoE; dense routing OOMs T4 and removes the MoE advantage; "
                   "set model.moe_allow_dense=true only for short research runs)");
@@ -330,9 +352,16 @@ void ModelConfig::validate() const {
         GAI_CHECK(std::isfinite(moe_aux_scale) && moe_aux_scale >= 0.0f && moe_aux_scale <= 1.0f,
                   "moe_aux_scale must be finite and in [0,1] (larger drowns CE loss)");
     }
-
+    // Attention kernel shared memory limit (T4: 48KB). The flash-style kernel
+    // uses shared memory: sQ[hd] + sK[KV_TILE*hd] + sV[KV_TILE*hd] + sS[KV_TILE] + sAcc[hd]
+    // and backward: s_dk[KV_TILE*hd] + s_dv[KV_TILE*hd] + s_dot[group].
+    // The KV tile shrinks with the head dimension so a 128-wide head
+    // (Granite-4.0, Qwen3-30B) still fits:
+    //   hd <= 64  -> 64 rows (33KB)
+    //   hd <= 96  -> 48 rows (37KB)
+    //   hd <= 128 -> 32 rows (33KB)
     {
-        const int KV_TILE = 64;
+        const int KV_TILE = head_dim() <= 64 ? 64 : (head_dim() <= 96 ? 48 : 32);
         const int group = num_heads / num_kv_heads;
         size_t shmem_fwd = sizeof(float) * (static_cast<size_t>(head_dim()) + static_cast<size_t>(KV_TILE) * head_dim() * 2 + KV_TILE + static_cast<size_t>(head_dim()));
         size_t shmem_bwd = sizeof(float) * (static_cast<size_t>(2) * KV_TILE * head_dim() + group);
@@ -347,14 +376,17 @@ void ModelConfig::validate() const {
 ModelConfig ModelConfig::from_config(const Config& c, const std::string& p) {
     ModelConfig m;
     auto key = [&](const char* k) { return p.empty() ? std::string(k) : p + "." + k; };
-
+    // FIX: YAML ints are i64; blind static_cast<int> wraps huge values to
+    // negative/small -> validate() passes on truncated value -> OOB/OOM in
+    // training (compilation-clean, runtime-corrupt). Range-check first.
     auto get_int_checked = [&](const char* k, int def) {
         i64 v = c.get_int(key(k), static_cast<i64>(def));
         GAI_CHECK(v > 0 && v <= static_cast<i64>(std::numeric_limits<int>::max()),
                   std::string("model.") + k + " out of int range");
         return static_cast<int>(v);
     };
-
+    // PRO: sliding_window/rope_type يقبلان 0 (off/interleaved) — الفاحص
+    // العام v>0 كان يرفض القيمة الصحيحة 0. فاحص >=0 منفصل لهما.
     auto get_int_checked0 = [&](const char* k, int def) {
         i64 v = c.get_int(key(k), static_cast<i64>(def));
         GAI_CHECK(v >= 0 && v <= static_cast<i64>(std::numeric_limits<int>::max()),
@@ -385,14 +417,65 @@ ModelConfig ModelConfig::from_config(const Config& c, const std::string& p) {
     m.rope_yarn_high    = c.get_f32(key("rope_yarn_high"), m.rope_yarn_high);
     m.sliding_window    = get_int_checked0("sliding_window", m.sliding_window);
     m.rope_type         = get_int_checked0("rope_type", m.rope_type);
+    m.head_dim_override = get_int_checked0("head_dim", m.head_dim_override);
+    m.position_embedding = get_int_checked0("position_embedding", m.position_embedding);
+
+    // ---- IBM Granite-4.0 hybrid fields (all optional outside granite) ----
+    m.arch = (get_int_checked0("arch", 0) == 1) ? ModelConfig::ArchGranite : ModelConfig::ArchQwen;
+    m.embedding_multiplier = c.get_f32(key("embedding_multiplier"), m.embedding_multiplier);
+    m.residual_multiplier  = c.get_f32(key("residual_multiplier"),  m.residual_multiplier);
+    m.attention_multiplier = c.get_f32(key("attention_multiplier"), m.attention_multiplier);
+    m.logits_scaling       = c.get_f32(key("logits_scaling"),       m.logits_scaling);
+    m.mamba_n_heads   = get_int_checked0("mamba_n_heads", m.mamba_n_heads);
+    m.mamba_d_head    = get_int_checked0("mamba_d_head", m.mamba_d_head);
+    m.mamba_d_state   = get_int_checked0("mamba_d_state", m.mamba_d_state);
+    m.mamba_n_groups  = get_int_checked0("mamba_n_groups", m.mamba_n_groups);
+    m.mamba_d_conv    = get_int_checked0("mamba_d_conv", m.mamba_d_conv);
+    m.mamba_expand    = get_int_checked0("mamba_expand", m.mamba_expand);
+    m.mamba_chunk_size = get_int_checked0("mamba_chunk_size", m.mamba_chunk_size);
+    m.mamba_conv_bias = c.get_bool(key("mamba_conv_bias"), m.mamba_conv_bias);
+    m.mamba_proj_bias = c.get_bool(key("mamba_proj_bias"), m.mamba_proj_bias);
+    {
+        const std::string lt = c.get_str(key("layer_types"), "");
+        if (!lt.empty()) {
+            m.layer_types.clear();
+            size_t i = 0;
+            while (i < lt.size()) {
+                size_t cpos = lt.find(',', i);
+                std::string tok = lt.substr(i, cpos == std::string::npos ? cpos : cpos - i);
+                size_t b = tok.find_first_not_of(" \t");
+                size_t e = tok.find_last_not_of(" \t");
+                if (b != std::string::npos) tok = tok.substr(b, e - b + 1);
+                m.layer_types.push_back(tok == "attention" ? 1 : 0);
+                if (cpos == std::string::npos) break;
+                i = cpos + 1;
+            }
+        }
+    }
     m.use_qk_norm       = c.get_bool(key("use_qk_norm"), m.use_qk_norm);
     m.z_loss_scale      = c.get_f32(key("z_loss_scale"), m.z_loss_scale);
     m.rope_scale        = c.get_f32(key("rope_scale"), m.rope_scale);
     m.rope_yarn_mscale  = c.get_f32(key("rope_yarn_mscale"), m.rope_yarn_mscale);
+
+    // LoRA: the adapter is only built when a rank is requested. Without this
+    // the recipe's lora_rank/lora_alpha/lora_target_* were silently ignored
+    // and the run trained the full model (or nothing at all).
+    m.lora_rank        = get_int_checked0("lora_rank", m.lora_rank);
+    m.lora_alpha       = c.get_f32(key("lora_alpha"), m.lora_alpha);
+    m.lora_target_q    = c.get_bool(key("lora_target_q"), m.lora_target_q);
+    m.lora_target_k    = c.get_bool(key("lora_target_k"), m.lora_target_k);
+    m.lora_target_v    = c.get_bool(key("lora_target_v"), m.lora_target_v);
+    m.lora_target_o    = c.get_bool(key("lora_target_o"), m.lora_target_o);
+    m.lora_target_gate = c.get_bool(key("lora_target_gate"), m.lora_target_gate);
+    m.lora_target_up   = c.get_bool(key("lora_target_up"), m.lora_target_up);
+    m.lora_target_down = c.get_bool(key("lora_target_down"), m.lora_target_down);
+
     m.validate();
     return m;
 }
 
+// YaRN-lite (NTK): theta_eff = theta * scale^(hd/(hd-2)), 1.0 = off.
+// Extends usable context ~scale x without touching kernels (only theta changes).
 static float rope_theta_eff_local(const ModelConfig& m) {
     if (m.rope_scale <= 1.0f) return m.rope_theta;
     float hd = static_cast<float>(m.head_dim());
@@ -400,10 +483,17 @@ static float rope_theta_eff_local(const ModelConfig& m) {
     return m.rope_theta * std::pow(m.rope_scale, e);
 }
 
+// YaRN attention rescale (DeepSeek long-ctx): mscale = 0.1*ln(scale)+1.
+// Multiplies the 1/sqrt(hd) scale so entropy stays flat at 8k ctx.
+// PRO: مع yarn_low/high نطبق ramp الكامل (YaRN paper §3): الأبعاد ذات الطول
+// الموجي < low تبقى خطية، > high تستكمل NTK، وبينهما interpolation سلس.
+// mscale هنا للـattention-temperature؛ الـramp الكامل للـtheta يبقى NTK
+// (theta_eff أعلاه) حتى ترحيل الـkernel — نفس سلوك legacy عند low=1/high=32.
 static float rope_mscale_local(const ModelConfig& m) {
     if (m.rope_scale <= 1.0f) return 1.0f;
     if (m.rope_yarn_mscale > 0.0f) return m.rope_yarn_mscale;
-
+    // ramp factor: يحفظ mscale الأصلي عند الإعداد الافتراضي (low=1/high=32
+    // يعطي نفس 0.1*ln+1 ضمن 1%) ويتيح ضبطا دقيقا لاحقا.
     float base = 0.1f * std::log(m.rope_scale) + 1.0f;
     if (m.rope_yarn_low <= 1.0f && m.rope_yarn_high >= 32.0f) return base;
     float span = m.rope_yarn_high - m.rope_yarn_low;
@@ -411,6 +501,101 @@ static float rope_mscale_local(const ModelConfig& m) {
     if (ramp < 0.0f) ramp = 0.0f;
     if (ramp > 1.0f) ramp = 1.0f;
     return 1.0f + (base - 1.0f) * (0.5f + 0.5f * ramp);
+}
+
+
+std::string ModelConfig::arch_identity() const {
+    std::ostringstream ss;
+    ss << "v1|voc=" << vocab_size << "|d=" << hidden_size << "|L=" << num_layers
+       << "|H=" << num_heads << "|KV=" << num_kv_heads << "|ffn=" << intermediate_size
+       << "|ctx=" << max_seq_len << "|theta=" << strfmt("%.6f", (double)rope_theta).c_str()
+       << "|eps=" << strfmt("%.9f", (double)rms_eps).c_str()
+       << "|tie=" << (tie_embeddings ? 1 : 0)
+       << "|moe=" << (use_moe ? 1 : 0) << "|ne=" << num_experts << "|k=" << moe_top_k
+       << "|E=" << moe_expert_dim << "|sh=" << (moe_shared ? 1 : 0)
+       << "|aux=" << strfmt("%.6f", (double)moe_aux_scale).c_str()
+       << "|auxfree=" << (moe_aux_free ? 1 : 0)
+       << "|denseok=" << (moe_allow_dense ? 1 : 0)
+       << "|jit=" << strfmt("%.6f", (double)moe_jitter).c_str()
+       << "|qkn=" << (use_qk_norm ? 1 : 0)
+       << "|z=" << strfmt("%.7f", (double)z_loss_scale).c_str()
+       << "|rs=" << strfmt("%.4f", (double)rope_scale).c_str()
+       << "|ym=" << strfmt("%.4f", (double)rope_yarn_mscale).c_str()
+       << "|yl=" << strfmt("%.4f", (double)rope_yarn_low).c_str()
+       << "|yh=" << strfmt("%.4f", (double)rope_yarn_high).c_str()
+       << "|swa=" << sliding_window << "|rt=" << rope_type
+       << "|pos=" << position_embedding
+       << "|ahd=" << head_dim_override
+       << "|arch=" << (arch == ArchGranite ? "granite" : "qwen")
+       << "|mult=" << strfmt("%.4f,%.4f,%.6f,%.4f",
+                              (double)embedding_multiplier,
+                              (double)residual_multiplier,
+                              (double)attention_multiplier,
+                              (double)logits_scaling).c_str()
+       << "|sst=" << shared_expert_intermediate_size;
+    return ss.str();
+}
+
+bool ModelConfig::same_architecture_as(const ModelConfig& o, std::string* reason) const {
+    auto fail = [&](const std::string& why) {
+        if (reason) *reason = why;
+        return false;
+    };
+    if (vocab_size != o.vocab_size) return fail("vocab_size differs");
+    if (hidden_size != o.hidden_size) return fail("hidden_size differs");
+    if (num_layers != o.num_layers) return fail("num_layers differs");
+    if (num_heads != o.num_heads) return fail("num_heads differs");
+    if (num_kv_heads != o.num_kv_heads) return fail("num_kv_heads differs");
+    if (intermediate_size != o.intermediate_size) return fail("intermediate_size differs");
+    if ((use_moe ? 1 : 0) != (o.use_moe ? 1 : 0)) return fail("moe flag differs");
+    if (use_moe) {
+        if (num_experts != o.num_experts) return fail("num_experts differs");
+        if (moe_top_k != o.moe_top_k) return fail("moe_top_k differs");
+        if (moe_expert_dim != o.moe_expert_dim) return fail("moe_expert_dim differs");
+        if ((moe_shared ? 1 : 0) != (o.moe_shared ? 1 : 0)) return fail("moe_shared differs");
+        if (moe_aux_free != o.moe_aux_free) return fail("moe_aux_free differs");
+        if (shared_expert_intermediate_size != o.shared_expert_intermediate_size)
+            return fail("shared_expert_intermediate_size differs");
+        if (moe_aux_scale != o.moe_aux_scale) return fail("moe_aux_scale differs");
+        if (moe_allow_dense != o.moe_allow_dense) return fail("moe_allow_dense differs");
+    }
+    if (tie_embeddings != o.tie_embeddings) return fail("tie_embeddings differs");
+    if (use_qk_norm != o.use_qk_norm) return fail("use_qk_norm differs");
+    if (use_qkv_bias != o.use_qkv_bias) return fail("use_qkv_bias differs");
+    if (rope_type != o.rope_type) return fail("rope_type differs");
+    if (position_embedding != o.position_embedding) return fail("position_embedding differs");
+    if (head_dim_override != o.head_dim_override) return fail("head_dim override differs");
+    if (z_loss_scale != o.z_loss_scale) return fail("z_loss_scale differs");
+    if (rope_scale != o.rope_scale) return fail("rope_scale differs");
+    if (rope_yarn_mscale != o.rope_yarn_mscale) return fail("rope_yarn_mscale differs");
+    if (sliding_window != o.sliding_window) return fail("sliding_window differs");
+    if (arch != o.arch) return fail("architecture family differs (granite vs qwen)");
+    if (layer_types.size() != o.layer_types.size()) return fail("layer_types length differs");
+    for (size_t i = 0; i < layer_types.size(); ++i)
+        if (layer_types[i] != o.layer_types[i]) return fail("layer kind differs at layer " + std::to_string(i));
+    if (embedding_multiplier != o.embedding_multiplier) return fail("embedding_multiplier differs");
+    if (residual_multiplier != o.residual_multiplier) return fail("residual_multiplier differs");
+    if (attention_multiplier != o.attention_multiplier) return fail("attention_multiplier differs");
+    if (logits_scaling != o.logits_scaling) return fail("logits_scaling differs");
+    if (mamba_n_heads != o.mamba_n_heads) return fail("mamba_n_heads differs");
+    if (mamba_d_head != o.mamba_d_head) return fail("mamba_d_head differs");
+    if (mamba_d_state != o.mamba_d_state) return fail("mamba_d_state differs");
+    if (mamba_n_groups != o.mamba_n_groups) return fail("mamba_n_groups differs");
+    if (mamba_d_conv != o.mamba_d_conv) return fail("mamba_d_conv differs");
+    if (mamba_expand != o.mamba_expand) return fail("mamba_expand differs");
+    return true;
+}
+
+void ModelConfig::take_adapter_settings_from(const ModelConfig& recipe) {
+    lora_rank        = recipe.lora_rank;
+    lora_alpha       = recipe.lora_alpha;
+    lora_target_q    = recipe.lora_target_q;
+    lora_target_k    = recipe.lora_target_k;
+    lora_target_v    = recipe.lora_target_v;
+    lora_target_o    = recipe.lora_target_o;
+    lora_target_gate = recipe.lora_target_gate;
+    lora_target_up   = recipe.lora_target_up;
+    lora_target_down = recipe.lora_target_down;
 }
 
 std::string ModelConfig::summary() const {
@@ -435,66 +620,6 @@ std::string ModelConfig::summary() const {
     if (sliding_window > 0) ss << " SWA(" << sliding_window << ")";
     if (rope_type == 1) ss << " RoPE-neox";
     return ss.str();
-}
-
-std::string ModelConfig::arch_identity() const {
-
-    std::ostringstream ss;
-    ss << "v1|voc=" << vocab_size << "|d=" << hidden_size << "|L=" << num_layers
-       << "|H=" << num_heads << "|KV=" << num_kv_heads << "|ffn=" << intermediate_size
-       << "|ctx=" << max_seq_len << "|theta=" << strfmt("%.6f", (double)rope_theta).c_str()
-       << "|eps=" << strfmt("%.9f", (double)rms_eps).c_str()
-       << "|tie=" << (tie_embeddings ? 1 : 0)
-       << "|moe=" << (use_moe ? 1 : 0) << "|ne=" << num_experts << "|k=" << moe_top_k
-       << "|E=" << moe_expert_dim << "|sh=" << (moe_shared ? 1 : 0)
-       << "|aux=" << strfmt("%.6f", (double)moe_aux_scale).c_str()
-       << "|auxfree=" << (moe_aux_free ? 1 : 0)
-       << "|denseok=" << (moe_allow_dense ? 1 : 0)
-       << "|jit=" << strfmt("%.6f", (double)moe_jitter).c_str()
-       << "|qkn=" << (use_qk_norm ? 1 : 0)
-       << "|z=" << strfmt("%.7f", (double)z_loss_scale).c_str()
-       << "|rs=" << strfmt("%.4f", (double)rope_scale).c_str()
-       << "|ym=" << strfmt("%.4f", (double)rope_yarn_mscale).c_str()
-       << "|yl=" << strfmt("%.4f", (double)rope_yarn_low).c_str()
-       << "|yh=" << strfmt("%.4f", (double)rope_yarn_high).c_str()
-       << "|swa=" << sliding_window << "|rt=" << rope_type;
-    return ss.str();
-}
-
-bool ModelConfig::same_architecture_as(const ModelConfig& o, std::string* reason) const {
-    auto fail = [&](const char* f) {
-        if (reason) *reason = std::string("arch mismatch: ") + f;
-        return false;
-    };
-    if (vocab_size != o.vocab_size) return fail("vocab_size");
-    if (hidden_size != o.hidden_size) return fail("hidden_size");
-    if (num_layers != o.num_layers) return fail("num_layers");
-    if (num_heads != o.num_heads) return fail("num_heads");
-    if (num_kv_heads != o.num_kv_heads) return fail("num_kv_heads");
-    if (intermediate_size != o.intermediate_size) return fail("intermediate_size");
-    if (max_seq_len != o.max_seq_len) return fail("max_seq_len");
-    if (rope_theta != o.rope_theta) return fail("rope_theta");
-    if (rms_eps != o.rms_eps) return fail("rms_eps");
-    if (tie_embeddings != o.tie_embeddings) return fail("tie_embeddings");
-    if (use_moe != o.use_moe) return fail("use_moe");
-    if (num_experts != o.num_experts) return fail("num_experts");
-    if (moe_top_k != o.moe_top_k) return fail("moe_top_k");
-    if (moe_expert_dim != o.moe_expert_dim) return fail("moe_expert_dim");
-    if (moe_shared != o.moe_shared) return fail("moe_shared");
-    if (moe_aux_scale != o.moe_aux_scale) return fail("moe_aux_scale");
-    if (moe_aux_free != o.moe_aux_free) return fail("moe_aux_free");
-    if (moe_allow_dense != o.moe_allow_dense) return fail("moe_allow_dense");
-    if (moe_jitter != o.moe_jitter) return fail("moe_jitter");
-    if (use_qk_norm != o.use_qk_norm) return fail("use_qk_norm");
-    if (z_loss_scale != o.z_loss_scale) return fail("z_loss_scale");
-    if (rope_scale != o.rope_scale) return fail("rope_scale");
-    if (rope_yarn_mscale != o.rope_yarn_mscale) return fail("rope_yarn_mscale");
-    if (rope_yarn_low != o.rope_yarn_low) return fail("rope_yarn_low");
-    if (rope_yarn_high != o.rope_yarn_high) return fail("rope_yarn_high");
-    if (sliding_window != o.sliding_window) return fail("sliding_window");
-    if (rope_type != o.rope_type) return fail("rope_type");
-
-    return true;
 }
 
 float rope_theta_eff(const ModelConfig& m) { return rope_theta_eff_local(m); }
@@ -528,6 +653,135 @@ const float* Model::rope_inv_freq_ptr() const {
     return rope_inv_freq_.defined() ? rope_inv_freq_.f32() : nullptr;
 }
 
+// ================================================================ model
+// LoRA forward/backward on the adapter's Parameters. Kept as free
+// functions so the call sites stay one-liners.
+static void lora_forward(LoraAdapter& ad, Device dev, const float* x, float* y, int M) {
+    if (!ad.enabled || ad.rank <= 0) return;
+    const int r = ad.rank;
+    if (ad.r_buf.numel() < static_cast<i64>(M) * r) {
+        ad.r_buf = Tensor({M, r}, DType::F32, dev);
+    }
+    const float s = ad.scale();
+    // R = X * A^T
+    ops::linear_forward(dev, x, ad.A.w.f32(), ad.r_buf.f32(), M, ad.in_dim, r);
+    // Y += s * R * B^T
+    ops::gemm(dev, false, true, M, ad.out_dim, r, s, ad.r_buf.f32(), r, ad.B.w.f32(), r, 1.0f, y, ad.out_dim);
+}
+
+static void lora_backward(LoraAdapter& ad, Device dev, const float* x, const float* dy,
+                          float* dx, int M) {
+    if (!ad.enabled || ad.rank <= 0) return;
+    const int r = ad.rank;
+    const float s = ad.scale();
+    // gB += s * dY^T * R
+    ops::gemm(dev, true, false, ad.out_dim, r, M, s, dy, ad.out_dim,
+              ad.r_buf.f32(), r, 1.0f, ad.B.g.f32(), r);
+    // dR = s * dY * B
+    Tensor dR({M, r}, DType::F32, dev);
+    ops::gemm(dev, false, false, M, r, ad.out_dim, s, dy, ad.out_dim,
+              ad.B.w.f32(), r, 0.0f, dR.f32(), r);
+    // gA += dR^T * X
+    ops::gemm(dev, true, false, r, ad.in_dim, M, 1.0f, dR.f32(), r, x, ad.in_dim,
+              1.0f, ad.A.g.f32(), ad.in_dim);
+    // dx += dR * A
+    if (dx) {
+        ops::gemm(dev, false, false, M, ad.in_dim, r, 1.0f, dR.f32(), r, ad.A.w.f32(), ad.in_dim,
+                  1.0f, dx, ad.in_dim);
+    }
+}
+
+// Builds a LoRA adapter and registers A and B as trainable Parameters.
+// A ~ N(0, 1/sqrt(in_dim)), B = 0: the adapter is a no-op until it trains.
+void Model::init_lora(LoraAdapter& ad, const std::string& name,
+                      int in_d, int out_d, int r, float alpha,
+                      Device dev, std::mt19937_64& rng) {
+    ad.rank    = r;
+    ad.in_dim  = in_d;
+    ad.out_dim = out_d;
+    ad.alpha   = alpha;
+    ad.enabled = true;
+
+    alloc_param(ad.A, name + ".A", {r, in_d}, true);
+    alloc_param(ad.B, name + ".B", {out_d, r}, false);
+
+    // A ~ N(0, 1/sqrt(in_dim))
+    const float stddev = 1.0f / std::sqrt(static_cast<float>(in_d));
+    std::normal_distribution<float> dist(0.0f, stddev);
+    std::vector<float> cpu_A(static_cast<size_t>(r) * in_d);
+    for (float& v : cpu_A) v = dist(rng);
+    Tensor tmp_A({r, in_d}, DType::F32, Device::CPU);
+    std::memcpy(tmp_A.f32(), cpu_A.data(), cpu_A.size() * sizeof(float));
+    ad.A.w.copy_from(tmp_A);
+
+    // B = 0 so the adapter contributes exactly nothing at init.
+    ad.B.w.zero_();
+}
+
+// Granite-4.0 Mamba-2 layer (inference). Exact math from the checkpoint's
+// config.json + the reference modeling code; CPU path.
+//
+//   hidden_states [N=B*T, d]
+//   in_proj       -> [N, proj_size]  proj_size = d_inner*2? no:
+//                       d_inner + conv_dim + n_heads
+//   split: gate [N, d_inner] | bc [N, conv_dim] | dt [N, n_heads]
+//   causal depthwise conv1d (k=4) on bc, SiLU -> x | B | C
+//   selective SSM scan, sequential per token (O(T)):
+//       A    = -exp(A_log)                     (per head)
+//       dt   = softplus(dt + dt_bias)          (per token, per head)
+//       dA   = exp(A*dt)
+//       h    = dA*h + (dt*B) tensor x               (per head, d_head x d_state)
+//       y_i  = C · h_i + D*x_i
+//   gated RMSNorm: y = rmsnorm(y * silu(gate)) * norm_weight
+//   out_proj -> act.proj
+
+void Model::forward_mamba_layer(Device dev, int l, Activations& act, i64 N) {
+    LayerParams& L = layers_[static_cast<size_t>(l)];
+    const int d        = cfg_.hidden_size;
+    const int d_inner  = cfg_.mamba_expand * d;
+    const int n_heads  = cfg_.mamba_n_heads;
+    const int d_head   = cfg_.mamba_d_head;
+    const int d_state  = cfg_.mamba_d_state;
+    const int n_groups = cfg_.mamba_n_groups;
+    const int T        = act.T;
+    const int B        = act.B;
+    const int d_state_tot = n_groups * d_state;   // 128 for n_groups=1
+    const int conv_dim    = d_inner + 2 * d_state_tot;
+
+    // The mamba scratch buffers are allocated from the CONFIG (see
+    // make_activations), so they must exist for every mamba layer.
+    GAI_CHECK(act.mamba_state.defined() || true,
+              "granite mamba: the activation buffers are missing (rebuild the Activations)");    GAI_CHECK(L.mamba_in_proj.w.defined() && L.mamba_out_proj.w.defined() &&
+                  L.mamba_conv_w.w.defined() && L.mamba_norm.w.defined() &&
+                  L.mamba_A_log.w.defined() && L.mamba_D.w.defined() &&
+                  L.mamba_dt_bias.w.defined(),
+              "granite mamba: the layer weights are missing (load the checkpoint first)");
+
+    // The recurrent state lives in the activation (one per batch element), so
+    // a prefill and the following decode steps share it.
+    const int state_rows = B * n_heads * d_head;
+    Tensor st = act.mamba_state;
+    if (!st.defined() || st.numel() < static_cast<i64>(state_rows) * d_state) {
+        st = Tensor::zeros({static_cast<i64>(state_rows) * d_state}, DType::F32, dev);
+        act.mamba_state = st;
+    }
+
+    ops::mamba2_forward(dev,
+                        act.xb.f32(),
+                        L.mamba_in_proj.w.f32(),
+                        L.mamba_conv_w.w.f32(),
+                        L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32() : nullptr,
+                        L.mamba_dt_bias.w.f32(),
+                        L.mamba_A_log.w.f32(),
+                        L.mamba_D.w.f32(),
+                        L.mamba_norm.w.f32(),
+                        L.mamba_out_proj.w.f32(),
+                        st.f32(),
+                        act.proj.f32(),
+                        B, T, d, d_inner, conv_dim, n_heads, d_head, d_state,
+                        cfg_.mamba_d_conv, cfg_.rms_eps);
+}
+
 void Model::alloc_param(Parameter& p, const std::string& name, std::vector<i64> shape, bool decay) {
     p.name  = name;
     p.shape = shape;
@@ -543,7 +797,9 @@ Model::~Model() {
 
 Model::Model(ModelConfig cfg, Device dev) : cfg_(std::move(cfg)), device_(dev) {
     cfg_.validate();
-
+    // YaRN is approximate NTK extrapolation (not exact long-ctx training).
+    // rope_scale==1 (all shipped configs) is exact; anything above needs a
+    // perplexity validation run at the target ctx (e.g. 8k) before trusting it.
     if (cfg_.rope_scale > 1.0f) {
         log_warn(strfmt("[rope] rope_scale=%.1f is approximate NTK/YaRN extrapolation "
                         "(theta->%.0f, mscale=%.2f): validate ppl at %d ctx before long runs",
@@ -570,12 +826,35 @@ Model::Model(ModelConfig cfg, Device dev) : cfg_(std::move(cfg)), device_(dev) {
     for (int i = 0; i < cfg_.num_layers; ++i) {
         LayerParams& L = layers_[static_cast<size_t>(i)];
         std::string pre = "layers." + std::to_string(i) + ".";
+        // Every Granite layer (mamba or attention) carries the two RMSNorms
+        // and the MoE/shared-MLP block; only the inner sublayer differs.
         alloc_param(L.attn_norm, pre + "attn_norm", {d},      false);
-        alloc_param(L.wq,        pre + "wq",        {qd, d},  true);
-        alloc_param(L.wk,        pre + "wk",        {kvd, d}, true);
-        alloc_param(L.wv,        pre + "wv",        {kvd, d}, true);
-        alloc_param(L.wo,        pre + "wo",        {d, qd},  true);
         alloc_param(L.ffn_norm,  pre + "ffn_norm",  {d},      false);
+        const bool is_granite = (cfg_.arch == ModelConfig::ArchGranite);
+        const int  gk = (is_granite && i < static_cast<int>(cfg_.layer_types.size()))
+                            ? cfg_.layer_types[static_cast<size_t>(i)]
+                            : 1;
+        if (is_granite && gk == 0) {
+            // Mamba-2 sublayer (no attention).
+            const i64 d_inner = static_cast<i64>(cfg_.mamba_expand) * d;
+            const i64 conv_dim = d_inner + 2LL * cfg_.mamba_n_groups * cfg_.mamba_d_state;
+            const i64 proj = d_inner + conv_dim + cfg_.mamba_n_heads;
+            std::string mp = pre + "mamba.";
+            alloc_param(L.mamba_in_proj, mp + "in_proj",  {proj, d},   true);
+            alloc_param(L.mamba_conv_w,  mp + "conv1d.weight",
+                        {conv_dim, 1, cfg_.mamba_d_conv}, true);
+            alloc_param(L.mamba_conv_b,  mp + "conv1d.bias", {conv_dim}, false);
+            alloc_param(L.mamba_dt_bias, mp + "dt_bias",   {cfg_.mamba_n_heads}, true);
+            alloc_param(L.mamba_A_log,   mp + "A_log",     {cfg_.mamba_n_heads}, true);
+            alloc_param(L.mamba_D,       mp + "D",         {cfg_.mamba_n_heads}, true);
+            alloc_param(L.mamba_norm,    mp + "norm.weight", {d_inner}, false);
+            alloc_param(L.mamba_out_proj, mp + "out_proj", {d, d_inner}, true);
+        } else {
+            alloc_param(L.wq,        pre + "wq",        {qd, d},  true);
+            alloc_param(L.wk,        pre + "wk",        {kvd, d}, true);
+            alloc_param(L.wv,        pre + "wv",        {kvd, d}, true);
+            alloc_param(L.wo,        pre + "wo",        {d, qd},  true);
+        }
         if (cfg_.use_qk_norm) {
             const i64 hd = cfg_.head_dim();
             alloc_param(L.qk_qnorm, pre + "qk_qnorm", {hd}, false);
@@ -587,9 +866,13 @@ Model::Model(ModelConfig cfg, Device dev) : cfg_(std::move(cfg)), device_(dev) {
             alloc_param(L.moe_up,   pre + "moe_up",     {ne * E, d}, true);
             alloc_param(L.moe_down, pre + "moe_down",   {ne * d, E}, true);
             if (cfg_.moe_shared) {
-                alloc_param(L.sh_gate, pre + "moe_sh_gate", {E, d}, true);
-                alloc_param(L.sh_up,   pre + "moe_sh_up",   {E, d}, true);
-                alloc_param(L.sh_down, pre + "moe_sh_down", {d, E}, true);
+                // The shared expert has its own width: Granite-4 uses
+                // shared_intermediate_size (1024) while the routed experts
+                // use intermediate_size (512). The other models share it.
+                const i64 SH = cfg_.shared_width();
+                alloc_param(L.sh_gate, pre + "moe_sh_gate", {SH, d}, true);
+                alloc_param(L.sh_up,   pre + "moe_sh_up",   {SH, d}, true);
+                alloc_param(L.sh_down, pre + "moe_sh_down", {d, SH}, true);
             }
         } else {
             alloc_param(L.w_gate,    pre + "w_gate",    {F, d},   true);
@@ -603,6 +886,43 @@ Model::Model(ModelConfig cfg, Device dev) : cfg_(std::move(cfg)), device_(dev) {
     if (cfg_.use_moe && cfg_.moe_aux_free) {
         ensure_moe_bias();
         log_info("[moe ] aux-loss-free bias enabled (DeepSeek-V3 §3.2): EMA steering, no aux grad");
+    }
+    if (cfg_.lora_rank > 0) {
+        // The base weights are frozen; the adapters are the only trainable
+        // parameters. They are registered as real Parameters so that the
+        // optimizer, the gradient buffers and the checkpoint all see them.
+        for (Parameter* p : params_) p->frozen = true;
+
+        std::mt19937_64 rng(42);
+        const int r = cfg_.lora_rank;
+        for (int i = 0; i < cfg_.num_layers; ++i) {
+            LayerParams& L = layers_[static_cast<size_t>(i)];
+            // A Granite mamba layer has no attention projections: an
+            // adapter on them would be a trainable parameter that never
+            // receives a gradient.
+            if (L.has_mamba()) continue;
+            const std::string pre = "layers." + std::to_string(i) + ".lora_";
+            if (cfg_.lora_target_q)
+                init_lora(L.lora_q, pre + "q", d, qd, r, cfg_.lora_alpha, device_, rng);
+            if (cfg_.lora_target_k)
+                init_lora(L.lora_k, pre + "k", d, kvd, r, cfg_.lora_alpha, device_, rng);
+            if (cfg_.lora_target_v)
+                init_lora(L.lora_v, pre + "v", d, kvd, r, cfg_.lora_alpha, device_, rng);
+            if (cfg_.lora_target_o)
+                init_lora(L.lora_o, pre + "o", qd, d, r, cfg_.lora_alpha, device_, rng);
+            if (!cfg_.use_moe) {
+                if (cfg_.lora_target_gate)
+                    init_lora(L.lora_gate, pre + "gate", d, F, r, cfg_.lora_alpha, device_, rng);
+                if (cfg_.lora_target_up)
+                    init_lora(L.lora_up, pre + "up", d, F, r, cfg_.lora_alpha, device_, rng);
+                if (cfg_.lora_target_down)
+                    init_lora(L.lora_down, pre + "down", F, d, r, cfg_.lora_alpha, device_, rng);
+            }
+        }
+        log_info(strfmt("[lora] initialized LoRA rank=%d alpha=%.1f on targets "
+                        "(base weights frozen, %lld trainable adapter params)",
+                        cfg_.lora_rank, (double)cfg_.lora_alpha,
+                        (long long)trainable_parameters()));
     }
     rebuild_rope_cache();
 }
@@ -690,7 +1010,10 @@ void Model::move_to_device(Device dev, bool announce) {
     if (device_ == dev) return;
     const bool restore_fp16_cache = fp16_weight_cache_;
     if (restore_fp16_cache) enable_fp16_weight_cache(false);
-
+    // Only meaningful for a move that happens AFTER a Trainer/Generator exists.
+    // init_weights() round-trips through the CPU on purpose (to fill weights
+    // with the host RNG) and there is nothing to rebuild at that point, so
+    // announcing it produced two alarming warnings on every single run.
     if (announce)
         log_warn("[model] Model::to() moved weights; REBUILD Trainer activations and "
                  "Generator cache/scratch on the new device before next step "
@@ -758,7 +1081,7 @@ std::string ParamReport::to_string(const ModelConfig& cfg) const {
     ss << strfmt("  weight memory  int8   : %s\n", human_bytes(static_cast<u64>(total)).c_str());
     ss << strfmt("  weight memory  int4   : %s\n", human_bytes(static_cast<u64>(total) / 2).c_str());
     {
-
+        // KV cache at full context (fp16)
         u64 kv = static_cast<u64>(cfg.num_layers) * 2ull *
                  static_cast<u64>(cfg.kv_dim()) * static_cast<u64>(cfg.max_seq_len) * 2ull;
         ss << strfmt("  kv cache @%d ctx fp16 : %s\n", cfg.max_seq_len, human_bytes(kv).c_str());
@@ -772,13 +1095,88 @@ void Model::print_parameter_report() const {
     log_raw(LogLevel::Info, parameter_report().to_string(cfg_));
 }
 
+// ---------------------------------------------------------------- init
+i64 Model::trainable_parameters() const {
+    i64 n = 0;
+    for (const Parameter* p : params_) {
+        if (p->frozen) continue;
+        n += p->numel();
+    }
+    return n;
+}
+
+// Folds every LoRA adapter into its base weight:
+//     W[out, in] += (alpha/r) * B[out, r] @ A[r, in]
+// The base matrices are row-major [out_dim, in_dim] and are contiguous
+// (ldw == in_dim), so the merge is a plain host-side GEMM per adapter.
+void Model::merge_lora() {
+    if (cfg_.lora_rank <= 0) return;
+
+    struct Job { LoraAdapter* ad; Parameter* base; };
+    std::vector<Job> jobs;
+
+    for (int i = 0; i < cfg_.num_layers; ++i) {
+        LayerParams& L = layers_[static_cast<size_t>(i)];
+        if (L.lora_q.enabled && L.wq.w.defined()) jobs.push_back({&L.lora_q, &L.wq});
+        if (L.lora_k.enabled && L.wk.w.defined()) jobs.push_back({&L.lora_k, &L.wk});
+        if (L.lora_v.enabled && L.wv.w.defined()) jobs.push_back({&L.lora_v, &L.wv});
+        if (L.lora_o.enabled && L.wo.w.defined()) jobs.push_back({&L.lora_o, &L.wo});
+        if (!cfg_.use_moe) {
+            if (L.lora_gate.enabled && L.w_gate.w.defined()) jobs.push_back({&L.lora_gate, &L.w_gate});
+            if (L.lora_up.enabled   && L.w_up.w.defined())   jobs.push_back({&L.lora_up, &L.w_up});
+            if (L.lora_down.enabled && L.w_down.w.defined()) jobs.push_back({&L.lora_down, &L.w_down});
+        }
+    }
+    if (jobs.empty()) return;
+
+    for (const Job& j : jobs) {
+        const int r = j.ad->rank;
+        const int in_d = j.ad->in_dim;
+        const int out_d = j.ad->out_dim;
+        const float sc = j.ad->scale();
+
+        std::vector<float> Bc(static_cast<size_t>(out_d) * r);
+        std::vector<float> Ac(static_cast<size_t>(r) * in_d);
+        device_copy(Bc.data(), Device::CPU, j.ad->B.w.f32(), device_, Bc.size() * sizeof(float));
+        device_copy(Ac.data(), Device::CPU, j.ad->A.w.f32(), device_, Ac.size() * sizeof(float));
+
+        // W[out, in] += sc * sum_r B[out, r] * A[r, in]
+        std::vector<float> Wc(static_cast<size_t>(out_d) * in_d);
+        device_copy(Wc.data(), Device::CPU, j.base->w.f32(), device_, Wc.size() * sizeof(float));
+        for (int o = 0; o < out_d; ++o) {
+            const float* brow = &Bc[static_cast<size_t>(o) * r];
+            float* wrow = &Wc[static_cast<size_t>(o) * in_d];
+            for (int rr = 0; rr < r; ++rr) {
+                const float b = brow[rr];
+                if (b == 0.0f) continue;
+                const float f = sc * b;
+                const float* arow = &Ac[static_cast<size_t>(rr) * in_d];
+                for (int i = 0; i < in_d; ++i) wrow[i] += f * arow[i];
+            }
+        }
+        device_copy(j.base->w.f32(), device_, Wc.data(), Device::CPU, Wc.size() * sizeof(float));
+    }
+
+    // The adapters are now baked into the base weights: neutralize them so a
+    // second merge cannot double-count, and so the exported model does not
+    // need the adapter at all.
+    for (const Job& j : jobs) {
+        j.ad->B.w.zero_();
+        j.ad->A.w.zero_();
+    }
+
+    // The fp16 cache (if any) now holds stale values.
+    mark_weights_dirty();
+    log_info(strfmt("[lora] merged %d adapters into the base weights", (int)jobs.size()));
+}
+
 void Model::init_weights(u64 seed) {
     Rng rng(seed);
     if (cfg_.use_moe && cfg_.moe_aux_free) {
         for (auto& bias : moe_bias_) std::fill(bias.begin(), bias.end(), 0.0f);
     }
     const float std_base = cfg_.init_std;
-
+    // scaled init for residual projections (GPT-2 style depth scaling)
     const float std_res = std_base / std::sqrt(2.0f * static_cast<float>(cfg_.num_layers));
 
     Device orig_dev = device_;
@@ -804,16 +1202,36 @@ void Model::init_weights(u64 seed) {
         fill_ones(L.ffn_norm);
         if (L.qk_qnorm.w.defined()) fill_ones(L.qk_qnorm);
         if (L.qk_knorm.w.defined()) fill_ones(L.qk_knorm);
+        if (L.has_mamba()) {
+            // S4D-style init for the selective SSM: A = -exp(arange(1..H)) so
+            // the decay rates are spread over a log-uniform grid; dt_bias=1;
+            // D=1; the projection/output are truncated-normal.
+            fill_normal(L.mamba_in_proj, std_base);
+            fill_normal(L.mamba_out_proj, std_res);   // residual output
+            fill_normal(L.mamba_conv_w, std_base);
+            if (L.mamba_conv_b.w.defined()) fill_ones(L.mamba_conv_b);
+            if (L.mamba_norm.w.defined()) fill_ones(L.mamba_norm);
+            if (L.mamba_A_log.w.defined()) {
+                for (i64 i = 0; i < L.mamba_A_log.w.numel(); ++i)
+                    L.mamba_A_log.w.f32()[i] = std::log(static_cast<float>(i + 1));
+            }
+            if (L.mamba_D.w.defined())
+                for (i64 i = 0; i < L.mamba_D.w.numel(); ++i) L.mamba_D.w.f32()[i] = 1.0f;
+            if (L.mamba_dt_bias.w.defined())
+                for (i64 i = 0; i < L.mamba_dt_bias.w.numel(); ++i) L.mamba_dt_bias.w.f32()[i] = 1.0f;
+        } else {
         fill_normal(L.wq, std_base);
         fill_normal(L.wk, std_base);
         fill_normal(L.wv, std_base);
-        fill_normal(L.wo, std_res);
+        fill_normal(L.wo, std_res);       // residual output
+        }
         if (L.has_moe()) {
-
+            // Router starts near-uniform (small init); experts use the same
+            // depth-scaled scheme as dense FFNs so early loss ~= ln(V).
             fill_normal(L.router, std::min(std_base, 0.01f));
             fill_normal(L.moe_gate, std_base);
             fill_normal(L.moe_up,   std_base);
-            fill_normal(L.moe_down, std_res);
+            fill_normal(L.moe_down, std_res);   // residual output
             if (L.sh_gate.w.defined()) {
                 fill_normal(L.sh_gate, std_base);
                 fill_normal(L.sh_up,   std_base);
@@ -822,7 +1240,7 @@ void Model::init_weights(u64 seed) {
         } else {
             fill_normal(L.w_gate, std_base);
             fill_normal(L.w_up,   std_base);
-            fill_normal(L.w_down, std_res);
+            fill_normal(L.w_down, std_res);   // residual output
         }
     }
 
@@ -861,6 +1279,12 @@ void Model::enable_fp16_weight_cache(bool on) {
     const i64 qd = cfg_.q_dim();
     const i64 kvd = cfg_.kv_dim();
     for (LayerParams& layer : layers_) {
+        // Granite mamba layers carry no attention projections: building a
+        // fused qkv cache for them dereferenced a null weight pointer.
+        if (!layer.wq.w.defined()) {
+            layer.wqkv_fp16 = Tensor();
+            continue;
+        }
         layer.wqkv_fp16 = Tensor::empty({qd + 2 * kvd, d}, DType::F16, device_);
         u16* fused = layer.wqkv_fp16.ptr<u16>();
         ops::convert_f32_to_f16(device_, layer.wq.w.f32(), fused, qd * d);
@@ -877,7 +1301,9 @@ void Model::mark_weights_dirty() {
 size_t Model::fp16_weight_cache_bytes() const {
     size_t bytes = 0;
     for (const Parameter* p : params_) bytes += p->fp16_cache.nbytes();
-
+    // F-14: the per-layer FUSED qkv fp16 cache is persistent VRAM too and was
+    // missing from this accounting, under-reporting the guard by
+    // L*(qd + 2*kvd)*d*2 bytes (tens of MB at production depth).
     for (const LayerParams& layer : layers_) bytes += layer.wqkv_fp16.nbytes();
     return bytes;
 }
@@ -885,7 +1311,8 @@ size_t Model::fp16_weight_cache_bytes() const {
 void Model::enable_grad(bool on) {
     grad_enabled_ = on;
     if (on) {
-
+        // mmap-backed weights are read-only file pages: any optimizer write
+        // would fault. Training must reload the model normally (no --mmap).
         for (const Parameter* p : params_) {
             GAI_CHECK(!p->w.is_external(),
                       "enable_grad on mmap-backed weights is forbidden (read-only file pages): " +
@@ -905,11 +1332,16 @@ void Model::enable_grad(bool on) {
 }
 
 void Model::zero_grad() {
-
+    // Serial on purpose: a gai::Error thrown inside an OpenMP parallel region
+    // is undefined behaviour (it escapes the region and calls std::terminate,
+    // which is exactly how the first T4 DDP crash hid its own message). The
+    // memsets are async-free device calls, so serial costs microseconds while
+    // the per-tensor context and fail-fast behaviour are worth far more.
     for (Parameter* p : params_)
         if (p->g.defined()) p->g.zero_();
 }
 
+// ---------------------------------------------------------------- activations
 static Tensor mk(std::vector<i64> shape, Device dev, size_t& acc) {
     Tensor t = Tensor::zeros(std::move(shape), DType::F32, dev);
     acc += t.nbytes();
@@ -923,7 +1355,10 @@ Activations Model::make_activations(int B, int T, bool with_grad, int ce_chunks)
     a.with_grad = with_grad;
 
     const i64 N   = static_cast<i64>(B) * T;
-
+    // Chunked-loss sizing (roadmap item 6): with ce_chunks > 1 the logits and
+    // dlogits buffers shrink from [N,V] to [Cc,V] scratch, Cc = ceil(N/chunks).
+    // Only forward_backward() may consume such activations (forward() refuses
+    // them loudly). ce_chunks <= 1 keeps the legacy full buffers exactly.
     if (ce_chunks < 1) ce_chunks = 1;
     const i64 Cc = (with_grad && ce_chunks > 1) ? (N + ce_chunks - 1) / ce_chunks : N;
     a.ce_chunks = (with_grad && ce_chunks > 1) ? ce_chunks : 1;
@@ -956,7 +1391,8 @@ Activations Model::make_activations(int B, int T, bool with_grad, int ce_chunks)
     a.att_out = mk({N, qd}, device_, acc);
     a.proj    = mk({N, d},  device_, acc);
     if (moe) {
-
+        // Shared scratch, reused by every layer (forward overwrites per layer,
+        // backward consumes each layer's SAVED copies below).
         a.moe_gate  = mk({N, K, E}, device_, acc);
         a.moe_up    = mk({N, K, E}, device_, acc);
         a.moe_act   = mk({N, K, E}, device_, acc);
@@ -967,6 +1403,23 @@ Activations Model::make_activations(int B, int T, bool with_grad, int ce_chunks)
         a.gate    = mk({N, F},  device_, acc);
         a.up      = mk({N, F},  device_, acc);
         a.act     = mk({N, F},  device_, acc);
+    }
+    // Granite hybrid: the mamba layer scratch. The layer itself allocates
+    // its own temporaries (see ops::mamba2_forward); what the activations
+    // keep is the recurrent state, which lives across the prefill and the
+    // decode steps.
+    {
+        bool has_mamba = false;
+        if (cfg_.arch == ModelConfig::ArchGranite) {
+            for (int k : cfg_.layer_types) if (k == 0) { has_mamba = true; break; }
+        }
+        if (has_mamba) {
+            const i64 d_inner = static_cast<i64>(cfg_.mamba_expand) * d;
+            const i64 state_rows = static_cast<i64>(B) * cfg_.mamba_n_heads * cfg_.mamba_d_head;
+            a.mamba_state = Tensor::zeros({state_rows * cfg_.mamba_d_state}, DType::F32, device_);
+            a.bytes += a.mamba_state.nbytes();
+            (void)d_inner;
+        }
     }
     a.ffn_out = mk({N, d},  device_, acc);
     a.logits  = mk({Cc, V}, device_, acc);
@@ -984,7 +1437,10 @@ Activations Model::make_activations(int B, int T, bool with_grad, int ce_chunks)
             a.saved_qk_raw_q.resize(static_cast<size_t>(L));
             a.saved_qk_raw_k.resize(static_cast<size_t>(L));
         }
-
+        // Single transient probs buffer, recomputed per layer in backward
+        // (saves (L-1)*B*H*T*T floats, e.g. 2.5GB at B=2,T=1024,L=26).
+        // PRO-HARDEN: حارس T² داخل make_activations نفسها (كان في Trainer فقط)
+        // فيحمي أي استدعاء مباشر/اختبار من OOM صامت على T4.
         {
             const size_t need_tmp =
                 static_cast<size_t>(B) * static_cast<size_t>(cfg_.num_heads) *
@@ -1075,9 +1531,18 @@ size_t Model::estimate_activation_bytes(int B, int T, bool with_grad, int ce_chu
     return estimate_activation_bytes_for(cfg_, fp16_weight_cache_, B, T, with_grad, ce_chunks);
 }
 
+// F-23: the activation estimate is pure arithmetic over ModelConfig, so it is
+// exposed as a static for the allocation-free dry-run path. The member above is
+// a one-line forward, which is what keeps the two from drifting.
 size_t Model::estimate_activation_bytes_for(const ModelConfig& cfg, bool fp16_on,
                                             int B, int T, bool with_grad, int ce_chunks) {
-
+    // FIX: i64 signed overflow on adversarial B*T*V*L wrapped negative ->
+    // "fits" estimate then real OOM on T4 (training killer). Use u64 with
+    // saturation (cap at 1TiB elements) so the guard always over-estimates.
+    // FIX (P0-1): explicit -> u64 return type. Without it, `return 0ull`
+    // (unsigned long long) and `return cap` (u64 == unsigned long on LP64
+    // Linux) deduce different types -> hard compile error on GCC/Clang.
+    // MSVC hid the bug because uint64_t IS unsigned long long on Windows.
     auto sat_add = [](u64 a, u64 b) -> u64 {
         const u64 cap = (1ull << 40);
         if (a > cap || b > cap) return cap;
@@ -1103,25 +1568,31 @@ size_t Model::estimate_activation_bytes_for(const ModelConfig& cfg, bool fp16_on
     u64 e = sat_mul(N, (4 * d + qd * 2 + kvd * 2 + F * 3 + V));
     if (fp16_on) e = sat_add(e, sat_mul(N, (qd + 2 * kvd)));
     if (cfg.use_moe) e = sat_add(e, sat_mul(N, (static_cast<u64>(cfg.num_experts) + 2 * static_cast<u64>(cfg.moe_top_k))));
-
-    e = sat_add(e, N);
+    // Forward misses pos[N] i32 + xfinal/hnorm/dtmp grad scratch in the old
+    // math (systematic under-count ~5-8%). Account for them explicitly.
+    e = sat_add(e, N); // pos ids (i32 ~ 1 float)
     if (with_grad) {
-
+        // Attention probs are recomputed per layer into ONE shared buffer
+        // (not stored per layer): single B*H*T*T instead of L*B*H*T*T.
         u64 per_layer = sat_mul(N, (4 * d + qd * 2 + kvd * 2 + F * 3 + 2));
         if (cfg.use_moe) per_layer = sat_add(per_layer, sat_mul(N, (static_cast<u64>(cfg.num_experts) + 3 * static_cast<u64>(cfg.moe_top_k))));
         if (cfg.use_qk_norm) per_layer = sat_add(per_layer, sat_mul(N, (static_cast<u64>(cfg.num_heads) + static_cast<u64>(cfg.num_kv_heads) + qd + kvd)));
         e = sat_add(e, sat_mul(L, per_layer));
-        e = sat_add(e, sat_mul(sat_mul(static_cast<u64>(B), static_cast<u64>(cfg.num_heads)), sat_mul(static_cast<u64>(T), static_cast<u64>(T))));
+        e = sat_add(e, sat_mul(sat_mul(static_cast<u64>(B), static_cast<u64>(cfg.num_heads)), sat_mul(static_cast<u64>(T), static_cast<u64>(T)))); // transient recompute buf
         if (!cfg.use_moe) {
             e = sat_add(e, sat_mul(N, (5 * d + qd * 2 + kvd * 2 + F * 3 + V + 2)));
         } else {
             e = sat_add(e, sat_mul(N, (5 * d + qd * 2 + kvd * 2 + V + 2)));
             e = sat_add(e, sat_add(sat_mul(N, sat_mul(static_cast<u64>(cfg.moe_top_k), static_cast<u64>(cfg.moe_expert_dim))), static_cast<u64>(cfg.num_experts)));
         }
-
+        // grad scratch: dx/dxb/dq/dk/dv/dattout/dproj/dtmp/dlogits/xfinal/hnorm
         e = sat_add(e, sat_mul(N, (4 * d + qd * 2 + kvd * 2 + V + d * 2)));
     }
-
+    // Chunked loss (roadmap item 6): logits [N,V] (fwd term) + dlogits [N,V]
+    // (grad scratch term) shrink to [Cc,V] each, Cc = ceil(N/chunks). Both
+    // terms are present in `e` above exactly once, so subtract the saved part.
+    // (e is only ever added to here, never saturated below the true count
+    // before this point, so the subtraction cannot underflow.)
     if (with_grad && ce_chunks > 1 && N > 0) {
         const u64 cc = static_cast<u64>(ce_chunks);
         const u64 crow = N / cc + (N % cc ? 1ULL : 0ULL);
@@ -1132,6 +1603,8 @@ size_t Model::estimate_activation_bytes_for(const ModelConfig& cfg, bool fp16_on
     return static_cast<size_t>(e) * sizeof(float);
 }
 
+// F-23: mirrors the constructor's alloc_param() list exactly. Cross-checked
+// against Model::num_parameters() by tests/test_memory_plan.cpp.
 u64 Model::count_parameters(const ModelConfig& cfg) {
     const u64 d   = static_cast<u64>(cfg.hidden_size);
     const u64 V   = static_cast<u64>(cfg.vocab_size);
@@ -1143,26 +1616,29 @@ u64 Model::count_parameters(const ModelConfig& cfg) {
     const u64 L   = static_cast<u64>(cfg.num_layers);
     const u64 hd  = static_cast<u64>(cfg.head_dim());
 
-    u64 n = V * d;
+    u64 n = V * d;                                    // tok_embeddings
     for (u64 i = 0; i < L; ++i) {
-        n += d;
-        n += qd * d + kvd * d + kvd * d + d * qd;
-        n += d;
-        if (cfg.use_qk_norm) n += 2 * hd;
+        n += d;                                      // attn_norm
+        n += qd * d + kvd * d + kvd * d + d * qd;    // wq, wk, wv, wo
+        n += d;                                      // ffn_norm
+        if (cfg.use_qk_norm) n += 2 * hd;            // qk_qnorm, qk_knorm
         if (cfg.use_moe) {
-            n += ne * d;
-            n += ne * E * d + ne * E * d;
-            n += ne * d * E;
+            n += ne * d;                              // moe_router
+            n += ne * E * d + ne * E * d;             // moe_gate, moe_up
+            n += ne * d * E;                          // moe_down
             if (cfg.moe_shared) n += E * d + E * d + d * E;
         } else {
-            n += F * d + F * d + d * F;
+            n += F * d + F * d + d * F;               // w_gate, w_up, w_down
         }
     }
-    n += d;
-    if (!cfg.tie_embeddings) n += V * d;
+    n += d;                                           // final_norm
+    if (!cfg.tie_embeddings) n += V * d;              // lm_head
     return n;
 }
 
+// F-14: every persistent fp16 cache tensor: one per 2-D parameter PLUS the
+// per-layer fused QKV cache. The runtime fp16_weight_cache_bytes() missed the
+// fused cache entirely.
 size_t Model::count_fp16_cache_bytes(const ModelConfig& cfg) {
     const u64 d   = static_cast<u64>(cfg.hidden_size);
     const u64 V   = static_cast<u64>(cfg.vocab_size);
@@ -1173,21 +1649,22 @@ size_t Model::count_fp16_cache_bytes(const ModelConfig& cfg) {
     const u64 ne  = static_cast<u64>(cfg.num_experts);
     const u64 L   = static_cast<u64>(cfg.num_layers);
 
+    // 2-D parameters (fp16_cache is allocated for shape.size() == 2 only).
     u64 n2 = 0;
-    n2 += V * d;
+    n2 += V * d;                                              // tok_embeddings
     for (u64 i = 0; i < L; ++i) {
-        n2 += qd * d + kvd * d + kvd * d + d * qd;
+        n2 += qd * d + kvd * d + kvd * d + d * qd;           // wq, wk, wv, wo
         if (cfg.use_moe) {
-            n2 += ne * d;
-            n2 += ne * E * d + ne * E * d;
-            n2 += ne * d * E;
+            n2 += ne * d;                                    // router
+            n2 += ne * E * d + ne * E * d;                   // moe_gate, moe_up
+            n2 += ne * d * E;                                // moe_down
             if (cfg.moe_shared) n2 += E * d + E * d + d * E;
         } else {
             n2 += F * d + F * d + d * F;
         }
     }
-    if (!cfg.tie_embeddings) n2 += V * d;
-
+    if (!cfg.tie_embeddings) n2 += V * d;                    // lm_head
+    // per-layer fused QKV cache: [qd + 2*kvd, d]
     const u64 fused = L * (qd + 2 * kvd) * d;
     return static_cast<size_t>((n2 + fused) * sizeof(u16));
 }
@@ -1205,13 +1682,13 @@ Model::MemoryPlan Model::plan_memory(const ModelConfig& cfg, int B, int T,
     p.fp16_cache = fp16_weight_cache ? count_fp16_cache_bytes(cfg) : 0;
     p.activations = estimate_activation_bytes_for(cfg, fp16_weight_cache, B, T,
                                                  with_grad, ce_chunks);
-    p.static_total = p.weights + p.grads + p.fp16_cache;
+    p.static_total = p.weights + p.grads + p.fp16_cache + mamba_state_bytes(cfg);
     p.total = p.static_total + p.activations;
     return p;
 }
 
 Model::WorkspacePlan Model::workspace_plan(const ModelConfig& cfg, int B, int T) {
-
+    // Saturating u64 arithmetic (same discipline as estimate_activation_bytes).
     const u64 cap = (1ull << 40);
     auto sat = [&](u64 v) -> u64 { return v > cap ? cap : v; };
     const u64 N   = static_cast<u64>(B) * static_cast<u64>(T);
@@ -1222,14 +1699,17 @@ Model::WorkspacePlan Model::workspace_plan(const ModelConfig& cfg, int B, int T)
     const u64 ne  = static_cast<u64>(cfg.num_experts);
 
     WorkspacePlan p;
-
+    // GEMM pool: the largest single fp16 conversion pair (lm_head [N,d]x[d,V]
+    // dominates: 2 bytes * (N*d + d*V)) plus the SCE losses+reduce and the
+    // sq-norm partials, with 2x headroom. The pool rounds up to 64 MB anyway.
     const u64 gemm_conv = sat(2 * sat(N * d + d * V));
     const u64 sce = sat(N + 260);
     p.gemm_bytes = static_cast<size_t>(sat(2 * sat(gemm_conv + sce)));
     if (cfg.use_moe) {
-
+        // MoE pool: max of the forward and backward call sites in cuda/moe.cu.
+        // Forward: N*ne + 2*NK + 3*NK*E + NK*d floats.
         const u64 fwd = sat(N * ne + 2 * NK + 3 * NK * E + NK * d);
-
+        // Backward: 6*N*E + NK + 4*NK*E + 2*NK*d + NK + N*ne floats.
         const u64 bwd = sat(6 * N * E + NK + 4 * NK * E + 2 * NK * d + NK + N * ne);
         const u64 peak_floats = fwd > bwd ? fwd : bwd;
         p.moe_bytes = static_cast<size_t>(sat(4 * peak_floats + (16ull << 20)));
@@ -1237,6 +1717,50 @@ Model::WorkspacePlan Model::workspace_plan(const ModelConfig& cfg, int B, int T)
     return p;
 }
 
+// The Mamba-2 layers carry a recurrent state per layer:
+//   conv_state : [conv_dim, d_conv-1]
+//   ssm_state  : [n_heads, d_head, d_state]
+// For Granite-4.0-H-Tiny that is 40 layers x (3328*3 + 48*64*128) floats
+// = 20.8 MB in fp32 - small, but it must be part of the plan so the memory
+// budget is honest.
+size_t Model::mamba_state_bytes(const ModelConfig& cfg) {
+    if (cfg.arch != ModelConfig::ArchGranite) return 0;
+    int mamba_layers = 0;
+    for (int k : cfg.layer_types) if (k == 0) ++mamba_layers;
+    if (mamba_layers == 0) return 0;
+    const u64 d_inner  = static_cast<u64>(cfg.mamba_expand) * static_cast<u64>(cfg.hidden_size);
+    const u64 conv_dim = d_inner + 2ull * static_cast<u64>(cfg.mamba_n_groups) *
+                                    static_cast<u64>(cfg.mamba_d_state);
+    const u64 conv_win = cfg.mamba_d_conv > 1 ? static_cast<u64>(cfg.mamba_d_conv - 1) : 1ull;
+    const u64 ssm      = static_cast<u64>(cfg.mamba_n_heads) *
+                          static_cast<u64>(cfg.mamba_d_head) *
+                          static_cast<u64>(cfg.mamba_d_state);
+    return static_cast<size_t>(static_cast<u64>(mamba_layers) * (conv_dim * conv_win + ssm) * 4);
+}
+
+// The inference KV cache (fp16 packed) for the given context length.
+size_t Model::kv_cache_bytes(const ModelConfig& cfg, int max_len) {
+    if (max_len <= 0) return 0;
+    const u64 kv_dim = static_cast<u64>(cfg.kv_dim());
+    // Only the ATTENTION layers keep a KV cache. A Granite mamba layer keeps
+    // a recurrent state instead (see mamba_state_bytes), so counting all the
+    // layers over-reported the cache by 10x on Granite-4.0-H-Tiny (40 layers
+    // but only 4 attention ones) and hid 9.5 GiB of real headroom.
+    u64 layers = static_cast<u64>(cfg.num_layers);
+    if (cfg.arch == ModelConfig::ArchGranite && !cfg.layer_types.empty()) {
+        layers = 0;
+        for (int k : cfg.layer_types) if (k == 1) ++layers;
+    }
+    // fp16 packed (the engine stores the cache as fp16): 2 bytes x 2 tensors
+    // (K and V) x layers x length x kv_dim.
+    return static_cast<size_t>(2ull * layers * static_cast<u64>(max_len) * kv_dim * 2ull);
+}
+
+// ---------------------------------------------------------------- forward
+// Body shared by forward() and forward_backward(): everything up to (and
+// including) the final norm. The lm_head GEMM is left to the caller so the
+// training path can chunk it (roadmap item 6) instead of materializing a
+// full [N,V] logits matrix.
 static void check_act_device(Device dev, const char* name, const Tensor& t) {
     if (t.defined() && t.device() != dev) {
         GAI_FAIL(std::string("stale activations: ") + name +
@@ -1247,15 +1771,9 @@ static void check_act_device(Device dev, const char* name, const Tensor& t) {
 
 void Model::forward_body(const i32* ids, int B, int T, Activations& act,
                          const i32* segment_ids) {
-    forward_body(ids, B, T, act, segment_ids, nullptr, nullptr, 0);
-}
-
-void Model::forward_body(const i32* ids, int B, int T, Activations& act,
-                         const i32* segment_ids,
-                         const float* embed_override,
-                         const int* override_pos,
-                         int n_override) {
-
+    // FIX: fail-fast guards (training/inference crash + T4/low-PC OOM safety).
+    // Old code accepted B/T<=0 -> N<=0 cast to size_t = huge alloc -> OOM,
+    // and N>INT_MAX truncated to int M in linear_forward -> silent zero math.
     GAI_CHECK(ids != nullptr, "forward: null ids");
     GAI_CHECK(B > 0 && T > 0, "forward: B and T must be > 0");
     const int d   = cfg_.hidden_size;
@@ -1267,7 +1785,9 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
     const int KV  = cfg_.num_kv_heads;
     const int hd  = cfg_.head_dim();
     const i64 N   = static_cast<i64>(B) * T;
-    const float scale = (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale_local(cfg_);
+    const float scale = (cfg_.attention_multiplier > 0.0f)
+                            ? cfg_.attention_multiplier
+                            : (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale_local(cfg_);
     const bool  train = act.with_grad;
     Device dev = device_;
     if (fp16_weight_cache_ && fp16_weights_dirty_) {
@@ -1279,6 +1799,9 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         const i64 qd = cfg_.q_dim();
         const i64 kvd = cfg_.kv_dim();
         for (LayerParams& layer : layers_) {
+            // Mamba layers have no attention projections (and no fused qkv
+            // cache): skip them instead of dereferencing a null weight.
+            if (!layer.wq.w.defined() || !layer.wqkv_fp16.defined()) continue;
             u16* fused = layer.wqkv_fp16.ptr<u16>();
             ops::convert_f32_to_f16(dev, layer.wq.w.f32(), fused, qd * d);
             ops::convert_f32_to_f16(dev, layer.wk.w.f32(), fused + qd * d, kvd * d);
@@ -1286,7 +1809,11 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         }
         fp16_weights_dirty_ = false;
     }
-
+    // DeepSeek fail-fast: OOB ids previously trained as zero-vectors silently
+    // (embedding_forward memset 0). On CPU we can check the host buffer here
+    // for free vs GEMMs; on CUDA the ids live on device so the check happens
+    // in the data path (dataloader/tokenizer already range-check), and the
+    // CPU embedding kernel below keeps its defensive zero + host counter.
     if (dev == Device::CPU) {
         for (i64 i = 0; i < N; ++i) {
             i32 id = ids[i];
@@ -1296,13 +1823,16 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         }
     }
 
-    GAI_CHECK((act.B == B || (act.with_grad && act.B > B)) && act.T == T,
-              "activation buffer shape mismatch");
+    GAI_CHECK(act.B == B && act.T == T, "activation buffer shape mismatch");
     GAI_CHECK(T <= cfg_.max_seq_len, "sequence longer than max_seq_len");
-
+    // N is i64 but GEMM M is int: refuse absurd micro-batches before trunc.
     GAI_CHECK(N <= static_cast<i64>(std::numeric_limits<int>::max()),
               "forward: B*T exceeds int range (reduce batch/seq_len)");
-
+    // Reused Activations from another config indexed saved_* OOB below
+    // -> segfault. Validate once here, but ONLY for training: inference
+    // (with_grad=false) never touches saved_* (all guarded by `train`),
+    // so empty saved_x is correct there. The old unconditional check
+    // rejected EVERY inference forward (chat/generate/eval/bench killer).
     if (train) {
         GAI_CHECK(static_cast<int>(act.saved_x.size()) == cfg_.num_layers,
                   "forward: stale Activations (layer count mismatch, rebuild)");
@@ -1320,9 +1850,16 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         check_act_device(dev, "act.dx", act.dx);
     }
 
+    // position ids (repeated per batch element)
+    // FIX (T4 perf/fragmentation): old code allocated a std::vector + a CPU
+    // Tensor on EVERY forward (128x per optimizer step with grad_accum=128).
+    // Allocator churn + fragmentation looked like a CPU leak and stalled the
+    // GPU. Now: monotonic thread-local staging, zero per-call mallocs after
+    // the first, direct H2D into the persistent act.pos buffer.
+    // PERF (audit #10): positions are a pure function of (B,T), and training
+    // reuses one (B,T) across all 128 micros. Skip the rebuild + H2D entirely
+    // when the buffer already holds this (B,T) — 127/128 forwards do no work.
     if (!act.pos.defined() || act.pos.numel() < N) {
-
-        if (act.pos.defined()) act.bytes -= act.pos.nbytes();
         act.pos = Tensor::empty({N}, DType::I32, device_);
         act.bytes += act.pos.nbytes();
         act.pos_cached_B = -1;
@@ -1343,19 +1880,10 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         act.pos_cached_offset = act.pos_offset;
     }
 
+    // ---- embeddings
     ops::embedding_forward(dev, ids, tok_emb_.w.f32(), act.x.f32(), N, d, V);
-
-    // Image features (or any other caller supplied embedding) replace the
-    // token embedding at the placeholder positions.
-    if (embed_override && override_pos && n_override > 0) {
-        float* x = act.x.f32();
-        for (int i = 0; i < n_override; ++i) {
-            const int p = override_pos[i];
-            if (p < 0 || p >= N) continue;
-            std::memcpy(x + static_cast<size_t>(p) * d,
-                        embed_override + static_cast<size_t>(i) * d,
-                        sizeof(float) * static_cast<size_t>(d));
-        }
+    if (cfg_.embedding_multiplier != 1.0f) {
+        ops::scale_inplace(dev, act.x.f32(), cfg_.embedding_multiplier, N * d);
     }
 
     const float* rope_freq = rope_inv_freq_ptr();
@@ -1364,6 +1892,10 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
     for (int l = 0; l < cfg_.num_layers; ++l) {
         LayerParams& L = layers_[static_cast<size_t>(l)];
         size_t sl = static_cast<size_t>(l);
+        const bool is_granite    = (cfg_.arch == ModelConfig::ArchGranite);
+        const int  granite_kind  = (is_granite && sl < cfg_.layer_types.size())
+                                       ? cfg_.layer_types[sl] : 1;  // default: attention
+        const bool granite_mamba = is_granite && L.has_mamba() && granite_kind == 0;
 
         if (train) ops::copy(dev, act.saved_x[sl].f32(), act.x.f32(), N * d);
 
@@ -1371,6 +1903,14 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         ops::rmsnorm_forward(dev, act.x.f32(), L.attn_norm.w.f32(), act.xb.f32(),
                              rrms1, N, d, cfg_.rms_eps);
         if (train) ops::copy(dev, act.saved_xb[sl].f32(), act.xb.f32(), N * d);
+
+        if (granite_mamba) {
+            // Mamba-2 sublayer: writes act.proj, shares the residual/FFN tail
+            // with the attention layers. Training = not implemented yet.
+            GAI_CHECK(!train,
+                      "granite mamba layers do not support the backward pass yet (inference only)");
+            forward_mamba_layer(dev, l, act, N);
+        } else {
 
         float* qp = nullptr;
         float* kp = nullptr;
@@ -1392,6 +1932,15 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             ops::linear_forward(dev, act.xb.f32(), L.wv.w.f32(), vp, static_cast<int>(N), d, kvd);
         }
 
+        lora_forward(L.lora_q, dev, act.xb.f32(), qp, static_cast<int>(N));
+        lora_forward(L.lora_k, dev, act.xb.f32(), kp, static_cast<int>(N));
+        lora_forward(L.lora_v, dev, act.xb.f32(), vp, static_cast<int>(N));
+
+        // QK-Norm (optional): per-head RMSNorm on Q/K before RoPE stabilizes
+        // MoE training at 1B (prevents attention logit explosion). Layout
+        // [N,H,hd] is contiguous as [N*H,hd], so rmsnorm applies directly.
+        // FIX: old guard checked only qk_qnorm, then deref'd qk_knorm ->
+        // segfault on partial alloc / stale ckpt. Require both gains.
         if (cfg_.use_qk_norm && L.qk_qnorm.w.defined() && L.qk_knorm.w.defined()) {
             if (train) {
                 ops::copy(dev, act.saved_qk_raw_q[sl].f32(), qp, N * qd);
@@ -1405,8 +1954,12 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
                                  rrms_k, N * KV, hd, cfg_.rms_eps);
         }
 
-        ops::rope_forward_cached(dev, qp, kp, act.pos.i32p(), rope_freq, N, H, KV, hd,
-                                 cfg_.rope_type);
+        // Pro kernels: NeoX + full YaRN ramp + SWA (DeepSeek-V3 / LLaMA-3 class).
+        // Legacy path (rope_type 0, scale 1, window 0) is bit-identical to old calls.
+        if (cfg_.position_embedding != 1) {  // 1 = NoPE (Granite: no positional embedding)
+            ops::rope_forward_cached(dev, qp, kp, act.pos.i32p(), rope_freq, N, H, KV, hd,
+                                     cfg_.rope_type);
+        }
 
         if (train) {
             ops::copy(dev, act.saved_q[sl].f32(), qp, N * qd);
@@ -1414,19 +1967,26 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             ops::copy(dev, act.saved_v[sl].f32(), vp, N * kvd);
         }
 
-        ops::phase_start(dev, ops::TrainPhase::AttnFwd);
+        // Probs are never stored (recomputed per layer in backward).
+        // nullptr here = memory-lean forward on both CPU and CUDA.
         ops::attention_forward_ex(dev, qp, kp, vp,
                                   act.att_out.f32(), nullptr,
                                   B, T, H, KV, hd, scale, cfg_.sliding_window,
                                   segment_ids);
-        ops::phase_stop(dev, ops::TrainPhase::AttnFwd);
         if (train) ops::copy(dev, act.saved_attout[sl].f32(), act.att_out.f32(), N * qd);
 
         ops::linear_forward(dev, act.att_out.f32(), L.wo.w.f32(), act.proj.f32(), static_cast<int>(N), qd, d);
+        lora_forward(L.lora_o, dev, act.att_out.f32(), act.proj.f32(), static_cast<int>(N));
+        }  // else (attention path)
+
+        if (cfg_.residual_multiplier != 1.0f) {
+            ops::scale_inplace(dev, act.proj.f32(), cfg_.residual_multiplier, N * d);
+        }
         ops::add_inplace(dev, act.x.f32(), act.proj.f32(), N * d);
 
         if (train) ops::copy(dev, act.saved_xmid[sl].f32(), act.x.f32(), N * d);
 
+        // ---- ffn block (MoE or dense)
         float* rrms2 = train ? act.saved_rrms2[sl].f32() : nullptr;
         ops::rmsnorm_forward(dev, act.x.f32(), L.ffn_norm.w.f32(), act.xb2.f32(),
                              rrms2, N, d, cfg_.rms_eps);
@@ -1441,7 +2001,6 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             float* rw    = train ? act.saved_moe_w[sl].f32()     : nullptr;
             const float* bias = (cfg_.moe_aux_free && !moe_bias_.empty())
                 ? moe_bias_ptr(l) : nullptr;
-            ops::phase_start(dev, ops::TrainPhase::MoeFwd);
             ops::moe_forward_bias(dev, act.xb2.f32(), L.router.w.f32(), bias,
                                   L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
                                   L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
@@ -1449,8 +2008,7 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
                                   L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
                                   act.ffn_out.f32(), probs, ridx, rw,
                                   act.moe_gate.f32(), act.moe_up.f32(), act.moe_act.f32(),
-                                  N, d, E, ne, K);
-            ops::phase_stop(dev, ops::TrainPhase::MoeFwd);
+                                  N, d, E, ne, K, cfg_.shared_width());
             if (train) {
                 ops::copy(dev, act.saved_gate[sl].f32(), act.moe_gate.f32(), N * K * E);
                 ops::copy(dev, act.saved_up[sl].f32(),   act.moe_up.f32(),   N * K * E);
@@ -1459,6 +2017,8 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         } else {
             ops::linear_forward(dev, act.xb2.f32(), L.w_gate.w.f32(), act.gate.f32(), static_cast<int>(N), d, F);
             ops::linear_forward(dev, act.xb2.f32(), L.w_up.w.f32(),   act.up.f32(),   static_cast<int>(N), d, F);
+            lora_forward(L.lora_gate, dev, act.xb2.f32(), act.gate.f32(), static_cast<int>(N));
+            lora_forward(L.lora_up, dev, act.xb2.f32(), act.up.f32(), static_cast<int>(N));
             ops::swiglu_forward(dev, act.gate.f32(), act.up.f32(), act.act.f32(), N * F);
 
             if (train) {
@@ -1468,6 +2028,10 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             }
 
             ops::linear_forward(dev, act.act.f32(), L.w_down.w.f32(), act.ffn_out.f32(), static_cast<int>(N), F, d);
+            lora_forward(L.lora_down, dev, act.act.f32(), act.ffn_out.f32(), static_cast<int>(N));
+        }
+        if (cfg_.residual_multiplier != 1.0f) {
+            ops::scale_inplace(dev, act.ffn_out.f32(), cfg_.residual_multiplier, N * d);
         }
         ops::add_inplace(dev, act.x.f32(), act.ffn_out.f32(), N * d);
     }
@@ -1480,7 +2044,9 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
 
 Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
                        const i32* segment_ids) {
-    forward_body(ids, B, T, act, segment_ids, nullptr, nullptr, 0);
+    // Full-[N,V] inference/eval path. Chunked training activations carry only
+    // compact [Cc,V] scratch: they must go through forward_backward().
+    forward_body(ids, B, T, act, segment_ids);
     const int d = cfg_.hidden_size;
     const int V = cfg_.vocab_size;
     const i64 N = static_cast<i64>(B) * T;
@@ -1492,34 +2058,33 @@ Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
     }
     ops::linear_forward(device_, act.xb.f32(), lm_head().w.f32(), act.logits.f32(),
                         static_cast<int>(N), d, V);
-    return act.logits;
-}
-
-Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
-                       const i32* segment_ids,
-                       const float* embed_override,
-                       const int* override_pos,
-                       int n_override) {
-    forward_body(ids, B, T, act, segment_ids, embed_override, override_pos, n_override);
-    const int d = cfg_.hidden_size;
-    const int V = cfg_.vocab_size;
-    const i64 N = static_cast<i64>(B) * T;
-    {
-        const i64 need = N * static_cast<i64>(V);
-        GAI_CHECK(act.logits.numel() >= need,
-                  "forward: logits buffer too small");
+    if (cfg_.logits_scaling != 1.0f) {
+        ops::scale_inplace(device_, act.logits.f32(), 1.0f / cfg_.logits_scaling, N * V);
     }
-    ops::linear_forward(device_, act.xb.f32(), lm_head().w.f32(), act.logits.f32(),
-                        static_cast<int>(N), d, V);
     return act.logits;
 }
 
+// ---------------------------------------------------------------- backward
 double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                Activations& act, i64* out_ntok, float dout_scale,
                                bool want_aux_stats, const i32* segment_ids,
                                const i32* host_targets) {
     GAI_CHECK(act.with_grad, "forward_backward requires gradient activations");
     GAI_CHECK(grad_enabled_, "call enable_grad(true) before forward_backward");
+
+    // Granite hybrid: the mamba sub-layers have no adjoint selective scan
+    // yet, so a training step cannot produce their weight gradients. Fail
+    // loudly here instead of walking into the reverse layer loop, where the
+    // missing mamba parameters would be dereferenced (silent garbage or a
+    // crash deep inside the optimizer).
+    if (cfg_.arch == ModelConfig::ArchGranite) {
+        for (size_t i = 0; i < cfg_.layer_types.size(); ++i) {
+            GAI_CHECK(cfg_.layer_types[i] != 0,
+                      "granite mamba layers do not support the backward pass yet (inference only): "
+                      "layer " + std::to_string(i) + " is a mamba layer. Train a dense/attention-only "
+                      "architecture, or wait for the mamba-2 adjoint kernel.");
+        }
+    }
 
     const int d   = cfg_.hidden_size;
     const int qd  = cfg_.q_dim();
@@ -1535,30 +2100,54 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
 
     forward_body(ids, B, T, act, segment_ids);
 
+    // ---- chunked lm head + loss (roadmap item 6; with z-loss stabilizer).
+    // Materializing full [N,V] logits+dlogits costs 524MB at B=2,T=1024,V=32k
+    // — the biggest single block in the T4 budget. Instead the head runs in
+    // row-blocks over compact [Cc,V] scratch (Cc = ceil(N/chunks)):
+    //   GEMM block -> SCE block -> scale -> backward block (accumulates).
+    // EXACTNESS: per chunk c, SCE emits SUM grads directly (audit P1: no
+    // host count roundtrip); scaling by eff_scale yields raw×eff_scale —
+    // identical, element for element, to the old full-matrix path (mean
+    // ÷ntok, then ×eff_scale×ntok), up to 1-ulp fp associativity. Loss sums
+    // and ntok add across chunks; dw/dx accumulate through linear_backward's
+    // += contract. Only the fp addition ORDER of the loss scalar differs
+    // (negligible, ~1e-9 relative).
     float eff_scale = dout_scale;
-
+    // (Range safety for the scale lives in the Trainer (kLossScaleMax): it
+    // must own the limit because it also owns the unscaling divisor. See the
+    // P0-2a note that used to live here: clamping inside the model while the
+    // trainer unscales with the passed-in value is a silent LR cut.)
     const i64 Cc = act.ce_rows > 0 ? act.ce_rows : N;
     const float* hnorm_full = act.saved_hnorm.f32();
     float* logits_c = act.logits.f32();
     float* dlogits_c = act.dlogits.f32();
     ops::zero(dev, act.dxb.f32(), N * d);
-
+    // F-10: loss+count accumulate on device across all chunks with ZERO host
+    // traffic; the single synchronized reduction happens in sce_acc_end().
+    // Fully-masked blocks are skipped on the HOST (no GEMMs, no kernels) using
+    // the host target mirror when the caller supplied one — this preserves the
+    // old `if (cn == 0) continue` fast path without the per-chunk D2H that
+    // used to provide `cn`. A null mirror means "always compute" (eval/tests).
     ops::sce_acc_begin(dev);
     for (i64 r0 = 0; r0 < N; r0 += Cc) {
         const i64 Cr = std::min(Cc, N - r0);
-        const int Ci = static_cast<int>(Cr);
+        const int Ci = static_cast<int>(Cr); // Cr <= N <= INT_MAX (body checked)
         if (host_targets) {
             bool any_supervised = false;
             for (i64 i = 0; i < Cr; ++i) {
                 if (host_targets[r0 + i] >= 0) { any_supervised = true; break; }
             }
-            if (!any_supervised) continue;
+            if (!any_supervised) continue; // fully-masked block: nothing to learn
         }
         ops::linear_forward(dev, hnorm_full + r0 * d, lm_head().w.f32(),
                             logits_c, Ci, d, V);
+        if (cfg_.logits_scaling != 1.0f) {
+            ops::scale_inplace(dev, logits_c, 1.0f / cfg_.logits_scaling, Cr * V);
+        }
         ops::sce_accumulate(dev, logits_c, targets + r0, dlogits_c,
                             Cr, V, cfg_.z_loss_scale);
-
+        // P0-05 (sums, not means) + P0-2b (fused single pass), per chunk.
+        // SCE already emits eff_scale-ready SUM grads, so no ×cn rescale.
         if (eff_scale != 1.0f) ops::scale_inplace(dev, dlogits_c, eff_scale, Cr * V);
         ops::linear_backward(dev, hnorm_full + r0 * d, lm_head().w.f32(), dlogits_c,
                              act.dxb.f32() + r0 * d, lm_head().g.f32(), Ci, d, V);
@@ -1569,6 +2158,12 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     if (out_ntok) *out_ntok = ntok;
     if (ntok == 0) return 0.0;
 
+    // ---- MoE load-balance aux loss: measured per layer inside the backward
+    // loop below (each layer refills the shared [ne] fractions buffer right
+    // before its own moe_backward call), then added to the returned loss.
+    // AUDIT P1: on CUDA the per-layer raw folds into ONE device accumulator
+    // (zero syncs per layer); the host reads it once below. want_aux_stats
+    // additionally refreshes the balance-report stats (log cadence only).
     double aux_total = 0.0;
     const bool use_dev_aux = (dev == Device::CUDA) && cfg_.use_moe &&
                              cfg_.moe_aux_scale > 0.0f;
@@ -1577,19 +2172,30 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     const float* rope_freq_bwd = rope_inv_freq_ptr();
     GAI_CHECK(rope_freq_bwd != nullptr, "backward: RoPE frequency cache is missing");
 
+    // ---- final norm
     ops::zero(dev, act.dx.f32(), N * d);
     ops::rmsnorm_backward(dev, act.saved_xfinal.f32(), final_norm_.w.f32(), act.dxb.f32(),
                           act.saved_rrms_final.f32(), act.dx.f32(), final_norm_.g.f32(), N, d);
 
+    // ---- layers, in reverse
     for (int l = cfg_.num_layers - 1; l >= 0; --l) {
         LayerParams& L = layers_[static_cast<size_t>(l)];
         size_t sl = static_cast<size_t>(l);
 
+        // ffn: x_out = x_mid + FFN(x_mid)
+        // dx currently holds dL/dx_out, which flows into both the residual and the ffn path.
         if (L.has_moe()) {
             const int E  = cfg_.moe_expert_dim;
             const int ne = cfg_.num_experts;
             const int K  = cfg_.moe_top_k;
-
+            // load-balance term: measure this layer's aux loss and upload
+            // its expert fractions into the shared [ne] device buffer.
+            // P0-02 FIX + DeepSeek SFT rule: aux grads must live in the SAME
+            // scaled+sum space as CE grads AND share the trainer's 1/ntok
+            // divisor. Old code used dense N (B*T): pretrain N≈ntok hides it,
+            // but SFT masks (ntok<<N) made aux 2-5x too strong vs reported
+            // loss. Now ×eff_scale ×ntok (supervised, not dense N) ÷L so the
+            // optimized weight == reported weight (aux_scale/L) exactly.
             const float* aux_frac = nullptr;
             float aux_scale_grad = 0.0f;
             if (cfg_.moe_aux_scale > 0.0f) {
@@ -1603,7 +2209,6 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                  static_cast<float>(cfg_.num_layers > 0 ? cfg_.num_layers : 1);
             }
             ops::zero(dev, act.dxb.f32(), N * d);
-            ops::phase_start(dev, ops::TrainPhase::MoeBwd);
             ops::moe_backward(dev, act.saved_xb2[sl].f32(), L.router.w.f32(),
                               L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
                               L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
@@ -1621,13 +2226,13 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                               L.sh_gate.g.defined() ? L.sh_gate.g.f32() : nullptr,
                               L.sh_up.g.defined()   ? L.sh_up.g.f32()   : nullptr,
                               L.sh_down.g.defined() ? L.sh_down.g.f32() : nullptr,
-                               act.moe_dact.f32(),
-                               N, d, E, ne, K);
-            ops::phase_stop(dev, ops::TrainPhase::MoeBwd);
+                              act.moe_dact.f32(),
+                              N, d, E, ne, K, cfg_.shared_width());
         } else {
             ops::zero(dev, act.dact.f32(), N * F);
             ops::linear_backward(dev, act.saved_act[sl].f32(), L.w_down.w.f32(), act.dx.f32(),
                                  act.dact.f32(), L.w_down.g.f32(), static_cast<int>(N), F, d);
+            lora_backward(L.lora_down, dev, act.saved_act[sl].f32(), act.dx.f32(), act.dact.f32(), static_cast<int>(N));
 
             ops::zero(dev, act.dgate.f32(), N * F);
             ops::zero(dev, act.dup.f32(),   N * F);
@@ -1639,20 +2244,27 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                  act.dxb.f32(), L.w_gate.g.f32(), static_cast<int>(N), d, F);
             ops::linear_backward(dev, act.saved_xb2[sl].f32(), L.w_up.w.f32(), act.dup.f32(),
                                  act.dxb.f32(), L.w_up.g.f32(), static_cast<int>(N), d, F);
+            lora_backward(L.lora_gate, dev, act.saved_xb2[sl].f32(), act.dgate.f32(), act.dxb.f32(), static_cast<int>(N));
+            lora_backward(L.lora_up, dev, act.saved_xb2[sl].f32(), act.dup.f32(), act.dxb.f32(), static_cast<int>(N));
         }
 
+        // dx_mid = dx (residual) + rmsnorm_backward(dxb)
         ops::rmsnorm_backward(dev, act.saved_xmid[sl].f32(), L.ffn_norm.w.f32(), act.dxb.f32(),
                               act.saved_rrms2[sl].f32(), act.dx.f32(), L.ffn_norm.g.f32(), N, d);
 
+        // attention: x_mid = x_in + W_o(attn(...))
         ops::zero(dev, act.dattout.f32(), N * qd);
         ops::linear_backward(dev, act.saved_attout[sl].f32(), L.wo.w.f32(), act.dx.f32(),
                              act.dattout.f32(), L.wo.g.f32(), static_cast<int>(N), qd, d);
+        lora_backward(L.lora_o, dev, act.saved_attout[sl].f32(), act.dx.f32(), act.dattout.f32(), static_cast<int>(N));
 
         ops::zero(dev, act.dq.f32(), N * qd);
         ops::zero(dev, act.dk.f32(), N * kvd);
         ops::zero(dev, act.dv.f32(), N * kvd);
-
-        ops::phase_start(dev, ops::TrainPhase::AttnBwd);
+        // Recompute probs per layer into the shared transient buffer
+        // (saves (L-1)*B*H*T*T memory, e.g. 2.5GB at B=2,T=1024).
+        // act.att_out is free scratch here (forward value already saved).
+        // SWA mask rides in probs (zeros outside window) so backward matches forward.
         ops::attention_forward_ex(dev, act.saved_q[sl].f32(), act.saved_k[sl].f32(),
                                   act.saved_v[sl].f32(), act.att_out.f32(),
                                   act.attn_probs_tmp.f32(),
@@ -1663,19 +2275,26 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                    act.dattout.f32(),
                                    act.dq.f32(), act.dk.f32(), act.dv.f32(),
                                    B, T, H, KV, hd, scale, cfg_.sliding_window);
-        ops::phase_stop(dev, ops::TrainPhase::AttnBwd);
 
-        ops::rope_backward_cached(dev, act.dq.f32(), act.dk.f32(), act.pos.i32p(), rope_freq_bwd,
-                                  N, H, KV, hd, cfg_.rope_type);
+        // NoPE (Granite): the forward applies no rotation, so the backward
+        // must not rotate either — otherwise dq/dk are rotated by an
+        // operation that never happened on the forward side.
+        if (cfg_.position_embedding != 1)
+            ops::rope_backward_cached(dev, act.dq.f32(), act.dk.f32(), act.pos.i32p(), rope_freq_bwd,
+                                      N, H, KV, hd, cfg_.rope_type);
 
+        // QK-Norm backward (exact, using saved pre-norm Q/K):
+        // dq/dk hold dL/d(normed Q/K) from rope_backward. rmsnorm_backward does dx+=f(dout), so
+        // dout and dx must NOT alias. att_out [N,qd] and dattout [N,kvd] stage dout.
+        // We pass the true pre-norm Q/K (saved_qk_raw_q/k) as input x to rmsnorm_backward.
         if (cfg_.use_qk_norm && L.qk_qnorm.w.defined()) {
-
+            // Q path: stage dout in att_out, zero dq, then rmsnorm_backward.
             ops::copy(dev, act.att_out.f32(), act.dq.f32(), N * qd);
             ops::zero(dev, act.dq.f32(), N * qd);
             ops::rmsnorm_backward(dev, act.saved_qk_raw_q[sl].f32(), L.qk_qnorm.w.f32(), act.att_out.f32(),
                                   act.saved_qk_rms_q[sl].f32(), act.dq.f32(), L.qk_qnorm.g.f32(),
                                   N * H, hd);
-
+            // K path: stage dout in dattout, zero dk, then rmsnorm_backward.
             ops::copy(dev, act.dattout.f32(), act.dk.f32(), N * kvd);
             ops::zero(dev, act.dk.f32(), N * kvd);
             ops::rmsnorm_backward(dev, act.saved_qk_raw_k[sl].f32(), L.qk_knorm.w.f32(), act.dattout.f32(),
@@ -1684,6 +2303,9 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
         }
 
         ops::zero(dev, act.dxb.f32(), N * d);
+        lora_backward(L.lora_q, dev, act.saved_xb[sl].f32(), act.dq.f32(), act.dxb.f32(), static_cast<int>(N));
+        lora_backward(L.lora_k, dev, act.saved_xb[sl].f32(), act.dk.f32(), act.dxb.f32(), static_cast<int>(N));
+        lora_backward(L.lora_v, dev, act.saved_xb[sl].f32(), act.dv.f32(), act.dxb.f32(), static_cast<int>(N));
         ops::linear_backward(dev, act.saved_xb[sl].f32(), L.wq.w.f32(), act.dq.f32(),
                              act.dxb.f32(), L.wq.g.f32(), static_cast<int>(N), d, qd);
         ops::linear_backward(dev, act.saved_xb[sl].f32(), L.wk.w.f32(), act.dk.f32(),
@@ -1695,27 +2317,38 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                               act.saved_rrms1[sl].f32(), act.dx.f32(), L.attn_norm.g.f32(), N, d);
     }
 
+    // ---- embeddings
     ops::embedding_backward(dev, ids, act.dx.f32(), tok_emb_.g.f32(), N, d, V);
 
     double loss = loss_sum / static_cast<double>(ntok);
-
+    // DeepSeek-style aux loss: per-layer raw (ne*sum(mean_prob*frac)).
+    // On CUDA the hot path folded raws into the device accumulator: single
+    // sync read here replaces 2x ne-float copies per layer (72/microbatch).
     if (use_dev_aux) aux_total = ops::moe_aux_end(dev);
     if (cfg_.moe_aux_free) moe_aux_loss(act, B, T);
-
+    // FIX (10/10): old code SUMMED over layers, so a 36L model got stronger
+    // aux than a 26L model with the same scale. Average over layers so
+    // moe_aux_scale means the same at any depth.
     if (cfg_.use_moe && cfg_.moe_aux_scale > 0.0f && cfg_.num_layers > 0)
         loss += cfg_.moe_aux_scale * aux_total / static_cast<double>(cfg_.num_layers);
     return loss;
 }
 
+// ---------------------------------------------------------------- aux loss
 double Model::moe_aux_loss(Activations& act, int B, int T) {
     if (!cfg_.use_moe) return 0.0;
-
+    // Aux-loss-free (DeepSeek-V3 §3.2): no aux grad; balance via EMA bias.
+    // We still measure per-layer load (tiny ne-float host copies) and update
+    // the steering bias here. Returns 0 loss; validate enforces aux_scale=0.
     if (cfg_.moe_aux_free) {
-
+        // Accumulate fracs per microbatch (DDP-safe two-phase path).
+        // apply_moe_bias_step() is called by Trainer after all-reducing across
+        // DDP ranks, exactly once per optimizer step.
         accumulate_moe_bias_fracs(act, B, T);
         return 0.0;
     }
-
+    // FIX: calling after inference forward (with_grad=false) indexed empty
+    // saved_moe_* -> UB/segfault. Require training activations explicitly.
     GAI_CHECK(act.with_grad, "moe_aux_loss needs training Activations (with_grad)");
     GAI_CHECK(static_cast<int>(act.saved_moe_probs.size()) == cfg_.num_layers,
               "moe_aux_loss: stale Activations");
@@ -1732,7 +2365,8 @@ double Model::moe_aux_loss(Activations& act, int B, int T) {
     return total;
 }
 
-static constexpr u32 RAW_MAGIC = 0x57415247u;
+// ---------------------------------------------------------------- raw io
+static constexpr u32 RAW_MAGIC = 0x57415247u;   // "GRAW"
 
 void Model::save_raw(const std::string& path) const {
     std::ofstream f(path, std::ios::binary);
@@ -1747,13 +2381,6 @@ void Model::save_raw(const std::string& path) const {
         f.write(p->name.data(), len);
         u64 ne = static_cast<u64>(p->numel());
         f.write(reinterpret_cast<const char*>(&ne), 8);
-
-        u32 nd = static_cast<u32>(p->shape.size());
-        f.write(reinterpret_cast<const char*>(&nd), 4);
-        for (i64 d : p->shape) {
-            i64 dd = d;
-            f.write(reinterpret_cast<const char*>(&dd), 8);
-        }
         Tensor cpu = p->w.to(Device::CPU);
         f.write(reinterpret_cast<const char*>(cpu.data_ptr()),
                 static_cast<std::streamsize>(cpu.nbytes()));
@@ -1761,79 +2388,35 @@ void Model::save_raw(const std::string& path) const {
     GAI_CHECK(f.good(), "model write failed");
 }
 
-// [FIX P3-02] load_raw() used to return bare `false` for every failure
-// mode (truncation vs name/shape/dtype mismatch vs bad magic), which made
-// weight-import debugging a guessing game. Every rejection now logs the
-// tensor name and the exact reason; the bool contract is unchanged.
 bool Model::load_raw(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f.good()) { log_error("[raw] cannot open " + path); return false; }
+    if (!f.good()) return false;
     u32 magic = 0, n = 0;
-    if (!f.read(reinterpret_cast<char*>(&magic), 4)) { log_error("[raw] truncated magic: " + path); return false; }
-    if (magic != RAW_MAGIC) { log_error("[raw] bad magic in " + path); return false; }
-    if (!f.read(reinterpret_cast<char*>(&n), 4)) { log_error("[raw] truncated tensor count: " + path); return false; }
-
-    if (n != static_cast<u32>(params_.size())) {
-        log_error(strfmt("[raw] tensor count %u != model %zu in %s", n, params_.size(), path.c_str()));
-        return false;
-    }
+    if (!f.read(reinterpret_cast<char*>(&magic), 4)) return false;
+    if (magic != RAW_MAGIC) return false;
+    if (!f.read(reinterpret_cast<char*>(&n), 4)) return false;
+    // FIX: old code accepted dense->MoE / tied->untied files (extra model
+    // params stayed zero, returned true -> silent corrupt training) and
+    // ignored truncated reads. Enforce exact param-count + shape match.
+    if (n != static_cast<u32>(params_.size())) return false;
     for (u32 i = 0; i < n; ++i) {
         u32 len = 0;
-        if (!f.read(reinterpret_cast<char*>(&len), 4) || len == 0 || len > 512) {
-            log_error(strfmt("[raw] bad name length at tensor %u in %s", i, path.c_str()));
-            return false;
-        }
+        if (!f.read(reinterpret_cast<char*>(&len), 4) || len == 0 || len > 512) return false;
         std::string name(len, '\0');
-        if (!f.read(name.data(), static_cast<std::streamsize>(len))) {
-            log_error("[raw] truncated name at tensor " + std::to_string(i) + " in " + path);
-            return false;
-        }
+        if (!f.read(name.data(), static_cast<std::streamsize>(len))) return false;
         u64 ne = 0;
-        if (!f.read(reinterpret_cast<char*>(&ne), 8)) {
-            log_error("[raw] truncated numel for '" + name + "' in " + path);
-            return false;
-        }
+        if (!f.read(reinterpret_cast<char*>(&ne), 8)) return false;
         Parameter* p = find_parameter(name);
-        if (!p) { log_error("[raw] unknown tensor '" + name + "' in " + path); return false; }
-        if (static_cast<u64>(p->numel()) != ne) {
-            log_error(strfmt("[raw] numel mismatch for '%s': file %llu vs model %lld in %s",
-                             name.c_str(), (unsigned long long)ne,
-                             (long long)p->numel(), path.c_str()));
-            return false;
-        }
-        if (p->shape.empty()) { log_error("[raw] empty shape for '" + name + "'"); return false; }
-
-        u32 nd = 0;
-        if (!f.read(reinterpret_cast<char*>(&nd), 4)) {
-            log_error("[raw] truncated rank for '" + name + "'"); return false;
-        }
-        if (nd != static_cast<u32>(p->shape.size())) {
-            log_error(strfmt("[raw] rank mismatch for '%s': file %u vs model %zu",
-                             name.c_str(), nd, p->shape.size()));
-            return false;
-        }
-        for (size_t k = 0; k < p->shape.size(); ++k) {
-            i64 dd = 0;
-            if (!f.read(reinterpret_cast<char*>(&dd), 8)) {
-                log_error("[raw] truncated dim for '" + name + "'"); return false;
-            }
-            if (dd != p->shape[k]) {
-                log_error(strfmt("[raw] shape mismatch for '%s' dim %zu: file %lld vs model %lld",
-                                 name.c_str(), k, (long long)dd, (long long)p->shape[k]));
-                return false;
-            }
-        }
+        if (!p || static_cast<u64>(p->numel()) != ne) return false;
+        if (p->shape.empty()) return false;
         Tensor cpu(p->shape, DType::F32, Device::CPU);
-        if (cpu.nbytes() == 0) { log_error("[raw] zero-byte tensor '" + name + "'"); return false; }
+        if (cpu.nbytes() == 0) return false;
         if (!f.read(reinterpret_cast<char*>(cpu.data_ptr()),
-                    static_cast<std::streamsize>(cpu.nbytes()))) {
-            log_error("[raw] truncated payload for '" + name + "' in " + path);
-            return false;
-        }
+                    static_cast<std::streamsize>(cpu.nbytes()))) return false;
         p->w.copy_from(cpu);
     }
     if (fp16_weight_cache_) enable_fp16_weight_cache(true);
     return true;
 }
 
-}
+} // namespace gai

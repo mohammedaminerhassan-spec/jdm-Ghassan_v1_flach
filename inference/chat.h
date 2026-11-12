@@ -9,19 +9,13 @@
 namespace gai {
 
 struct ChatOptions {
+    // Optional explicit system prompt. Empty = no system message at all
+    // (the model speaks as its checkpoint was trained to speak).
     std::string      system;
-
-    std::string      persona = "en";
     GenerationConfig gen;
-    bool             adaptive_dialog = true;
     bool             stream = true;
     bool             show_stats = false;
     int              max_history_turns = 24;
-
-    std::string      retrieve_index;
-    double           retrieve_threshold = 3.0;
-    int              retrieve_top_k = 1;
-    bool             retrieve_direct = true;
 };
 
 class ChatSession {
@@ -39,18 +33,9 @@ public:
 private:
     void trim_history();
 
-    bool try_retrieve(const std::string& user_message, std::string& out) const;
-
-    void apply_script_policy(const std::string& user_message);
-
     Generator&           gen_;
     ChatOptions          opts_;
     std::vector<Message> history_;
-    bool                 custom_system_ = false;
-
-    mutable bool retrieve_tried_ = false;
-
-    mutable std::string retrieve_loaded_path_;
 };
 
 }

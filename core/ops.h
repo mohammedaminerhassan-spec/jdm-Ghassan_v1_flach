@@ -90,6 +90,8 @@ void linear_backward(Device dev, const float* x, const float* w, const float* dy
 
 void add(Device dev, const float* a, const float* b, float* out, i64 n);
 void add_inplace(Device dev, float* a, const float* b, i64 n);
+void add_bias(Device dev, const float* b, float* y, i64 rows, int cols);
+void bias_backward(Device dev, const float* dy, float* db, i64 rows, int cols);
 void scale_inplace(Device dev, float* a, float s, i64 n);
 void zero(Device dev, float* a, i64 n);
 void copy(Device dev, float* dst, const float* src, i64 n);
@@ -128,6 +130,8 @@ void swiglu_forward(Device dev, const float* g, const float* u, float* out, i64 
 void swiglu_backward(Device dev, const float* g, const float* u, const float* dout,
                      float* dg, float* du, i64 n);
 
+// The routed experts have width E; the shared expert has its own width SH
+// (Granite-4: 512 vs 1024). SH == E for the models that share it.
 void moe_forward(Device dev,
                  const float* x, const float* router_w,
                  const float* gates, const float* ups, const float* downs,
@@ -135,7 +139,7 @@ void moe_forward(Device dev,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                 i64 N, int d, int E, int ne, int K);
+                 i64 N, int d, int E, int ne, int K, int SH);
 
 void moe_forward_bias(Device dev,
                       const float* x, const float* router_w, const float* router_bias,
@@ -144,7 +148,7 @@ void moe_forward_bias(Device dev,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K);
+                      i64 N, int d, int E, int ne, int K, int SH);
 void moe_backward(Device dev,
                   const float* x, const float* router_w,
                   const float* gates, const float* ups, const float* downs,
@@ -157,7 +161,7 @@ void moe_backward(Device dev,
                   float* drouter_w, float* dgates, float* dups, float* ddowns,
                   float* dsh_g, float* dsh_u, float* dsh_d,
                   float* s_dact,
-                  i64 N, int d, int E, int ne, int K);
+                  i64 N, int d, int E, int ne, int K, int SH);
 
 bool moe_aux_gpu(Device dev,
                  const float* probs, const i32* idx, float* frac_dev,
@@ -165,6 +169,23 @@ bool moe_aux_gpu(Device dev,
                  i64 N, int K, int ne, double* d_raw_accum = nullptr);
 double* moe_aux_begin(Device dev);
 double moe_aux_end(Device dev);
+
+// IBM Granite-4.0: one Mamba-2 layer over a whole sequence (the recurrent
+// state is carried between calls).
+void mamba2_forward(Device dev,
+                    const float* x,
+                    const float* w_in,
+                    const float* conv_w,
+                    const float* conv_b,
+                    const float* dt_bias,
+                    const float* a_log,
+                    const float* D,
+                    const float* norm_w,
+                    const float* w_out,
+                    float* state,
+                    float* out,
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps);
 
 void attention_forward(Device dev,
                        const float* q, const float* k, const float* v,
@@ -200,6 +221,15 @@ void attention_decode_ring(Device dev,
                            float* out, int H, int KV, int hd, int ring_start,
                            int pinned_prefix, int cur_len, int cache_max,
                            float scale, float* scratch, int window);
+
+// Same as above, but the KV cache is stored as fp16 (half the memory and
+// half the bandwidth of the cache read, which is what dominates the decode
+// step at long contexts).
+void attention_decode_ring_fp16(Device dev,
+                                 const float* q, const u16* kcache, const u16* vcache,
+                                 float* out, int H, int KV, int hd, int ring_start,
+                                 int pinned_prefix, int cur_len, int cache_max,
+                                 float scale, float* scratch, int window);
 
 void softmax_cross_entropy(Device dev,
                            const float* logits, const i32* targets,

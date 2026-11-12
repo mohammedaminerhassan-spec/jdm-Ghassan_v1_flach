@@ -689,7 +689,7 @@ void moe_forward(const float* x, const float* router_w,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                  i64 N, int d, int E, int ne, int K) {
+                  i64 N, int d, int E, int ne, int K, int SH) {
     if (N <= 0) return;
 
     GAI_CHECK(N <= 2147483647LL, "moe forward: N exceeds INT_MAX (B*T too large)");
@@ -703,6 +703,7 @@ void moe_forward(const float* x, const float* router_w,
         sizeof(float) * (size_t)NK +
         sizeof(float) * (size_t)NK * E * 3 +
         sizeof(float) * (size_t)NK * d +
+        sizeof(float) * (size_t)N * SH * 3 +
         ws_pad_for(7));
     float* rlogits = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
     i32*   tmp_idx = (i32*)carve16(ws, sizeof(i32) * (size_t)NK);
@@ -711,6 +712,10 @@ void moe_forward(const float* x, const float* router_w,
     float* Ublk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
     float* Ablk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
     float* Xblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
+    // The shared expert has its own width (SH).
+    float* Sg = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* Su = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* Sa = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
 
     linear_forward(x, router_w, rlogits, (int)N, d, ne);
 
@@ -725,11 +730,11 @@ void moe_forward(const float* x, const float* router_w,
     moe_build_groups_launch(idx_use, N, K, ne, &grouped);
 
     if (sh_g && sh_u && sh_d) {
-        linear_forward(x, sh_g, Gblk, (int)N, d, E);
-        linear_forward(x, sh_u, Ublk, (int)N, d, E);
-        k_swiglu<<<grid_for(N * E, 256), 256>>>(Gblk, Ublk, Ablk, N * E);
+        linear_forward(x, sh_g, Sg, (int)N, d, SH);
+        linear_forward(x, sh_u, Su, (int)N, d, SH);
+        k_swiglu<<<grid_for(N * SH, 256), 256>>>(Sg, Su, Sa, N * SH);
         CU_CHECK(cudaGetLastError());
-        linear_forward(Ablk, sh_d, out, (int)N, E, d);
+        linear_forward(Sa, sh_d, out, (int)N, SH, d);
     } else {
         CU_CHECK(cudaMemset(out, 0, sizeof(float) * (size_t)N * d));
     }
@@ -767,11 +772,11 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K) {
+                      i64 N, int d, int E, int ne, int K, int SH) {
     if (N <= 0) return;
     if (!router_bias) {
         moe_forward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
-                    probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K);
+                    probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K, SH);
         return;
     }
 
@@ -786,6 +791,7 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
         sizeof(float) * (size_t)NK +
         sizeof(float) * (size_t)NK * E * 3 +
         sizeof(float) * (size_t)NK * d +
+        sizeof(float) * (size_t)N * SH * 3 +
         ws_pad_for(7));
     float* rlogits = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
     i32*   tmp_idx = (i32*)carve16(ws, sizeof(i32) * (size_t)NK);
@@ -794,6 +800,10 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
     float* Ublk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
     float* Ablk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
     float* Xblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
+    // The shared expert has its own width (SH).
+    float* Sg = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* Su = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* Sa = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
 
     linear_forward(x, router_w, rlogits, (int)N, d, ne);
 
@@ -809,11 +819,12 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
     moe_build_groups_launch(idx_use, N, K, ne, &grouped);
 
     if (sh_g && sh_u && sh_d) {
-        linear_forward(x, sh_g, Gblk, (int)N, d, E);
-        linear_forward(x, sh_u, Ublk, (int)N, d, E);
-        k_swiglu<<<grid_for(N * E, 256), 256>>>(Gblk, Ublk, Ablk, N * E);
+        // The shared expert has its own width (SH), not the routed width E.
+        linear_forward(x, sh_g, Sg, (int)N, d, SH);
+        linear_forward(x, sh_u, Su, (int)N, d, SH);
+        k_swiglu<<<grid_for(N * SH, 256), 256>>>(Sg, Su, Sa, N * SH);
         CU_CHECK(cudaGetLastError());
-        linear_forward(Ablk, sh_d, out, (int)N, E, d);
+        linear_forward(Sa, sh_d, out, (int)N, SH, d);
     } else {
         CU_CHECK(cudaMemset(out, 0, sizeof(float) * (size_t)N * d));
     }
@@ -856,7 +867,7 @@ void moe_backward(const float* x, const float* router_w,
                   float* drouter_w, float* dgates, float* dups, float* ddowns,
                   float* dsh_g, float* dsh_u, float* dsh_d,
                   float* s_dact,
-                  i64 N, int d, int E, int ne, int K) {
+                  i64 N, int d, int E, int ne, int K, int SH) {
     if (N <= 0) return;
     GAI_CHECK(N <= 2147483647LL, "moe backward: N exceeds INT_MAX (B*T too large)");
     GAI_CHECK(K >= 1 && K <= 8, "moe backward: top_k out of kernel range [1,8]");
@@ -867,8 +878,8 @@ void moe_backward(const float* x, const float* router_w,
     (void)s_dact;
 
     uint8_t* ws = (uint8_t*)moe_workspace(
-        sizeof(float) * (size_t)N * E * 3 +
-        sizeof(float) * (size_t)N * E * 3 +
+        sizeof(float) * (size_t)N * SH * 3 +
+        sizeof(float) * (size_t)N * SH * 3 +
         sizeof(float) * (size_t)NK +
         sizeof(float) * (size_t)NK * E * 4 +
         sizeof(float) * (size_t)NK * d * 2 +
@@ -876,12 +887,13 @@ void moe_backward(const float* x, const float* router_w,
         sizeof(float) * (size_t)N * ne +
         ws_pad_for(15));
 
-    float* shg = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
-    float* shu = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
-    float* sha = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
-    float* shdg = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
-    float* shdu = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
-    float* shda = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
+    // The shared expert has its own width (SH).
+    float* shg = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* shu = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* sha = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* shdg = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* shdu = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* shda = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
     float* dpfull = (float*)carve16(ws, sizeof(float) * (size_t)NK);
     float* Gblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
     float* Ublk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
@@ -893,17 +905,18 @@ void moe_backward(const float* x, const float* router_w,
     float* DLblk = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
 
     if (sh_g && sh_u && sh_d && dsh_g && dsh_u && dsh_d) {
-        linear_forward(x, sh_g, shg, (int)N, d, E);
-        linear_forward(x, sh_u, shu, (int)N, d, E);
-        k_swiglu<<<grid_for(N * E, 256), 256>>>(shg, shu, sha, N * E);
+        // The shared expert has its own width (SH), not the routed width E.
+        linear_forward(x, sh_g, shg, (int)N, d, SH);
+        linear_forward(x, sh_u, shu, (int)N, d, SH);
+        k_swiglu<<<grid_for(N * SH, 256), 256>>>(shg, shu, sha, N * SH);
         CU_CHECK(cudaGetLastError());
 
-    gemm(false, false, (int)N, E, d, 1.0f, dout, d, sh_d, E, 0.0f, shda, E);
-    k_swiglu_bwd_assign<<<grid_for(N * E, 256), 256>>>(shg, shu, shda, shdg, shdu, N * E);
+    gemm(false, false, (int)N, SH, d, 1.0f, dout, d, sh_d, SH, 0.0f, shda, SH);
+    k_swiglu_bwd_assign<<<grid_for(N * SH, 256), 256>>>(shg, shu, shda, shdg, shdu, N * SH);
         CU_CHECK(cudaGetLastError());
-        linear_backward(sha, sh_d, dout, nullptr, dsh_d, (int)N, E, d);
-        linear_backward(x, sh_g, shdg, dx, dsh_g, (int)N, d, E);
-        linear_backward(x, sh_u, shdu, dx, dsh_u, (int)N, d, E);
+        linear_backward(sha, sh_d, dout, nullptr, dsh_d, (int)N, SH, d);
+        linear_backward(x, sh_g, shdg, dx, dsh_g, (int)N, d, SH);
+        linear_backward(x, sh_u, shdu, dx, dsh_u, (int)N, d, SH);
     }
 
     CU_CHECK(cudaMemset(dpfull, 0, sizeof(float) * (size_t)NK));

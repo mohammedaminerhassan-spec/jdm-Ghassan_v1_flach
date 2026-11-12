@@ -1,4 +1,5 @@
 #include "core/ops_cpu.h"
+#include "core/dtype.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -256,6 +257,33 @@ void add_inplace(float* a, const float* b, i64 n) {
     #pragma omp parallel for if(n > 8192) schedule(static)
 #endif
     for (i64 i = 0; i < n; ++i) a[i] += b[i];
+}
+
+void add_bias(const float* b, float* y, i64 rows, int cols) {
+    if (!b || rows <= 0 || cols <= 0) return;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for if(rows > 16) schedule(static)
+#endif
+    for (i64 r = 0; r < rows; ++r) {
+        float* row = y + r * cols;
+        for (int c = 0; c < cols; ++c) {
+            row[c] += b[c];
+        }
+    }
+}
+
+void bias_backward(const float* dy, float* db, i64 rows, int cols) {
+    if (!db || rows <= 0 || cols <= 0) return;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for if(cols > 128) schedule(static)
+#endif
+    for (int c = 0; c < cols; ++c) {
+        double sum = 0.0;
+        for (i64 r = 0; r < rows; ++r) {
+            sum += static_cast<double>(dy[r * cols + c]);
+        }
+        db[c] += static_cast<float>(sum);
+    }
 }
 
 void scale_inplace(float* a, float s, i64 n) {
@@ -919,6 +947,58 @@ void attention_decode_ring(const float* q, const float* kcache, const float* vca
             size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
             const float* vh = vcache + (slot * static_cast<size_t>(KV) + kvh) * hd;
             axpy_f32(o, vh, s[j] * inv, hd);
+        }
+    }
+}
+
+// fp16 KV cache variant of attention_decode_ring. The values are converted
+// on the fly: the cache stays at half the size and the decode step reads
+// half the bytes.
+void attention_decode_ring_fp16(const float* q, const u16* kcache, const u16* vcache,
+                                float* out, int H, int KV, int hd, int ring_start,
+                                int pinned_prefix, int cur_len, int cache_max,
+                                float scale, float* scratch, int window) {
+    GAI_CHECK(H > 0 && KV > 0 && hd > 0, "attention_decode_ring_fp16: empty shape");
+    GAI_CHECK(H % KV == 0, "attention_decode_ring_fp16: H must be a multiple of KV");
+    GAI_CHECK(cur_len >= 0 && cache_max >= 0 && cur_len <= cache_max,
+              "attention_decode_ring_fp16: length exceeds cache capacity");
+    GAI_CHECK(pinned_prefix >= 0 && pinned_prefix <= cur_len,
+              "attention_decode_ring_fp16: pinned prefix out of range");
+    const int ring_capacity = cache_max - pinned_prefix;
+    if (cur_len > pinned_prefix) {
+        GAI_CHECK(ring_capacity > 0, "attention_decode_ring_fp16: ring has no rolling slots");
+        GAI_CHECK(ring_start >= 0 && ring_start < ring_capacity,
+                  "attention_decode_ring_fp16: ring start out of range");
+    }
+    const int group = H / KV;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int h = 0; h < H; ++h) {
+        int kvh = h / group;
+        float* s = scratch + static_cast<size_t>(h) * static_cast<size_t>(cur_len);
+        const float* qh = q + static_cast<size_t>(h) * hd;
+        int j0 = (window > 0 && cur_len > window) ? cur_len - window : 0;
+        float mx = -3.4e38f;
+        for (int j = j0; j < cur_len; ++j) {
+            size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
+            const u16* kh = kcache + (slot * static_cast<size_t>(KV) + kvh) * hd;
+            float d = 0.0f;
+            for (int c = 0; c < hd; ++c) d += qh[c] * fp16_to_fp32(kh[c]);
+            d *= scale;
+            s[j] = d;
+            mx = std::max(mx, d);
+        }
+        float sum = 0.f;
+        for (int j = j0; j < cur_len; ++j) { s[j] = std::exp(s[j] - mx); sum += s[j]; }
+        float inv = sum > 0.f ? 1.0f / sum : 0.0f;
+        float* o = out + static_cast<size_t>(h) * hd;
+        std::memset(o, 0, sizeof(float) * static_cast<size_t>(hd));
+        for (int j = j0; j < cur_len; ++j) {
+            size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
+            const u16* vh = vcache + (slot * static_cast<size_t>(KV) + kvh) * hd;
+            const float w = s[j] * inv;
+            for (int c = 0; c < hd; ++c) o[c] += w * fp16_to_fp32(vh[c]);
         }
     }
 }

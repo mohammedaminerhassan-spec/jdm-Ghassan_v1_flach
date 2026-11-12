@@ -33,6 +33,8 @@ public:
     bool is_null()   const { return type_ == Type::Null; }
     bool is_bool()   const { return type_ == Type::Bool; }
     bool is_number() const { return type_ == Type::Number; }
+    // True when the value was parsed as (or created as) an exact int64.
+    bool is_integer() const { return type_ == Type::Number && is_int_; }
     bool is_string() const { return type_ == Type::String; }
     bool is_array()  const { return type_ == Type::Array; }
     bool is_object() const { return type_ == Type::Object; }

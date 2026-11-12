@@ -1,8 +1,11 @@
 #include "tools/cli_common.h"
+#include "tools/model_loader.h"
 #include "training/trainer.h"
 #include "core/device.h"
 #include "format/gguf_codec.h"
+#include "format/hf_checkpoint.h"
 #include "tokenizer/tokenizer.h"
+#include "training/jsonl_loader.h"
 
 #include <iostream>
 #include <filesystem>
@@ -54,7 +57,7 @@ static void usage() {
     "  --resume-mode exact|migrate   # exact: fail closed on any recipe/state drift\n"
     "  --gemm-fp16 0|1           # force CUDA fp16 GEMMs off/on\n"
     "  --device auto|cpu|cuda   --threads <n>\n"
-    "  --export <path> --export-profile fp16|q8_k|q4_0|q4_k_m|q6_k --tokenizer <path>\n"
+    "  --export <path> --export-profile q8_k|q4_0 --tokenizer <hf-dir|tokenizer.json>\n"
     "      # GGUF-only export (self-contained). --compat native (ghassan-ai) |\n"
     "      # llama (dense Ollama) | llama_moe (MoE Ollama, needs moe_shared=false)\n";
 }
@@ -77,7 +80,64 @@ int main(int argc, char** argv) {
         }
 
         ModelConfig mcfg = ModelConfig::from_config(cfg, "model");
+        const ModelConfig recipe_mcfg = mcfg;   // the recipe's adapter settings
         TrainerConfig tcfg = TrainerConfig::from_config(cfg, args.flag("strict-config", false));
+
+        // --model <dir>: fine-tune a HuggingFace checkpoint (config.json +
+        // safetensors + tokenizer.json) with no conversion step. The
+        // architecture comes from the checkpoint, not from the recipe.
+        std::unique_ptr<HFCheckpoint> hf;
+        bool weights_loaded_by_cli = false;
+        {
+            const std::string mdir = args.str("model");
+            if (!mdir.empty() && fs::is_directory(mdir)) {
+                hf = std::make_unique<HFCheckpoint>();
+                // A dry run is an arithmetic estimate: it must not map the
+                // 13.9 GB of shards just to print a memory plan.
+                GAI_CHECK(hf->open(mdir, !args.flag("dry-run", false)),
+                          "not a usable HuggingFace checkpoint: " + mdir);
+                mcfg = hf->config();
+                // The checkpoint owns the architecture, the recipe owns the
+                // adapter: keep the recipe's LoRA settings (they would
+                // otherwise be dropped by the swap and the run would train
+                // the full model instead of the adapter).
+                mcfg.take_adapter_settings_from(recipe_mcfg);
+                weights_loaded_by_cli = true;
+                log_info(strfmt("[mod ] %s: %d layers, d=%d, H=%d/%d, V=%d%s%s",
+                                mdir.c_str(), mcfg.num_layers, mcfg.hidden_size,
+                                mcfg.num_heads, mcfg.num_kv_heads, mcfg.vocab_size,
+                                mcfg.use_moe ? ", MoE" : "",
+                                mcfg.lora_rank > 0
+                                    ? strfmt(", LoRA r=%d", mcfg.lora_rank).c_str() : ""));
+            }
+        }
+
+        // training.pretrained_checkpoint may also point at a HuggingFace
+        // directory (config.json + safetensors). In that case the weights are
+        // loaded directly from it and the trainer must not try to read the
+        // engine's own binary checkpoint format. The architecture comes from
+        // that checkpoint too: the recipe's model block is only a mirror, so
+        // a stale key there must not change the model that gets trained.
+        if (!hf) {
+            const std::string pc = tcfg.pretrained_checkpoint;
+            if (!pc.empty() && fs::is_directory(pc) &&
+                HFCheckpoint::looks_like_checkpoint(pc)) {
+                hf = std::make_unique<HFCheckpoint>();
+                GAI_CHECK(hf->open(pc, !args.flag("dry-run", false)),
+                          "not a usable HuggingFace checkpoint: " + pc);
+                const ModelConfig hc = hf->config();
+                std::string why;
+                if (!hc.same_architecture_as(mcfg, &why)) {
+                    log_warn("[sft ] the recipe's model block does not mirror the checkpoint (" + why +
+                             "): the checkpoint's config.json is the architecture that gets trained");
+                    mcfg = hc;
+                    mcfg.take_adapter_settings_from(recipe_mcfg);
+                }
+                log_info(strfmt("[sft ] pretrained checkpoint: %s (HuggingFace safetensors, %d layers, d=%d)",
+                                pc.c_str(), hc.num_layers, hc.hidden_size));
+                // The trainer loads the weights (it owns the pretrained path).
+            }
+        }
 
         if (cfg.has("tokenizer.vocab_size")) {
             const int tv = static_cast<int>(cfg.get_int("tokenizer.vocab_size", mcfg.vocab_size));
@@ -178,6 +238,8 @@ if (args.has("resume-mode")) {
 print_device_report();
 
          std::string tok_path = "";
+         Tokenizer hf_tok;          // the tokenizer of a HuggingFace checkpoint
+         bool have_hf_tok = false;
          if (args.has("tokenizer")) {
              tok_path = args.str("tokenizer");
          } else if (cfg.has("tokenizer.path")) {
@@ -190,25 +252,55 @@ print_device_report();
                  if (fs::exists(cand)) tok_path = cand.string();
              }
          }
-         if (!tok_path.empty()) {
+         if (hf) {
+             // The checkpoint carries its own vocabulary: it is the one the
+             // shards were tokenized with.
+             GAI_CHECK(hf->load_tokenizer(hf_tok),
+                       "cannot build the tokenizer of the checkpoint");
+             have_hf_tok = true;
+             GAI_CHECK(hf_tok.vocab_size() <= mcfg.vocab_size,
+                       strfmt("the tokenizer has %d tokens but the model has %d",
+                              hf_tok.vocab_size(), mcfg.vocab_size));
+             log_info(strfmt("[tok ] the checkpoint's tokenizer: vocab=%d%s",
+                             hf_tok.vocab_size(),
+                             hf_tok.vocab_size() == mcfg.vocab_size
+                                 ? " (matches the model)"
+                                 : " (the model has more rows: they are padding)"));
+         }
+         // Auto-convert any JSON/JSONL instruction datasets in data_dir into
+         // .gbin shards (idempotent: existing .gbin newer than the source
+         // are skipped). Uses the checkpoint's tokenizer when fine-tuning a
+         // HF checkpoint, otherwise the --tokenizer file.
+         {
+             const Tokenizer* convert_tok = nullptr;
+             if (have_hf_tok) convert_tok = &hf_tok;
+             Tokenizer file_tok;
+             if (!have_hf_tok && !tok_path.empty() && !args.flag("dry-run")) {
+                 std::vector<i32> e_ids;
+                 if (load_tokenizer_auto(tok_path, file_tok, e_ids)) {
+                     convert_tok = &file_tok;
+                 }
+             }
+             if (convert_tok) {
+                 const int n = JsonlLoader::process_directory(tcfg.data_dir, *convert_tok, tcfg.seq_len);
+                 if (n > 0) log_info(strfmt("[data] auto-converted %d JSONL dataset(s) -> .gbin shards", n));
+             }
+         }
+         if (!tok_path.empty() && !have_hf_tok) {
              if (args.flag("dry-run")) {
-
                  log_info(strfmt("[tok ] dry-run: skipping tokenizer load (%s)", tok_path.c_str()));
-              } else {
-                  Tokenizer tok;
-                  GAI_CHECK(tok.load(tok_path), "cannot load tokenizer: " + tok_path);
-                  GAI_CHECK(tok.vocab_size() == mcfg.vocab_size,
-                            strfmt("tokenizer vocab_size %d != model.vocab_size %d "
-                                   "(training would produce corrupt embeddings)",
-                                   tok.vocab_size(), mcfg.vocab_size));
-
-                  const NormalizerConfig& ncfg = tok.normalizer_config();
-                  log_info(strfmt("[tok ] validated %s (vocab=%d matches model; norm: lowercase=%d fold=%d strip_diacritics=%d)",
-                                  tok_path.c_str(), tok.vocab_size(),
-                                  ncfg.lowercase_latin ? 1 : 0,
-                                  ncfg.fold_letters ? 1 : 0,
-                                  ncfg.strip_diacritics ? 1 : 0));
-              }
+             } else {
+                 Tokenizer tok;
+                 std::vector<i32> e_ids;
+                 GAI_CHECK(load_tokenizer_auto(tok_path, tok, e_ids),
+                           "cannot load tokenizer: " + tok_path);
+                 GAI_CHECK(tok.vocab_size() <= mcfg.vocab_size,
+                           strfmt("tokenizer vocab_size %d exceeds model.vocab_size %d "
+                                  "(training would produce corrupt embeddings)",
+                                  tok.vocab_size(), mcfg.vocab_size));
+                 log_info(strfmt("[tok ] validated %s (vocab=%d matches model)",
+                                 tok_path.c_str(), tok.vocab_size()));
+             }
          }
 
          Device dev = Device::CPU;
@@ -263,6 +355,25 @@ print_device_report();
             log_info(strfmt("  fp16 weight cache  : %s%s",
                             human_bytes(cost.fp16_cache).c_str(),
                             tcfg.fp16_weight_cache ? "" : " (disabled)"));
+            {
+                // The two fixed-size blocks of a hybrid model: the Mamba-2
+                // recurrent state and the inference KV cache.
+                const size_t ms = Model::mamba_state_bytes(mcfg);
+                if (ms > 0)
+                    log_info(strfmt("  mamba-2 states      : %s (recurrent, all layers)",
+                                    human_bytes(ms).c_str()));
+                const size_t kvb = Model::kv_cache_bytes(mcfg, mcfg.max_seq_len);
+                if (kvb > 0)
+                    log_info(strfmt("  kv cache @%d ctx  : %s (fp16 packed, inference)",
+                                    mcfg.max_seq_len, human_bytes(kvb).c_str()));
+                // A 7B model in fp32 masters does not fit a 16GB T4; fp16
+                // masters + fp16 weights do (13.9GB). Say it out loud.
+                const size_t fp16_weights = static_cast<size_t>(cost.params) * 2;
+                if (fp16_weights < cost.weights && fp16_weights > (4ull << 30))
+                    log_info(strfmt("  fp16 weights would be: %s (fp32 masters: %s)",
+                                    human_bytes(fp16_weights).c_str(),
+                                    human_bytes(cost.weights).c_str()));
+            }
             log_info(strfmt("  activations b=%d t=%d%s%s : %s",
                             tcfg.batch_size, tcfg.seq_len,
                             tcfg.activation_checkpointing ? " [ckpt]" : "",
@@ -338,7 +449,16 @@ print_device_report();
         Model model(mcfg, dev);
         model.print_parameter_report();
 
-        model.init_weights(tcfg.seed);
+        if (weights_loaded_by_cli) {
+            // Fine-tuning a real checkpoint: the weights come from the
+            // checkpoint, not from a random init.
+            GAI_CHECK(hf->load_model(model),
+                      "cannot load the weights of the checkpoint");
+            log_info("[mod ] the checkpoint weights are loaded");
+            tcfg.pretrained_loaded = true;
+        } else {
+            model.init_weights(tcfg.seed);
+        }
         model.enable_grad(true);
 
         Trainer trainer(model, tcfg);
@@ -351,6 +471,13 @@ print_device_report();
         }
 
         if (args.has("export")) {
+            // A LoRA run trains adapters; the exported model must be a plain
+            // dense checkpoint, so the adapters are folded into the base
+            // weights first.
+            if (model.has_lora()) {
+                log_info("[expt] merging the LoRA adapters into the base weights");
+                model.merge_lora();
+            }
             int my_rank = 0;
             if (const char* rank_env = std::getenv("RANK")) {
                 const int r = std::atoi(rank_env);
@@ -360,12 +487,19 @@ print_device_report();
                 log_info("[export] rank " + std::to_string(my_rank) +
                          ": skipping GGUF export (rank 0 owns the artifact)");
             } else {
-                std::string prof = args.str("export-profile", "fp16");
+                std::string prof = args.str("export-profile", "q8_k");
 
                 std::string tok_path = args.str("tokenizer", cfg.get_str("tokenizer.path", ""));
-                if (!args.has("tokenizer") && !tok_path.empty())
-                    log_info("[cfg ] using tokenizer.path from yaml: " + tok_path);
-                export_model_gguf(args.str("export"), model, tok_path,
+                Tokenizer etok;
+                if (!have_hf_tok && !tok_path.empty()) {
+                    std::vector<i32> e_ids;
+                    GAI_CHECK(load_tokenizer_auto(tok_path, etok, e_ids),
+                              "cannot load tokenizer for export: " + tok_path);
+                }
+                const Tokenizer& effective_tok = have_hf_tok ? hf_tok : etok;
+                GAI_CHECK(have_hf_tok || !tok_path.empty(),
+                          "GGUF export needs a tokenizer: pass --tokenizer <hf-dir|tokenizer.json>");
+                export_model_gguf(args.str("export"), model, effective_tok,
                                   gguf_profile_for(prof),
                                   {{"stage", cfg.get_str("training.stage", "pretrain")},
                                    {"steps", std::to_string(trainer.state().step)}},

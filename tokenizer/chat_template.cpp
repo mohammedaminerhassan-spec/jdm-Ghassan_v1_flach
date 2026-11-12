@@ -1,58 +1,17 @@
 #include "tokenizer/chat_template.h"
-#include "core/unicode.h"
 
 namespace gai {
 
-const char* ChatTemplate::default_system() {
-    return "";
-}
-
-const char* ChatTemplate::default_system_latin() {
-    return "";
-}
-
-const char* ChatTemplate::default_system_english() {
-    return "";
-}
-
-const char* ChatTemplate::system_for_persona(const std::string& persona, ReplyScript s) {
-    if (persona == "en" || persona == "english") return default_system_english();
-    return system_for_script(s);
-}
-
-const char* ChatTemplate::script_directive(ReplyScript s) {
-    return (s == ReplyScript::Latin)
-        ? "Reply ONLY in Latin letters (Arabizi). Never use Arabic letters."
-        : "جاوب غير بالحروف العربية فقط. ممنوع تستعمل الحروف اللاتينية.";
-}
-
-ReplyScript ChatTemplate::detect_script(const std::string& user_message) {
-    ScriptStats st = script_stats(user_message);
-
-    if (st.arabic == 0 && st.latin == 0) return ReplyScript::Arabic;
-    return (st.arabic >= st.latin) ? ReplyScript::Arabic : ReplyScript::Latin;
-}
-
-const char* ChatTemplate::system_for_script(ReplyScript s) {
-    return (s == ReplyScript::Latin) ? default_system_latin() : default_system();
-}
-
-i32 ChatTemplate::role_token(Role r) {
-    switch (r) {
-        case Role::System:    return special::SYSTEM;
-        case Role::User:      return special::USER;
-        case Role::Assistant: return special::ASSISTANT;
-    }
-    return special::USER;
-}
-
-// ---------------------------------------------------------------------------
-// Foreign chat styles
-// ---------------------------------------------------------------------------
-
-const char* kImagePadToken = "<|image_pad|>";
-
 namespace {
+
+i32 need_ctrl(const Tokenizer& tk, const char* name) {
+    const i32 id = tk.token_to_id(name);
+    GAI_CHECK(id >= 0,
+              strfmt("The chat template needs the control token '%s' but it is not in the "
+                     "vocabulary (vocab_size=%d). This vocabulary does not speak this chat format.",
+                     name, tk.vocab_size()));
+    return id;
+}
 
 const char* role_name(Role r) {
     switch (r) {
@@ -63,30 +22,22 @@ const char* role_name(Role r) {
     return "user";
 }
 
-i32 need_ctrl(const Tokenizer& tk, const char* name) {
-    const i32 id = tk.token_to_id(name);
-    GAI_CHECK(id >= 0,
-              strfmt("chat style needs the control token '%s' but it is not in the "
-                     "vocabulary (vocab_size=%d)", name, tk.vocab_size()));
-    return id;
-}
+// Shared renderer: segments are either raw control ids or text to BPE.
+// `wrap` renders one message; `terminator` is the per-turn terminator token.
+struct RenderSpec {
+    i32  start;       // never null in our two templates
+    i32  end;
+    bool end_supervised;
+    std::string start_text_prefix;  // role header rendered as text after `start`
+    std::string start_text_suffix;
+};
 
 }  // namespace
 
-ChatStyle detect_chat_style(const Tokenizer& tk) {
-    if (tk.token_to_id("<|im_start|>") >= 0 && tk.token_to_id("<|im_end|>") >= 0)
-        return ChatStyle::ChatML;
-    if (tk.token_to_id("<|start_header_id|>") >= 0 && tk.token_to_id("<|eot_id|>") >= 0)
-        return ChatStyle::Llama3;
-    if (tk.token_to_id("[INST]") >= 0 && tk.token_to_id("[/INST]") >= 0)
-        return ChatStyle::Mistral;
-    return ChatStyle::Native;
-}
-
-std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
-                                     const std::vector<Message>& msgs,
-                                     bool add_generation_prompt) {    std::vector<ChatSegment> segs;
-
+std::vector<ChatSegment> render_chatml(const Tokenizer& tk,
+                                       const std::vector<Message>& msgs,
+                                       bool add_generation_prompt) {
+    std::vector<ChatSegment> segs;
     auto push_tok = [&](i32 id, bool sup) {
         ChatSegment s;
         s.is_token = true;
@@ -101,164 +52,37 @@ std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
         s.supervised = sup;
         segs.push_back(std::move(s));
     };
-    auto push_img = [&]() {
-        ChatSegment s;
-        s.is_image = true;
-        segs.push_back(std::move(s));
-    };
 
     if (tk.add_bos()) push_tok(tk.bos_id(), false);
 
-    // Some chat templates (SmolLM2, Qwen, ...) inject a default system
-    // message when the conversation does not start with one. The engine
-    // reproduces that behaviour from the metadata the converter wrote.
-    //
-    // An empty system message counts as "no system message": the callers
-    // that always push one (the chat session, the CLI) would otherwise
-    // suppress the default and change the prompt.
-    const bool has_system = [&] {
-        for (const Message& m : msgs) {
-            if (m.role == Role::System && !m.content.empty()) return true;
-        }
-        return false;
-    }();
-    const bool inject_default =
-        !has_system && !tk.default_system().empty() &&
-        (style == ChatStyle::ChatML || style == ChatStyle::Llama3);
-    const bool skip_empty_system =
-        (style == ChatStyle::ChatML || style == ChatStyle::Llama3);
-
-    switch (style) {
-        case ChatStyle::Native: {
-            const i32 sysm  = need_ctrl(tk, "<|system|>");
-            const i32 usrm  = need_ctrl(tk, "<|user|>");
-            const i32 asstm = need_ctrl(tk, "<|assistant|>");
-            const i32 endm  = need_ctrl(tk, "<|end|>");
-            for (const Message& m : msgs) {
-                const i32 marker = (m.role == Role::System) ? sysm
-                                 : (m.role == Role::User)  ? usrm
-                                                           : asstm;
-                const bool sup = (m.role == Role::Assistant);
-                push_tok(marker, false);
-                if (m.has_image()) push_img();
-                push_txt(m.content, sup);
-                push_tok(endm, sup);
-            }
-            if (add_generation_prompt) push_tok(asstm, false);
-            break;
-        }
-        case ChatStyle::ChatML: {
-            const i32 im_s = need_ctrl(tk, "<|im_start|>");
-            const i32 im_e = need_ctrl(tk, "<|im_end|>");
-            if (inject_default) {
-                push_tok(im_s, false);
-                push_txt("system\n", false);
-                push_txt(tk.default_system(), false);
-                push_tok(im_e, false);
-                push_txt("\n", false);
-            }
-            for (const Message& m : msgs) {
-                if (skip_empty_system && m.role == Role::System && m.content.empty()) continue;
-                const bool sup = (m.role == Role::Assistant);
-                push_tok(im_s, false);
-                push_txt(std::string(role_name(m.role)) + "\n", false);
-                if (m.has_image()) push_img();
-                push_txt(m.content, sup);
-                push_tok(im_e, sup);
-                push_txt("\n", false);
-            }
-            if (add_generation_prompt) {
-                push_tok(im_s, false);
-                push_txt("assistant\n", false);
-            }
-            break;
-        }
-        case ChatStyle::Llama3: {
-            const i32 hs  = need_ctrl(tk, "<|start_header_id|>");
-            const i32 he  = need_ctrl(tk, "<|end_header_id|>");
-            const i32 eot = need_ctrl(tk, "<|eot_id|>");
-            if (inject_default) {
-                push_tok(hs, false);
-                push_txt("system", false);
-                push_tok(he, false);
-                push_txt("\n\n", false);
-                push_txt(tk.default_system(), false);
-                push_tok(eot, false);
-            }
-            for (const Message& m : msgs) {
-                if (skip_empty_system && m.role == Role::System && m.content.empty()) continue;
-                const bool sup = (m.role == Role::Assistant);
-                push_tok(hs, false);
-                push_txt(role_name(m.role), false);
-                push_tok(he, false);
-                push_txt("\n\n", false);
-                if (m.has_image()) push_img();
-                push_txt(m.content, sup);
-                push_tok(eot, sup);
-            }
-            if (add_generation_prompt) {
-                push_tok(hs, false);
-                push_txt("assistant", false);
-                push_tok(he, false);
-                push_txt("\n\n", false);
-            }
-            break;
-        }
-        case ChatStyle::Mistral: {
-            const i32 inst  = need_ctrl(tk, "[INST]");
-            const i32 einst = need_ctrl(tk, "[/INST]");
-            // Mistral has no system role: fold it into the first user turn.
-            std::string sys;
-            for (const Message& m : msgs) {
-                if (m.role == Role::System) { sys = m.content; break; }
-            }
-            for (const Message& m : msgs) {
-                if (m.role == Role::System) continue;
-                if (m.role == Role::User) {
-                    push_tok(inst, false);
-                    push_txt(sys.empty() ? (" " + m.content) : (" " + sys + "\n" + m.content),
-                             false);
-                    push_tok(einst, false);
-                    sys.clear();
-                } else {
-                    push_txt(" " + m.content, true);
-                    push_tok(tk.eos_id(), true);
-                }
-            }
-            break;
-        }
+    const i32 im_s = need_ctrl(tk, "<|im_start|>");
+    const i32 im_e = need_ctrl(tk, "<|im_end|>");
+    for (const Message& m : msgs) {
+        const bool sup = (m.role == Role::Assistant);
+        push_tok(im_s, false);
+        push_txt(std::string(role_name(m.role)) + "\n", false);
+        push_txt(m.content, sup);
+        push_tok(im_e, sup);
+        push_txt("\n", false);
+    }
+    if (add_generation_prompt) {
+        push_tok(im_s, false);
+        push_txt("assistant\n", false);
     }
     return segs;
 }
 
-std::vector<i32> encode_chat(const Tokenizer& tk, ChatStyle style,
-                              const std::vector<Message>& msgs,
-                              bool add_generation_prompt,
-                              std::vector<u8>* loss_mask,
-                              std::vector<int>* image_positions,
-                              int image_tokens) {
+std::vector<i32> encode_chatml(const Tokenizer& tk,
+                               const std::vector<Message>& msgs,
+                               bool add_generation_prompt,
+                               std::vector<u8>* loss_mask) {
     std::vector<i32> ids;
     std::vector<u8> mask;
 
-    // The placeholder token the vision features will be written over. When
-    // the vocabulary does not have it, the unknown token is used: the
-    // position still exists, which is what matters.
-    i32 pad_id = tk.token_to_id(kImagePadToken);
-    if (pad_id < 0) pad_id = (tk.unk_id() >= 0) ? tk.unk_id() : 0;
-    const int n_img = (image_tokens > 0) ? image_tokens : 1;
-
-    for (const ChatSegment& s : render_chat(tk, style, msgs, add_generation_prompt)) {
+    for (const ChatSegment& s : render_chatml(tk, msgs, add_generation_prompt)) {
         if (s.is_token) {
             ids.push_back(s.token);
             mask.push_back(s.supervised ? 1 : 0);
-            continue;
-        }
-        if (s.is_image) {
-            for (int i = 0; i < n_img; ++i) {
-                if (image_positions) image_positions->push_back(static_cast<int>(ids.size()));
-                ids.push_back(pad_id);
-                mask.push_back(s.supervised ? 1 : 0);
-            }
             continue;
         }
         const std::vector<i32> body = tk.encode(s.text, false, false);
@@ -272,31 +96,100 @@ std::vector<i32> encode_chat(const Tokenizer& tk, ChatStyle style,
     return ids;
 }
 
-static const char* role_marker(Role r) {
-    switch (r) {
-        case Role::System:    return "<|system|>";
-        case Role::User:      return "<|user|>";
-        case Role::Assistant: return "<|assistant|>";
+std::vector<ChatSegment> render_granite(const Tokenizer& tk,
+                                        const std::vector<Message>& msgs,
+                                        bool add_generation_prompt) {
+    std::vector<ChatSegment> segs;
+    auto push_tok = [&](i32 id, bool sup) {
+        ChatSegment s;
+        s.is_token = true;
+        s.token = id;
+        s.supervised = sup;
+        segs.push_back(std::move(s));
+    };
+    auto push_txt = [&](std::string t, bool sup) {
+        if (t.empty()) return;
+        ChatSegment s;
+        s.text = std::move(t);
+        s.supervised = sup;
+        segs.push_back(std::move(s));
+    };
+
+    if (tk.add_bos()) push_tok(tk.bos_id(), false);
+
+    const i32 role_start = need_ctrl(tk, "<|start_of_role|>");
+    const i32 role_end   = need_ctrl(tk, "<|end_of_role|>");
+    const i32 turn_end   = need_ctrl(tk, "<|end_of_text|>");
+
+    // The Granite-4 template always opens with a system turn. When the
+    // caller supplies none, the reference template uses its own default
+    // sentence; the engine reproduces it so the prompt matches the training
+    // distribution exactly.
+    bool has_system = false;
+    for (const Message& m : msgs) if (m.role == Role::System) { has_system = true; break; }
+    if (!has_system) {
+        push_tok(role_start, false);
+        push_txt("system", false);
+        push_tok(role_end, false);
+        push_txt("You are a helpful assistant. Please ensure responses are professional, "
+                 "accurate, and safe.", false);
+        push_tok(turn_end, false);
+        push_txt("\n", false);
     }
-    return "<|user|>";
+
+    for (const Message& m : msgs) {
+        const bool sup = (m.role == Role::Assistant);
+        push_tok(role_start, false);
+        push_txt(role_name(m.role), false);
+        push_tok(role_end, false);
+        push_txt(m.content, sup);
+        push_tok(turn_end, sup);
+        push_txt("\n", false);
+    }
+    if (add_generation_prompt) {
+        push_tok(role_start, false);
+        push_txt("assistant", false);
+        push_tok(role_end, false);
+    }
+    return segs;
 }
 
-std::string ChatTemplate::render(const std::vector<Message>& msgs, bool add_generation_prompt) {
-    std::string out = "<s>";
-    for (const auto& m : msgs) {
-        out += role_marker(m.role);
-        out += m.content;
-        out += "<|end|>";
+std::vector<i32> encode_granite(const Tokenizer& tk,
+                                const std::vector<Message>& msgs,
+                                bool add_generation_prompt,
+                                std::vector<u8>* loss_mask) {
+    std::vector<i32> ids;
+    std::vector<u8> mask;
+
+    for (const ChatSegment& s : render_granite(tk, msgs, add_generation_prompt)) {
+        if (s.is_token) {
+            ids.push_back(s.token);
+            mask.push_back(s.supervised ? 1 : 0);
+            continue;
+        }
+        const std::vector<i32> body = tk.encode(s.text, false, false);
+        for (i32 id : body) {
+            ids.push_back(id);
+            mask.push_back(s.supervised ? 1 : 0);
+        }
     }
-    if (add_generation_prompt) out += "<|assistant|>";
-    return out;
+
+    if (loss_mask) *loss_mask = std::move(mask);
+    return ids;
 }
 
-std::vector<i32> ChatTemplate::encode(const Tokenizer& tk,
-                                      const std::vector<Message>& msgs,
-                                      bool add_generation_prompt,
-                                      std::vector<u8>* loss_mask) {
-    return encode_chat(tk, ChatStyle::Native, msgs, add_generation_prompt, loss_mask);
+std::vector<i32> encode_chat(const Tokenizer& tk,
+                             ChatTemplate kind,
+                             const std::vector<Message>& msgs,
+                             bool add_generation_prompt,
+                             std::vector<u8>* loss_mask) {
+    switch (kind) {
+        case ChatTemplate::Granite:
+            return encode_granite(tk, msgs, add_generation_prompt, loss_mask);
+        case ChatTemplate::ChatML:
+        default:
+            return encode_chatml(tk, msgs, add_generation_prompt, loss_mask);
+    }
 }
 
 }

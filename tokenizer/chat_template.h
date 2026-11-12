@@ -6,95 +6,74 @@
 
 namespace gai {
 
+// The chat formats this engine speaks.
+enum class ChatTemplate : u8 {
+    // Qwen / ChatML: <|im_start|>role\ncontent<|im_end|>\n
+    ChatML = 0,
+    // IBM Granite-4: <|start_of_role|>role<|end_of_role|>content<|end_of_text|>\n
+    Granite = 1,
+};
+
+// The one chat format this engine speaks by default: ChatML, the format Qwen (and
+// DeepSeek) checkpoints are trained with:
+//
+//   <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n
+//   <|im_start|>assistant\n...<|im_end|>\n
+//
+// There are no engine-invented prompts: no default system message, no
+// language routing, no persona logic. A system message is rendered only
+// when the caller (or the user) explicitly supplies one.
 enum class Role : u8 { System = 0, User = 1, Assistant = 2 };
 
 struct Message {
     Role        role = Role::User;
     std::string content;
-
-    // Optional image attached to this message. The pixels are CHW and
-    // already resized and normalized; the vision tower turns them into
-    // embeddings that replace the placeholder tokens in the prompt.
-    std::vector<float> pixels;
-    int               image_h = 0;
-    int               image_w = 0;
-
-    bool has_image() const { return !pixels.empty(); }
 };
 
-enum class ReplyScript : u8 { Arabic = 0, Latin = 1 };
-
-// Chat formatting styles.
-//
-// Native is the Gai style. The other three are the de-facto standards used
-// by HuggingFace checkpoints; the engine detects them from the vocabulary so
-// a foreign model can be served without hand-editing anything.
-enum class ChatStyle : u8 {
-    Native  = 0,  // <|system|>c<|end|> ... <|assistant|>
-    ChatML  = 1,  // <|im_start|>role\nc<|im_end|>
-    Llama3  = 2,  // <|start_header_id|>role<|end_header_id|>\n\nc<|eot_id|>
-    Mistral = 3,  // [INST] c [/INST]
-};
-
-// One piece of a rendered prompt: either a literal control token or plain
-// text that still has to go through the tokenizer.
+// One pre-tokenized piece of a rendered prompt: either a control token to
+// emit verbatim, or text that still has to go through the BPE.
 struct ChatSegment {
     bool        is_token   = false;
     i32         token      = -1;
     std::string text;
     bool        supervised = false;  // contributes to the training loss
-    bool        is_image   = false;  // the vision features go here
 };
 
-// Detects the chat style from the marker tokens present in the vocabulary.
-ChatStyle detect_chat_style(const Tokenizer& tk);
-
-// Renders the message list into control-token / text segments.
-std::vector<ChatSegment> render_chat(const Tokenizer& tk, ChatStyle style,
-                                     const std::vector<Message>& msgs,
-                                     bool add_generation_prompt);
+std::vector<ChatSegment> render_chatml(const Tokenizer& tk,
+                                       const std::vector<Message>& msgs,
+                                       bool add_generation_prompt);
 
 // Renders and tokenizes. loss_mask (optional) is 1 for the tokens that
 // should be predicted (assistant content + the turn terminator).
+std::vector<i32> encode_chatml(const Tokenizer& tk,
+                               const std::vector<Message>& msgs,
+                               bool add_generation_prompt,
+                               std::vector<u8>* loss_mask = nullptr);
+
+// The Granite-4 chat format:
 //
-// image_positions (optional) receives the absolute positions of the
-// placeholder tokens that stand for an attached image, so the caller can
-// write the vision features over them. image_tokens is how many
-// placeholders one image takes (the number of patches).
-std::vector<i32> encode_chat(const Tokenizer& tk, ChatStyle style,
-                              const std::vector<Message>& msgs,
-                              bool add_generation_prompt,
-                              std::vector<u8>* loss_mask = nullptr,
-                              std::vector<int>* image_positions = nullptr,
-                              int image_tokens = 0);
+//   <|start_of_role|>system<|end_of_role|>{system}<|end_of_text|>\n
+//   <|start_of_role|>user<|end_of_role|>{content}<|end_of_text|>\n
+//   <|start_of_role|>assistant<|end_of_role|>{content}<|end_of_text|>\n
+//   <|start_of_role|>assistant<|end_of_role|>
+//
+// The loss mask covers the assistant content and its <|end_of_text|> turn
+// terminator only. No engine-invented default system message is added: a
+// system turn is rendered only when the caller supplies one.
+std::vector<ChatSegment> render_granite(const Tokenizer& tk,
+                                        const std::vector<Message>& msgs,
+                                        bool add_generation_prompt);
 
-// The token the engine puts in the prompt where the image features go.
-extern const char* kImagePadToken;
+std::vector<i32> encode_granite(const Tokenizer& tk,
+                                const std::vector<Message>& msgs,
+                                bool add_generation_prompt,
+                                std::vector<u8>* loss_mask = nullptr);
 
-class ChatTemplate {
-public:
-    static const char* default_system();
-
-    static const char* default_system_latin();
-
-    static const char* default_system_english();
-
-    static const char* script_directive(ReplyScript s);
-
-    static ReplyScript detect_script(const std::string& user_message);
-
-    static const char* system_for_script(ReplyScript s);
-
-    static const char* system_for_persona(const std::string& persona, ReplyScript s);
-
-    static std::string render(const std::vector<Message>& msgs, bool add_generation_prompt);
-
-    static std::vector<i32> encode(const Tokenizer& tk,
-                                   const std::vector<Message>& msgs,
-                                   bool add_generation_prompt,
-                                   std::vector<u8>* loss_mask = nullptr);
-
-    static i32 role_token(Role r);
-};
+// Encode with the requested template.
+std::vector<i32> encode_chat(const Tokenizer& tk,
+                             ChatTemplate kind,
+                             const std::vector<Message>& msgs,
+                             bool add_generation_prompt,
+                             std::vector<u8>* loss_mask = nullptr);
 
 }

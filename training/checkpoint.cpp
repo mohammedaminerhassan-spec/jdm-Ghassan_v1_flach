@@ -12,7 +12,7 @@ namespace gai {
 
 static constexpr u32 CKPT_MAGIC   = 0x54504B47u;
 
-static constexpr u32 CKPT_VERSION = 13u;
+static constexpr u32 CKPT_VERSION = 14u;
 static constexpr u8 OPT_ADAMW = 0u;
 static constexpr u8 OPT_LION  = 1u;
 static constexpr u8 OPT_MUON  = 2u;
@@ -92,6 +92,8 @@ static void wr_config(std::ostream& o, const ModelConfig& c) {
     // it must be resumed with it, or the "exact" resume check has to see it.
     u8 dense_ok = c.moe_allow_dense ? 1 : 0;
     wr(o, dense_ok);
+    u8 qkv_bias = c.use_qkv_bias ? 1 : 0;
+    wr(o, qkv_bias);
 }
 static bool rd_config_v6(std::istream& i, ModelConfig& c) {
     u8 tie = 0, moe = 0, sh = 0, qk = 0;
@@ -141,6 +143,14 @@ static bool rd_config_v13(std::istream& i, ModelConfig& c) {
     u8 dense_ok = 0;
     if (!rd(i, dense_ok)) return false;
     c.moe_allow_dense = dense_ok != 0;
+    return true;
+}
+
+static bool rd_config_v14(std::istream& i, ModelConfig& c) {
+    if (!rd_config_v13(i, c)) return false;
+    u8 qkv_bias = 0;
+    if (!rd(i, qkv_bias)) return false;
+    c.use_qkv_bias = qkv_bias != 0;
     return true;
 }
 static bool rd_config_v5(std::istream& i, ModelConfig& c) {
@@ -218,7 +228,7 @@ static bool arch_match(const ModelConfig& a, const ModelConfig& b) {
           a.tie_embeddings == b.tie_embeddings && a.use_moe == b.use_moe &&
           a.num_experts == b.num_experts && a.moe_top_k == b.moe_top_k &&
           a.moe_expert_dim == b.moe_expert_dim && a.moe_shared == b.moe_shared &&
-          a.use_qk_norm == b.use_qk_norm))
+          a.use_qk_norm == b.use_qk_norm && a.use_qkv_bias == b.use_qkv_bias))
         return false;
     if (a.max_seq_len != b.max_seq_len || a.rope_theta != b.rope_theta ||
         a.rope_scale != b.rope_scale || a.rope_yarn_mscale != b.rope_yarn_mscale ||
@@ -525,7 +535,9 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
 
     ModelConfig cfg{};
-    if (version >= 13u) {
+    if (version >= 14u) {
+        if (!rd_config_v14(f, cfg)) return false;
+    } else if (version >= 13u) {
         if (!rd_config_v13(f, cfg)) return false;
     } else if (version >= 9u) {
         if (!rd_config_v9(f, cfg)) return false;
@@ -636,6 +648,12 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     } else if (has_opt && !opt && strict) {
         log_error("exact resume: checkpoint carries optimizer state but no optimizer was supplied");
         return false;
+    } else if (has_opt && !opt) {
+        // The caller wants weights only (inference export). The optimizer
+        // payload is well-formed (it was written by Checkpoint::save) but the
+        // caller asked for none of it: skip to EOF instead of flagging
+        // "trailing bytes" that are really just an unread optimizer state.
+        f.seekg(0, std::ios::end);
     }
     return check_no_trailing(f, strict);
 }
@@ -653,7 +671,9 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
-    if (version >= 13u) {
+    if (version >= 14u) {
+        if (!rd_config_v14(f, cfg)) return false;
+    } else if (version >= 13u) {
         if (!rd_config_v13(f, cfg)) return false;
     } else if (version >= 9u) {
         if (!rd_config_v9(f, cfg)) return false;
@@ -761,6 +781,12 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     } else if (has_opt && !opt && strict) {
         log_error("exact resume: checkpoint carries optimizer state but no optimizer was supplied");
         return false;
+    } else if (has_opt && !opt) {
+        // The caller wants weights only (inference export). The optimizer
+        // payload is well-formed (it was written by Checkpoint::save) but the
+        // caller asked for none of it: skip to EOF instead of flagging
+        // "trailing bytes" that are really just an unread optimizer state.
+        f.seekg(0, std::ios::end);
     }
     return check_no_trailing(f, strict);
 }
@@ -779,7 +805,9 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
-    if (version >= 13u) {
+    if (version >= 14u) {
+        if (!rd_config_v14(f, cfg)) return false;
+    } else if (version >= 13u) {
         if (!rd_config_v13(f, cfg)) return false;
     } else if (version >= 9u) {
         if (!rd_config_v9(f, cfg)) return false;
@@ -887,6 +915,12 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     } else if (has_opt && !opt && strict) {
         log_error("exact resume: checkpoint carries optimizer state but no optimizer was supplied");
         return false;
+    } else if (has_opt && !opt) {
+        // The caller wants weights only (inference export). The optimizer
+        // payload is well-formed (it was written by Checkpoint::save) but the
+        // caller asked for none of it: skip to EOF instead of flagging
+        // "trailing bytes" that are really just an unread optimizer state.
+        f.seekg(0, std::ios::end);
     }
     return check_no_trailing(f, strict);
 }
@@ -897,7 +931,9 @@ bool Checkpoint::peek(const std::string& path, ModelConfig& cfg, TrainState& sta
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
-    if (version >= 13u) {
+    if (version >= 14u) {
+        if (!rd_config_v14(f, cfg)) return false;
+    } else if (version >= 13u) {
         if (!rd_config_v13(f, cfg)) return false;
     } else if (version >= 9u) {
         if (!rd_config_v9(f, cfg)) return false;

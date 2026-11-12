@@ -63,6 +63,7 @@ void free_workspace() {
     if (g_sce_acc) { cudaFree(g_sce_acc); g_sce_acc = nullptr; }
     free_sampling_workspace();
     moe_free_workspace();
+    mamba_free_workspace();
     attn_free_dots();
 }
 
@@ -959,73 +960,191 @@ i32 argmax_token(const float* logits, int V) {
     return h;
 }
 
-__global__ void k_topk_s1(const float* x, int V, float* tvals, i32* tids, int K) {
-    __shared__ float sv[512];
-    __shared__ i32 si[512];
-    int t = (int)threadIdx.x;
-    int b = (int)blockIdx.x;
-    int chunk = (V + 63) / 64;
-    int lo = b * chunk;
-    int hi = lo + chunk < V ? lo + chunk : V;
-    float v0 = -FLT_MAX, v1 = -FLT_MAX;
-    i32 i0 = 0, i1 = 0;
-    for (int i = lo + t; i < hi; i += 256) {
-        float v = x[i];
-        if (v > v0) { v1 = v0; i1 = i0; v0 = v; i0 = i; }
-        else if (v > v1) { v1 = v; i1 = i; }
-    }
-    sv[2 * t] = v0; si[2 * t] = i0; sv[2 * t + 1] = v1; si[2 * t + 1] = i1;
-    __syncthreads();
-    if (t == 0) {
+__global__ void k_topk_s1(const float* x, int V, float* tvals, i32* tids, int K, int chunk) {
+    extern __shared__ char smem_raw[];
+    int chunk_pad = ((chunk + 31) / 32) * 32;
+    float* s_val = reinterpret_cast<float*>(smem_raw);
+    i32*   s_idx = reinterpret_cast<i32*>(s_val + chunk_pad);
 
-        for (int k = 0; k < K; ++k) {
-            float bv = -FLT_MAX;
-            i32 bi = 0;
-            int bj = -1;
-            for (int j = 0; j < 512; ++j)
-                if (sv[j] > bv) { bv = sv[j]; bi = si[j]; bj = j; }
-            tvals[b * K + k] = bv; tids[b * K + k] = bi;
-            if (bj >= 0) sv[bj] = -FLT_MAX;
+    const int t = static_cast<int>(threadIdx.x);
+    const int b = static_cast<int>(blockIdx.x);
+    const int lo = b * chunk;
+    const int hi = lo + chunk < V ? lo + chunk : V;
+    const int n = hi - lo;
+
+    for (int i = t; i < chunk_pad; i += static_cast<int>(blockDim.x)) {
+        if (i < n) {
+            s_val[i] = x[lo + i];
+            s_idx[i] = lo + i;
+        } else {
+            s_val[i] = -FLT_MAX;
+            s_idx[i] = -1;
         }
+    }
+    __syncthreads();
+
+    // Parallel extraction of top-K elements
+    for (int k = 0; k < K; ++k) {
+        float thread_max = -FLT_MAX;
+        int thread_pos = -1;
+        for (int i = t; i < chunk_pad; i += static_cast<int>(blockDim.x)) {
+            float v = s_val[i];
+            if (v > thread_max) {
+                thread_max = v;
+                thread_pos = i;
+            }
+        }
+
+        // Warp reduction
+        for (int o = WARP / 2; o > 0; o >>= 1) {
+            float other_v = __shfl_down_sync(0xffffffffu, thread_max, o);
+            int   other_p = __shfl_down_sync(0xffffffffu, thread_pos, o);
+            if (other_v > thread_max) {
+                thread_max = other_v;
+                thread_pos = other_p;
+            }
+        }
+
+        __shared__ float warp_max_v[8];
+        __shared__ int   warp_max_p[8];
+        int lane = t % WARP;
+        int wid  = t / WARP;
+        if (lane == 0) {
+            warp_max_v[wid] = thread_max;
+            warp_max_p[wid] = thread_pos;
+        }
+        __syncthreads();
+
+        if (t == 0) {
+            float best_v = warp_max_v[0];
+            int   best_p = warp_max_p[0];
+            int num_warps = static_cast<int>(blockDim.x) / WARP;
+            for (int w = 1; w < num_warps; ++w) {
+                if (warp_max_v[w] > best_v) {
+                    best_v = warp_max_v[w];
+                    best_p = warp_max_p[w];
+                }
+            }
+            tvals[b * K + k] = best_v;
+            tids[b * K + k]  = (best_p >= 0 && best_p < n) ? s_idx[best_p] : -1;
+            if (best_p >= 0) {
+                s_val[best_p] = -FLT_MAX;
+            }
+        }
+        __syncthreads();
     }
 }
 
 __global__ void k_topk_s2(float* tvals, i32* tids, int M,
                           float* ovals, i32* oids, int K) {
-
-    if ((int)threadIdx.x == 0 && (int)blockIdx.x == 0) {
-        for (int k = 0; k < K; ++k) {
-            float bv = -FLT_MAX;
-            i32 bi = 0;
-            int bj = -1;
-            for (int j = 0; j < M; ++j) {
-                float v = tvals[j];
-                if (v > bv) { bv = v; bi = tids[j]; bj = j; }
+    const int t = static_cast<int>(threadIdx.x);
+    for (int k = 0; k < K; ++k) {
+        float thread_max = -FLT_MAX;
+        int thread_pos = -1;
+        for (int i = t; i < M; i += static_cast<int>(blockDim.x)) {
+            float v = tvals[i];
+            if (v > thread_max) {
+                thread_max = v;
+                thread_pos = i;
             }
-            ovals[k] = bv;
-            oids[k] = bi;
-            if (bj >= 0) tvals[bj] = -FLT_MAX;
         }
+
+        // Warp reduction
+        for (int o = WARP / 2; o > 0; o >>= 1) {
+            float other_v = __shfl_down_sync(0xffffffffu, thread_max, o);
+            int   other_p = __shfl_down_sync(0xffffffffu, thread_pos, o);
+            if (other_v > thread_max) {
+                thread_max = other_v;
+                thread_pos = other_p;
+            }
+        }
+
+        __shared__ float warp_max_v[8];
+        __shared__ int   warp_max_p[8];
+        int lane = t % WARP;
+        int wid  = t / WARP;
+        if (lane == 0) {
+            warp_max_v[wid] = thread_max;
+            warp_max_p[wid] = thread_pos;
+        }
+        __syncthreads();
+
+        if (t == 0) {
+            float best_v = warp_max_v[0];
+            int   best_p = warp_max_p[0];
+            int num_warps = static_cast<int>(blockDim.x) / WARP;
+            for (int w = 1; w < num_warps; ++w) {
+                if (warp_max_v[w] > best_v) {
+                    best_v = warp_max_v[w];
+                    best_p = warp_max_p[w];
+                }
+            }
+            ovals[k] = best_v;
+            oids[k]  = (best_p >= 0) ? tids[best_p] : -1;
+            if (best_p >= 0) {
+                tvals[best_p] = -FLT_MAX;
+            }
+        }
+        __syncthreads();
     }
 }
 
 void topk_select(const float* logits, int V, int K, float* out_vals, i32* out_ids) {
-
     GAI_CHECK(K >= 1 && K <= 128, "topk_select: K out of range [1,128]");
-    GAI_CHECK(V >= 64 * K, "topk_select: vocab too small for K (block filler would leak)");
-    GAI_CHECK(V <= 64 * 512, "topk_select: vocab exceeds tiled kernel coverage");
-    const int need = 64 * K;
+    GAI_CHECK(V >= K, "topk_select: vocab too small for K");
+    GAI_CHECK(V <= 262144, "topk_select: vocab exceeds maximum supported size (262,144)");
+    
+    const int G = (V < 64) ? 1 : 64;
+    const int chunk = (V + G - 1) / G;
+    const int chunk_pad = ((chunk + 31) / 32) * 32;
+    const size_t shmem_bytes = static_cast<size_t>(chunk_pad) * (sizeof(float) + sizeof(i32));
+    const int need = G * K;
 
     if (!g_topk_tv || !g_topk_ti || g_topk_cap < need) {
         if (g_topk_tv) { cudaFree(g_topk_tv); g_topk_tv = nullptr; }
         if (g_topk_ti) { cudaFree(g_topk_ti); g_topk_ti = nullptr; }
-        CU_CHECK(cudaMalloc(&g_topk_tv, sizeof(float) * (size_t)(64 * 128)));
-        CU_CHECK(cudaMalloc(&g_topk_ti, sizeof(i32) * (size_t)(64 * 128)));
-        g_topk_cap = 64 * 128;
+        size_t cap = std::max(need, 64 * 128);
+        CU_CHECK(cudaMalloc(&g_topk_tv, sizeof(float) * cap));
+        CU_CHECK(cudaMalloc(&g_topk_ti, sizeof(i32) * cap));
+        g_topk_cap = static_cast<int>(cap);
     }
-    k_topk_s1<<<64, 256>>>(logits, V, g_topk_tv, g_topk_ti, K);
+    k_topk_s1<<<G, 256, shmem_bytes>>>(logits, V, g_topk_tv, g_topk_ti, K, chunk);
     CU_CHECK(cudaGetLastError());
     k_topk_s2<<<1, 256>>>(g_topk_tv, g_topk_ti, need, out_vals, out_ids, K);
+    CU_CHECK(cudaGetLastError());
+}
+
+__global__ void k_add_bias(float* y, const float* b, i64 rows, int cols) {
+    i64 idx = blockIdx.x * i64(blockDim.x) + threadIdx.x;
+    i64 total = rows * static_cast<i64>(cols);
+    for (; idx < total; idx += static_cast<i64>(gridDim.x) * blockDim.x) {
+        int c = static_cast<int>(idx % cols);
+        y[idx] += b[c];
+    }
+}
+
+void add_bias(const float* b, float* y, i64 rows, int cols) {
+    if (!b || rows <= 0 || cols <= 0) return;
+    i64 total = rows * static_cast<i64>(cols);
+    k_add_bias<<<grid_for(total, 256), 256>>>(y, b, rows, cols);
+    CU_CHECK(cudaGetLastError());
+}
+
+__global__ void k_bias_backward(const float* dy, float* db, i64 rows, int cols) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    double sum = 0.0;
+    for (i64 r = 0; r < rows; ++r) {
+        sum += static_cast<double>(dy[r * cols + c]);
+    }
+    db[c] += static_cast<float>(sum);
+}
+
+void bias_backward(const float* dy, float* db, i64 rows, int cols) {
+    if (!db || rows <= 0 || cols <= 0) return;
+    int block = 256;
+    int grid = (cols + block - 1) / block;
+    k_bias_backward<<<grid, block>>>(dy, db, rows, cols);
     CU_CHECK(cudaGetLastError());
 }
 

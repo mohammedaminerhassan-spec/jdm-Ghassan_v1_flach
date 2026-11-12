@@ -29,6 +29,8 @@ void linear_backward(const float* x, const float* w, const float* dy,
 
 void add(const float* a, const float* b, float* out, i64 n);
 void add_inplace(float* a, const float* b, i64 n);
+void add_bias(const float* b, float* y, i64 rows, int cols);
+void bias_backward(const float* dy, float* db, i64 rows, int cols);
 void scale_inplace(float* a, float s, i64 n);
 void zero(float* a, i64 n);
 void copy(float* dst, const float* src, i64 n);
@@ -68,14 +70,41 @@ void moe_forward(const float* x, const float* router_w,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                 i64 N, int d, int E, int ne, int K);
+                 i64 N, int d, int E, int ne, int K, int SH);
 void moe_forward_bias(const float* x, const float* router_w, const float* router_bias,
                       const float* gates, const float* ups, const float* downs,
                       const float* sh_g, const float* sh_u, const float* sh_d,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K);
+                      i64 N, int d, int E, int ne, int K, int SH);
+
+// IBM Granite-4.0: one Mamba-2 layer over a whole sequence.
+//   x      [B, T, d]        the layer input
+//   w_in   [proj, d]        in_proj weight
+//   conv_w [conv_dim, k]    depthwise conv weight
+//   conv_b [conv_dim]       depthwise conv bias (may be null)
+//   dt_bias/alog/D [n_heads]
+//   norm_w [d_inner]        gated RMSNorm weight
+//   w_out  [d, d_inner]     out_proj weight
+//   state  [B, n_heads, d_head, d_state]  recurrent state (in/out)
+//   out    [B, T, d]        the layer output
+void mamba2_forward(const float* x,
+                    const float* w_in,
+                    const float* conv_w,
+                    const float* conv_b,
+                    const float* dt_bias,
+                    const float* a_log,
+                    const float* D,
+                    const float* norm_w,
+                    const float* w_out,
+                    float* state,
+                    float* out,
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps);
+// Releases the cached Mamba-2 scratch buffer (called with the other
+// workspaces at shutdown).
+void mamba_free_workspace();
 void moe_backward(const float* x, const float* router_w,
                   const float* gates, const float* ups, const float* downs,
                   const float* sh_g, const float* sh_u, const float* sh_d,
@@ -87,7 +116,7 @@ void moe_backward(const float* x, const float* router_w,
                   float* drouter_w, float* dgates, float* dups, float* ddowns,
                   float* dsh_g, float* dsh_u, float* dsh_d,
                   float* s_dact,
-                  i64 N, int d, int E, int ne, int K);
+                  i64 N, int d, int E, int ne, int K, int SH);
 
 void attention_forward(const float* q, const float* k, const float* v,
                        float* out, float* probs,
@@ -114,6 +143,11 @@ void attention_decode_ring(const float* q, const float* kcache, const float* vca
                            float* out, int H, int KV, int hd, int ring_start,
                            int pinned_prefix, int cur_len, int cache_max,
                            float scale, float* scratch, int window);
+
+void attention_decode_ring_fp16(const float* q, const u16* kc, const u16* vc,
+                                float* out, int H, int KV, int hd, int ring_start,
+                                int pinned_prefix, int cur_len, int cache_max,
+                                float scale, float* scratch, int window);
 
 void moe_aux_frac_gpu(const float* probs, const i32* idx, float* frac,
                       float* h_frac, float* h_psum,

@@ -2,9 +2,8 @@
 
 #include "core/device.h"
 #include "core/ops.h"
-#include "format/legacy_gai_format.h"
 #include "format/gguf_codec.h"
-#include "vision/vision.h"
+#include "format/hf_checkpoint.h"
 
 #include <filesystem>
 #include <fstream>
@@ -15,6 +14,47 @@ namespace fs = std::filesystem;
 namespace gai {
 
 namespace {
+
+// The model is allocated on the device before a single weight is read, so
+// a model that does not fit the GPU dies inside cudaMalloc with a cryptic
+// "out of memory". This pre-flight turns that into an actionable message.
+void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_cache_on) {
+    if (dev != Device::CUDA) return;
+    const DeviceInfo& di = device_info();
+    if (!di.cuda_available || di.total_mem == 0) return;
+
+    const Model::MemoryPlan plan =
+        Model::plan_memory(cfg, 1, ctx > 0 ? ctx : 512, false, 1, fp16_cache_on);
+    const size_t kv   = Model::kv_cache_bytes(cfg, ctx > 0 ? ctx : cfg.max_seq_len);
+    const size_t mam  = Model::mamba_state_bytes(cfg);
+    const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, ctx > 0 ? ctx : 512);
+    const size_t need = plan.weights + plan.fp16_cache + plan.activations +
+                        kv + mam + wsp.gemm_bytes + wsp.moe_bytes;
+
+    log_info(strfmt("[mem ] GPU plan: weights %s | fp16 cache %s | activations %s | "
+                    "kv %s | mamba %s | workspaces %s = %s of %s (%.0f%%)",
+                    human_bytes(plan.weights).c_str(),
+                    human_bytes(plan.fp16_cache).c_str(),
+                    human_bytes(plan.activations).c_str(),
+                    human_bytes(kv).c_str(),
+                    human_bytes(mam).c_str(),
+                    human_bytes(wsp.gemm_bytes + wsp.moe_bytes).c_str(),
+                    human_bytes(need).c_str(),
+                    human_bytes(di.total_mem).c_str(),
+                    100.0 * static_cast<double>(need) / static_cast<double>(di.total_mem)));
+
+    if (need > di.total_mem) {
+        GAI_FAIL(strfmt("the model does not fit this GPU: it needs %s but the card has %s "
+                        "(%s of fp32 weights + %s of fp16 cache + %s of activations/KV). "
+                        "Options: --device cpu (slower, uses the host RAM), a smaller --ctx, "
+                        "--no-fp16-cache (frees the fp16 copy), or the fp16 weight storage "
+                        "mode (not implemented yet: the engine still keeps fp32 masters).",
+                        human_bytes(need).c_str(), human_bytes(di.total_mem).c_str(),
+                        human_bytes(plan.weights).c_str(),
+                        human_bytes(plan.fp16_cache).c_str(),
+                        human_bytes(plan.activations + kv).c_str()));
+    }
+}
 
 Device pick_device(const Args& a) {
     const std::string d = a.str("device", "auto");
@@ -41,11 +81,29 @@ bool is_gguf_file(const std::string& path) {
     return magic == GGUF_MAGIC;
 }
 
+bool load_tokenizer_auto(const std::string& path, Tokenizer& out,
+                         std::vector<i32>& eos_out) {
+    eos_out.clear();
+    std::error_code ec;
+    // Directory mode: the tokenizer files live next to (not inside) the
+    // weights. No need to mmap several GB of safetensors just to tokenize.
+    std::string tok_json = path;
+    if (fs::is_directory(path, ec)) {
+        tok_json = (fs::path(path) / "tokenizer.json").string();
+        if (!fs::is_regular_file(tok_json, ec)) return false;
+        return HFCheckpoint::load_tokenizer_json(tok_json, out, &eos_out);
+    }
+    if (!fs::exists(tok_json, ec) || !fs::is_regular_file(tok_json, ec)) return false;
+    if (!HFCheckpoint::load_tokenizer_json(tok_json, out, &eos_out)) return false;
+    if (eos_out.empty()) eos_out.push_back(out.eos_id());
+    return true;
+}
+
 LoadedModel load_model(const Args& args) {
     LoadedModel lm;
     std::string path = args.str("model");
     GAI_CHECK(!path.empty(), "--model is required");
-    GAI_CHECK(fs::exists(path), "model file not found: " + path);
+    GAI_CHECK(fs::exists(path), "model not found: " + path);
 
     std::ifstream probe(path, std::ios::binary);
     u32 magic = 0;
@@ -67,41 +125,42 @@ LoadedModel load_model(const Args& args) {
     lm.path = path;
     if (is_gguf) {
         if (args.flag("mmap", false))
-            log_warn("--mmap currently covers .gai weights only; loading this GGUF normally");
+            log_warn("--mmap has no effect on GGUF files; loading normally");
         GGUFReader r;
         GAI_CHECK(r.open(path), "not a valid .gguf model file: " + path);
         lm.cfg = r.model_config();
         lm.arch = r.get_string("general.architecture", "ghassan");
         lm.quant = r.get_string("ghassan.quantization.profile",
-                     r.get_string("general.quantization_version", "fp16"));
+                     r.get_string("general.quantization_version", "q8_k"));
         lm.file_bytes = r.file_size();
 
         if (args.has("tokenizer")) {
-            GAI_CHECK(lm.tokenizer.load(args.str("tokenizer")),
+            GAI_CHECK(load_tokenizer_auto(args.str("tokenizer"), lm.tokenizer, lm.eos_ids),
                       "cannot load tokenizer: " + args.str("tokenizer"));
         } else if (r.has_tokenizer()) {
             GAI_CHECK(r.load_tokenizer(lm.tokenizer),
                       "GGUF tokenizer payload is corrupt; pass --tokenizer explicitly");
-            log_info("[load] using tokenizer embedded in GGUF (no sidecar needed)");
+            lm.eos_ids = r.eos_ids();
+            log_info("[load] using tokenizer embedded in GGUF (self-contained)");
         } else {
-            std::string def = (fs::path(path).parent_path() / "tokenizer" / "english32k.gtok").string();
-            if (!fs::exists(def)) def = "artifacts/tokenizer/english32k.gtok";
-            if (!fs::exists(def)) def = "artifacts/tokenizer/darija32k.gtok";
-            if (!fs::exists(def)) def = "artifacts/tokenizer/darija.gtok";
-            GAI_CHECK(lm.tokenizer.load(def),
-                      "legacy GGUF without embedded tokenizer; pass --tokenizer "
-                      "(e.g. artifacts/tokenizer/english32k.gtok) or re-export");
+            GAI_CHECK(false, "GGUF without embedded tokenizer; pass --tokenizer "
+                             "(a HF checkpoint dir or a tokenizer.json file)");
         }
-        GAI_CHECK(lm.tokenizer.vocab_size() == lm.cfg.vocab_size,
-                  strfmt("tokenizer/model vocab mismatch: %d vs %d",
+        GAI_CHECK(lm.tokenizer.vocab_size() <= lm.cfg.vocab_size,
+                  strfmt("the tokenizer (%d tokens) exceeds the model embedding (%d rows)",
                          lm.tokenizer.vocab_size(), lm.cfg.vocab_size));
+        if (lm.tokenizer.vocab_size() < lm.cfg.vocab_size)
+            log_info(strfmt("[load] tokenizer has %d tokens; embedding is %d rows (padding)",
+                            lm.tokenizer.vocab_size(), lm.cfg.vocab_size));
 
         Timer t;
+        const bool fp16_cache_on = (dev == Device::CUDA) && ops::gemm_fp16_enabled() &&
+                                   !args.flag("no-fp16-cache", false);
+        check_vram_budget(lm.cfg, dev, args.num_int("ctx", 0), fp16_cache_on);
         lm.model = std::make_unique<Model>(lm.cfg, dev);
         GAI_CHECK(load_model_from_gguf(path, *lm.model),
                   "failed to load weights from: " + path);
-        if (dev == Device::CUDA && ops::gemm_fp16_enabled() &&
-            !args.flag("no-fp16-cache", false)) {
+        if (fp16_cache_on) {
             lm.model->enable_fp16_weight_cache(true);
             log_info(strfmt("[prec] persistent fp16 inference cache: %s",
                             human_bytes(lm.model->fp16_weight_cache_bytes()).c_str()));
@@ -112,56 +171,55 @@ LoadedModel load_model(const Args& args) {
         return lm;
     }
 
-    GaiReader r;
-    GAI_CHECK(r.open(path), "not a valid .gai model file: " + path);
-    lm.cfg = r.model_config();
-    lm.arch = "ghassan";
-    lm.quant = r.meta_str("quant_profile", "fp32");
-    lm.file_bytes = r.file_size();
+    // A HuggingFace checkpoint directory: the engine serves it as it is,
+    // with no conversion step.
+    if (fs::is_directory(path)) {
+        HFCheckpoint hf;
+        GAI_CHECK(hf.open(path), "not a usable HuggingFace checkpoint: " + path);
+        lm.cfg = hf.config();
+        lm.arch = "hf";
+        lm.quant = "q8_k";
+        for (const std::string& f : hf.weight_files()) {
+            std::error_code ec;
+            const auto sz = fs::file_size(f, ec);
+            if (!ec) lm.file_bytes += static_cast<uint64_t>(sz);
+        }
 
-    if (args.has("tokenizer")) {
-        GAI_CHECK(lm.tokenizer.load(args.str("tokenizer")),
-                  "cannot load tokenizer: " + args.str("tokenizer"));
-    } else {
-        GAI_CHECK(r.has_tokenizer() && r.load_tokenizer(lm.tokenizer),
-                  "the model has no embedded tokenizer; pass --tokenizer");
-    }
-    GAI_CHECK(lm.tokenizer.vocab_size() == lm.cfg.vocab_size,
-              strfmt("tokenizer/model vocab mismatch: %d vs %d",
-                     lm.tokenizer.vocab_size(), lm.cfg.vocab_size));
+        if (args.has("tokenizer")) {
+            GAI_CHECK(load_tokenizer_auto(args.str("tokenizer"), lm.tokenizer, lm.eos_ids),
+                      "cannot load tokenizer: " + args.str("tokenizer"));
+        } else {
+            GAI_CHECK(hf.load_tokenizer(lm.tokenizer),
+                      "cannot build the tokenizer from " + path +
+                      "/tokenizer.json (pass --tokenizer to use another one)");
+            lm.eos_ids = hf.eos_ids();
+            log_info("[load] using the checkpoint's tokenizer (tokenizer.json)");
+        }
+        GAI_CHECK(lm.tokenizer.vocab_size() <= lm.cfg.vocab_size,
+                  strfmt("the tokenizer has %d tokens but the model has %d: "
+                         "the tokenizer would produce ids the model does not have",
+                         lm.tokenizer.vocab_size(), lm.cfg.vocab_size));
 
-    Timer t;
-    lm.model = std::make_unique<Model>(lm.cfg, dev);
-    bool use_mmap = args.flag("mmap", false);
-    if (use_mmap && dev != Device::CPU) {
-        log_warn("--mmap is CPU-inference only; loading normally for CUDA");
-        use_mmap = false;
-    }
-    if (use_mmap) {
-        int wrapped = 0, converted = 0;
-        GAI_CHECK(load_model_from_gai_mmap(path, *lm.model, &wrapped, &converted),
-                  "failed to memory-map weights from: " + path);
-        log_info(strfmt("[load] %s  (%s, %s profile) in %s on %s [mmap: %d zero-copy, %d converted]",
-                        path.c_str(), human_bytes(lm.file_bytes).c_str(), lm.quant.c_str(),
-                        human_duration(t.seconds()).c_str(), device_name(dev),
-                        wrapped, converted));
+        Timer t;
+        const bool fp16_cache_on = (dev == Device::CUDA) && ops::gemm_fp16_enabled() &&
+                                   !args.flag("no-fp16-cache", false);
+        check_vram_budget(lm.cfg, dev, args.num_int("ctx", 0), fp16_cache_on);
+        lm.model = std::make_unique<Model>(lm.cfg, dev);
+        GAI_CHECK(hf.load_model(*lm.model),
+                  "failed to load the weights of: " + path);
+        if (fp16_cache_on) {
+            lm.model->enable_fp16_weight_cache(true);
+            log_info(strfmt("[prec] persistent fp16 inference cache: %s",
+                            human_bytes(lm.model->fp16_weight_cache_bytes()).c_str()));
+        }
+        log_info(strfmt("[load] %s  (%s, safetensors) in %s on %s",
+                        path.c_str(), human_bytes(lm.file_bytes).c_str(),
+                        human_duration(t.seconds()).c_str(), device_name(dev)));
         return lm;
     }
-    for (Parameter* p : lm.model->parameters()) {
-        Tensor tt = r.read_tensor_f32(p->name);
-        GAI_CHECK(tt.numel() == p->numel(), "tensor size mismatch: " + p->name);
-        p->w.copy_from(tt);
-    }
-    if (dev == Device::CUDA && ops::gemm_fp16_enabled() &&
-        !args.flag("no-fp16-cache", false)) {
-        lm.model->enable_fp16_weight_cache(true);
-        log_info(strfmt("[prec] persistent fp16 inference cache: %s",
-                        human_bytes(lm.model->fp16_weight_cache_bytes()).c_str()));
-    }
-    log_info(strfmt("[load] %s  (%s, %s profile) in %s on %s",
-                    path.c_str(), human_bytes(lm.file_bytes).c_str(), lm.quant.c_str(),
-                    human_duration(t.seconds()).c_str(), device_name(dev)));
-    return lm;
+
+    GAI_CHECK(false, "not a valid model: " + path +
+                     " (expected a HuggingFace checkpoint directory or a .gguf file)");
 }
 
 GenerationConfig make_gen_config(const Args& a) {
@@ -180,67 +238,6 @@ GenerationConfig make_gen_config(const Args& a) {
     g.sampling.gpu_fast_sample = !a.flag("no-fast-sample", false);
     g.sampling.validate();
     return g;
-}
-
-const char* chat_style_name(ChatStyle s) {
-    switch (s) {
-        case ChatStyle::ChatML:  return "chatml";
-        case ChatStyle::Llama3:  return "llama3";
-        case ChatStyle::Mistral: return "mistral";
-        default:                 return "native";
-    }
-}
-
-std::unique_ptr<VisionTower> load_vision_tower(const std::string& path,
-                                              VisionConfig* out_cfg) {
-    GGUFReader r;
-    if (!r.open(path)) return nullptr;
-
-    VisionConfig cfg;
-    cfg.image_size  = static_cast<int>(r.get_uint("ghassan.vision.image_size", 0));
-    cfg.patch_size  = static_cast<int>(r.get_uint("ghassan.vision.patch_size", 0));
-    cfg.dim         = static_cast<int>(r.get_uint("ghassan.vision.dim", 0));
-    cfg.layers      = static_cast<int>(r.get_uint("ghassan.vision.layers", 0));
-    cfg.heads       = static_cast<int>(r.get_uint("ghassan.vision.heads", 0));
-    cfg.mlp_ratio   = static_cast<int>(r.get_uint("ghassan.vision.mlp_ratio", 4));
-    cfg.out_dim     = static_cast<int>(r.get_uint("ghassan.vision.out_dim", 0));
-    cfg.proj_hidden = static_cast<int>(r.get_uint("ghassan.vision.proj_hidden", 0));
-    cfg.channels    = static_cast<int>(r.get_uint("ghassan.vision.channels", 3));
-
-    if (cfg.image_size <= 0 || cfg.patch_size <= 0 || cfg.dim <= 0 ||
-        cfg.layers <= 0 || cfg.heads <= 0 || cfg.out_dim <= 0) {
-        return nullptr;  // not a multimodal checkpoint
-    }
-    if (cfg.image_size % cfg.patch_size != 0) {
-        log_warn("[vision] the image size is not a multiple of the patch size");
-        return nullptr;
-    }
-    if (cfg.dim % cfg.heads != 0) {
-        log_warn("[vision] the tower width is not a multiple of the head count");
-        return nullptr;
-    }
-
-    std::map<std::string, Tensor> weights;
-    for (const std::string& name : VisionTower::weight_names(cfg)) {
-        const GGUFTensorInfo* ti = r.find_tensor(name);
-        if (!ti) {
-            log_warn("[vision] the file has no tensor '" + name + "'");
-            return nullptr;
-        }
-        Tensor t = r.read_tensor_f32(name);
-        if (!t.defined()) return nullptr;
-        weights[name] = std::move(t);
-    }
-
-    auto tower = std::make_unique<VisionTower>(cfg, weights);
-    if (!tower->valid()) {
-        log_error("[vision] the vision weights do not match the declared config");
-        return nullptr;
-    }
-    if (out_cfg) *out_cfg = cfg;
-    log_info(strfmt("[vision] tower loaded: %d layers, dim %d, %d patches, output %d",
-                    cfg.layers, cfg.dim, cfg.n_patches(), cfg.out_dim));
-    return tower;
 }
 
 }  // namespace gai

@@ -3,6 +3,7 @@
 #include "core/tensor.h"
 #include "core/config.h"
 #include "core/rng.h"
+#include "training/lora.h"
 #include <vector>
 #include <string>
 #include <memory>
@@ -22,7 +23,9 @@ struct ModelConfig {
     bool  tie_embeddings    = true;
     float init_std          = 0.02f;
 
-    bool  use_moe           = true;
+    // A dense model is the safe default: an MoE model is only built when the
+    // recipe (or the checkpoint) explicitly asks for it.
+    bool  use_moe           = false;
     int   num_experts       = 8;
     int   moe_top_k         = 2;
     int   moe_expert_dim    = 768;
@@ -32,7 +35,12 @@ struct ModelConfig {
 
     bool  moe_allow_dense   = false;
 
+    // Granite-4.0 shared expert width (shared_intermediate_size). 0 = dense
+    // (unused for non-granite models).
+    int shared_expert_intermediate_size = 0;
+
     bool  use_qk_norm       = false;
+    bool  use_qkv_bias      = false;
     float z_loss_scale      = 0.0f;
     float rope_scale        = 1.0f;
     float rope_yarn_mscale  = 0.0f;
@@ -43,9 +51,71 @@ struct ModelConfig {
     float rope_yarn_high    = 32.0f;
     int   sliding_window    = 0;
 
-    int   rope_type         = 0;
+    // 1 = neox (half-split, what HuggingFace/Qwen/Llama/DeepSeek use),
+    // 0 = interleaved (GPT-J style).
+    int   rope_type         = 1;
 
-    int head_dim() const { return hidden_size / num_heads; }
+    // Positional embedding: 0 = RoPE, 1 = NoPE (Granite-4.0 hybrid: no
+    // positional embeddings at all).
+    int   position_embedding = 0;
+
+    int   lora_rank         = 0;
+    float lora_alpha        = 16.0f;
+    bool  lora_target_q     = true;
+    bool  lora_target_k     = false;
+    bool  lora_target_v     = true;
+    bool  lora_target_o     = true;
+    bool  lora_target_gate  = false;
+    bool  lora_target_up    = false;
+    bool  lora_target_down  = false;
+
+    // head_dim is hidden_size / num_heads for almost every model, but a few
+    // (Qwen3-30B-A3B, DeepSeek-V3) declare an explicit head_dim that is
+    // smaller. 0 means "derive it".
+    int head_dim_override = 0;
+
+    // ---- IBM Granite-4.0 hybrid (GraniteMoeHybridForCausalLM) ----
+    //
+    // The architecture alternates Mamba-2 (linear-attention / selective SSM)
+    // layers with ordinary GQA attention layers, and puts a top-k MoE plus a
+    // shared expert in the FFN slot of every layer. It also scales the
+    // embeddings, the residual stream and the logits by configurable
+    // multipliers.
+    enum Arch : u8 { ArchQwen = 0, ArchGranite = 1 } arch = ArchQwen;
+
+    // Per-layer kind for ArchGranite: 0 = mamba, 1 = attention. Empty when
+    // the architecture is a plain transformer.
+    std::vector<int> layer_types;
+
+    // Granite multipliers (all 1.0 outside Granite).
+    float embedding_multiplier = 1.0f;
+    float residual_multiplier  = 1.0f;
+    float attention_multiplier = 0.0f;   // 0 => keep 1/sqrt(head_dim)
+    float logits_scaling       = 1.0f;   // divide logits by this
+
+    // Mamba-2 dims for ArchGranite.
+    int mamba_n_heads   = 48;
+    int mamba_d_head    = 64;
+    int mamba_d_state   = 128;
+    int mamba_n_groups  = 1;
+    int mamba_d_conv    = 4;
+    int mamba_expand    = 2;
+    int mamba_chunk_size = 256;
+    bool mamba_conv_bias = true;
+    bool mamba_proj_bias = false;
+
+    int head_dim() const {
+        if (head_dim_override > 0) return head_dim_override;
+        return hidden_size / num_heads;
+    }
+
+    // The shared expert's width. Granite-4 gives it its own size
+    // (shared_intermediate_size = 1024 while the routed experts use 512);
+    // every other model shares the expert width.
+    int shared_width() const {
+        return shared_expert_intermediate_size > 0 ? shared_expert_intermediate_size
+                                                  : moe_expert_dim;
+    }
     int kv_dim()   const { return num_kv_heads * head_dim(); }
     int q_dim()    const { return num_heads * head_dim(); }
 
@@ -55,6 +125,12 @@ struct ModelConfig {
 
     std::string arch_identity() const;
     bool same_architecture_as(const ModelConfig& o, std::string* reason = nullptr) const;
+
+    // The HuggingFace checkpoint defines the ARCHITECTURE, the recipe defines
+    // the ADAPTER. When the architecture is taken from a checkpoint
+    // (--model <hf-dir>) the recipe's LoRA knobs must survive that swap,
+    // otherwise the run silently trains the full model (or nothing).
+    void take_adapter_settings_from(const ModelConfig& recipe);
 };
 
 float rope_theta_eff(const ModelConfig& m);
@@ -73,16 +149,38 @@ struct Parameter {
     i64 numel() const { return w.numel(); }
 };
 
+// A LoRA adapter, stored as two real Parameters so the optimizer, the
+// gradient buffer and the checkpoint format treat it like any other weight.
+struct LoraAdapter {
+    Parameter A;  // [rank, in_dim]
+    Parameter B;  // [out_dim, rank]
+    Tensor   r_buf;
+    int   rank = 0;
+    int   in_dim = 0;
+    int   out_dim = 0;
+    float alpha = 16.0f;
+    bool  enabled = false;
+
+    float scale() const {
+        return (rank > 0 && enabled) ? (alpha / static_cast<float>(rank)) : 0.0f;
+    }
+};
+
 struct LayerParams {
     Parameter attn_norm;
     Parameter wq;
     Parameter wk;
     Parameter wv;
+    Parameter bq;
+    Parameter bk;
+    Parameter bv;
     Tensor    wqkv_fp16;
     Parameter wo;
     Parameter ffn_norm;
     Parameter qk_qnorm;
     Parameter qk_knorm;
+
+    bool has_qkv_bias() const { return bq.w.defined(); }
 
     Parameter router;
     Parameter moe_gate;
@@ -95,6 +193,26 @@ struct LayerParams {
     Parameter w_gate;
     Parameter w_up;
     Parameter w_down;
+
+    // Granite hybrid: Mamba-2 layer tensors.
+    Parameter mamba_in_proj;   // [d_inner*2 + 2*groups*d_state + n_heads, d]
+    Parameter mamba_conv_w;    // [conv_dim, 1, d_conv]
+    Parameter mamba_conv_b;    // [conv_dim]
+    Parameter mamba_dt_bias;   // [n_heads]
+    Parameter mamba_A_log;     // [n_heads]
+    Parameter mamba_D;         // [n_heads]
+    Parameter mamba_norm;      // [d_inner]  (RMSNorm gated)
+    Parameter mamba_out_proj;  // [d, d_inner]
+
+    bool has_mamba() const { return mamba_in_proj.w.defined(); }
+
+    LoraAdapter lora_q;
+    LoraAdapter lora_k;
+    LoraAdapter lora_v;
+    LoraAdapter lora_o;
+    LoraAdapter lora_gate;
+    LoraAdapter lora_up;
+    LoraAdapter lora_down;
 
     bool has_moe() const { return moe_gate.w.defined(); }
 };
@@ -126,6 +244,11 @@ struct Activations {
     Tensor att_out;
     Tensor proj;
     Tensor gate, up, act;
+
+    // The Mamba-2 recurrent state: [B, n_heads, d_head, d_state]. It is
+    // allocated with the activations and shared by the prefill and the decode
+    // steps that follow it.
+    Tensor mamba_state;
 
     Tensor moe_gate, moe_up, moe_act;
     Tensor moe_probs;
@@ -203,9 +326,8 @@ public:
                     const i32* segment_ids = nullptr);
 
     // Same as forward(), but some positions take their embedding from the
-    // caller instead of the token embedding table. This is how a vision
-    // tower injects image features: the prompt carries a placeholder token
-    // and the tower's output is written over that position.
+    // caller instead of the token embedding table. This is how external feature injectors work: the prompt carries
+    // a placeholder token and the features are written over that position.
     //
     // embed_override : [n_override, hidden] features
     // override_pos   : [n_override] absolute positions in [0, B*T)
@@ -246,6 +368,11 @@ public:
                                                 int B, int T, bool with_grad,
                                                 int ce_chunks);
 
+    // The recurrent state of the Mamba-2 layers (Granite hybrid).
+    static size_t mamba_state_bytes(const ModelConfig& cfg);
+    // The inference KV cache for a given context length (fp16 packed).
+    static size_t kv_cache_bytes(const ModelConfig& cfg, int max_len);
+
     struct WorkspacePlan { size_t gemm_bytes = 0; size_t moe_bytes = 0; };
     static WorkspacePlan workspace_plan(const ModelConfig& cfg, int B, int T);
 
@@ -253,6 +380,17 @@ public:
 
     std::string moe_balance_report() const;
     void moe_balance_reset();
+
+    // Folds every LoRA adapter into its base weight, so the exported model
+    // is a plain dense checkpoint (no adapter needed at inference time).
+    // After this call the adapter parameters are zeroed and the model
+    // computes exactly the same function as the trained adapter.
+    void merge_lora();
+    // True when the model carries at least one trainable LoRA adapter.
+    bool has_lora() const { return cfg_.lora_rank > 0; }
+    // Trainable parameter count (the LoRA adapters when LoRA is on, every
+    // parameter otherwise).
+    i64  trainable_parameters() const;
 
     void ensure_moe_bias();
     const float* moe_bias_ptr(int layer) const;
@@ -282,6 +420,9 @@ public:
 
 private:
     void alloc_param(Parameter& p, const std::string& name, std::vector<i64> shape, bool decay);
+    void init_lora(LoraAdapter& ad, const std::string& name,
+                   int in_d, int out_d, int r, float alpha,
+                   Device dev, std::mt19937_64& rng);
     void rebuild_rope_cache();
 
     void move_to_device(Device dev, bool announce);
@@ -289,6 +430,9 @@ private:
     double moe_layer_aux(Device dev, const float* probs, const i32* idx,
                          float* auxfrac_dev, int layer, i64 N, int K, int ne,
                          bool want_stats = true, double* d_raw_accum = nullptr);
+
+    // Granite-4.0 hybrid decoder layer (inference path).
+    void forward_mamba_layer(Device dev, int l, Activations& act, i64 N);
 
     void forward_body(const i32* ids, int B, int T, Activations& act,
                       const i32* segment_ids);

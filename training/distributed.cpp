@@ -360,9 +360,23 @@ DistributedContext::Config distributed_config_from_env(int default_world_size) {
         cfg.master_port = std::atoi(master_port);
     }
 
-    if (cfg.world_size <= 0) cfg.world_size = default_world_size;
+    // Without an explicit WORLD_SIZE the process cannot know how many peers
+    // exist. Falling back to the GPU count would make a single process try
+    // to join a world of N and block forever in ncclCommInitRank waiting for
+    // a rank that never starts. One process = one world, unless the launcher
+    // says otherwise.
+    const bool have_world = (std::getenv("WORLD_SIZE") != nullptr) ||
+                            (std::getenv("SLURM_NTASKS") != nullptr);
+    if (cfg.world_size <= 0 || !have_world) cfg.world_size = 1;
     if (cfg.global_rank < 0) cfg.global_rank = 0;
     if (cfg.local_rank < 0) cfg.local_rank = 0;
+
+    if (cfg.world_size > 1 && !std::getenv("RANK") && !std::getenv("SLURM_PROCID")) {
+        log_error("[dist] world_size=" + std::to_string(cfg.world_size) +
+                  " but neither RANK nor SLURM_PROCID is set: launch one process "
+                  "per GPU (e.g. RANK=0 LOCAL_RANK=0 WORLD_SIZE=2 and "
+                  "RANK=1 LOCAL_RANK=1 WORLD_SIZE=2).");
+    }
 
     return cfg;
 }

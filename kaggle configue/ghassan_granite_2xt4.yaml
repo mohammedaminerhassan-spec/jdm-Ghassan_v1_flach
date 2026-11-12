@@ -1,0 +1,91 @@
+# Ghassan v1 Flash — Granite-4.0-H-Tiny, Kaggle 2x T4 recipe.
+#
+# The architecture comes from the checkpoint's config.json (the engine reads
+# it), so only the training knobs live here.
+#
+# NOTE: the Mamba-2 layers do not have a backward pass yet, so a training run
+# on Granite is refused by the engine ("granite mamba layers do not support
+# the backward pass yet"). This recipe is ready for the day that lands; for
+# now use it for the dry-run / memory plan.
+
+model:
+  # Mirrors the checkpoint (the engine reads the real config.json when the
+  # checkpoint is given with --model, so these are only a fallback).
+  vocab_size: 100352
+  hidden_size: 1536
+  num_layers: 40
+  num_heads: 12
+  num_kv_heads: 4
+  intermediate_size: 512          # routed expert width
+  shared_expert_intermediate_size: 1024   # the shared expert has its own width
+  max_seq_len: 131072
+  rms_eps: 1e-05
+  tie_embeddings: true
+  use_moe: true
+  num_experts: 64
+  moe_top_k: 6
+  moe_expert_dim: 512
+  moe_shared: true
+  arch: 1                        # granite
+  position_embedding: 1           # NoPE
+  layer_types: "mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,mamba,attention,mamba,mamba,mamba,mamba"
+  embedding_multiplier: 12.0
+  residual_multiplier: 0.22
+  attention_multiplier: 0.0078125
+  logits_scaling: 6.0
+  mamba_n_heads: 48
+  mamba_d_head: 64
+  mamba_d_state: 128
+  mamba_n_groups: 1
+  mamba_d_conv: 4
+  mamba_expand: 2
+  mamba_chunk_size: 256
+
+  # LoRA on the attention projections of the 4 attention layers.
+  lora_rank: 16
+  lora_alpha: 32.0
+  lora_target_q: true
+  lora_target_k: false
+  lora_target_v: true
+  lora_target_o: true
+
+training:
+  data_dir: "data"
+
+  # The HuggingFace checkpoint directory (config.json + safetensors +
+  # tokenizer.json). The engine loads the safetensors directly.
+  pretrained_checkpoint: "granite"
+  allow_recipe_drift: false
+  stage: sft
+
+  # 2x T4 (16 GB each).
+  batch_size: 1
+  seq_len: 2048
+  grad_accum: 8
+
+  learning_rate: 2e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 20
+  max_steps: 500
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1e-8
+  grad_clip: 1.0
+
+  # Precision & VRAM efficiency (T4 has no BF16 tensor cores).
+  precision: fp16
+  gemm_fp16: true
+  fp16_weight_cache: true
+  activation_checkpointing: true
+
+  # One process per GPU (see the launch command in GRANITE.md).
+  ddp: true
+  device: cuda
+
+  checkpoint_dir: "checkpoints"
+  save_every: 100
+  eval_every: 50
+  log_every: 10

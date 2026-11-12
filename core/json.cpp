@@ -110,6 +110,12 @@ static void dump_value(const Json& j, std::string& out, int indent, int depth) {
         case Json::Type::Null:   out += "null"; break;
         case Json::Type::Bool:   out += j.as_bool() ? "true" : "false"; break;
         case Json::Type::Number: {
+            if (j.is_integer()) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(j.as_int(0)));
+                out += buf;
+                break;
+            }
             double v = j.as_number();
             if (std::isfinite(v) && v == std::floor(v) && std::fabs(v) < 1e15) {
                 char buf[32];
@@ -245,7 +251,9 @@ struct Parser {
             is_int = false;
             ++i;
             if (i < s.size() && (s[i] == '-' || s[i] == '+')) ++i;
-            while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+            bool exp_digits = false;
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') { ++i; exp_digits = true; }
+            if (!exp_digits) return fail("bad exponent (want digits after e/E)");
         }
         if (!any) return fail("bad number");
         const std::string num = s.substr(start, i - start);
@@ -317,10 +325,10 @@ struct Parser {
                         out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
                         out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
                     } else {
-                        out.push_back(static_cast<char>(0xC0 | (cp >> 18)));
-                        out.push_back(static_cast<char>(0xC0 | ((cp >> 12) & 0x3F)));
-                        out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x3F)));
-                        out.push_back(static_cast<char>(0xC0 | (cp & 0x3F)));
+                        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+                        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
                     }
                     break;
                 }

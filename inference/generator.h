@@ -5,7 +5,6 @@
 #include "tokenizer/chat_template.h"
 #include "inference/kv_cache.h"
 #include "inference/sampler.h"
-#include "vision/vision.h"
 #include <functional>
 
 namespace gai {
@@ -13,7 +12,10 @@ namespace gai {
 struct GenerationConfig {
     int  max_new_tokens = 256;
     int  max_context    = 0;
-    std::vector<i32>         stop_tokens{special::END, special::EOS};
+    // Stop-token ids. Empty (the default) = the tokenizer's eos_id().
+    // HF checkpoints loaded through HFCheckpoint fill this from
+    // generation_config.json (e.g. [<|im_end|>, <|endoftext|>] for Qwen).
+    std::vector<i32>         stop_tokens;
     std::vector<std::string> stop_strings;
     bool echo_prompt = false;
     SamplingConfig sampling{};
@@ -58,24 +60,20 @@ public:
     KVCache& cache() { return cache_; }
     int context_used() const { return cache_.length(); }
 
-    // Attaches a vision tower. The tower must be configured for the
-    // language model's hidden size.
-    void set_vision(std::unique_ptr<VisionTower> tower) { vision_ = std::move(tower); }
-    bool has_vision() const { return vision_ != nullptr && vision_->valid(); }
-
 private:
 
     float* decode_step(i32 token, int position);
 
     float* decode_step_logits(i32 token, int position);
-    void   forward_prefill(const std::vector<i32>& tokens, int start_pos,
+
+    // IBM Granite-4.0: one Mamba-2 layer, one token, using the recurrent
+    // state kept between the decoded tokens. Writes the layer output into
+    // `out` (d floats).
+    void decode_mamba_layer(int layer_index, const float* x_in, float* out);
+    void forward_prefill(const std::vector<i32>& tokens, int start_pos,
                            const float* embed_override = nullptr,
                            const int* override_pos = nullptr,
                            int n_override = 0);
-
-    // The optional vision tower: it turns an image into the embeddings that
-    // replace the image placeholder tokens in the prompt.
-    std::unique_ptr<VisionTower> vision_;
 
     static constexpr int FAST_TOPK_MAX = 128;
     static constexpr int FAST_HIST_MAX = 2048;
@@ -104,6 +102,21 @@ private:
     std::vector<i32>   topk_ids_host_;
 
     Tensor moe_gate_, moe_up_, moe_act_;
+
+    // IBM Granite-4.0: the Mamba-2 layers are stateful. Two pieces of state
+    // per mamba layer:
+    //   conv_state : [conv_dim, d_conv-1]  the causal convolution window
+    //   ssm_state  : [n_heads, d_head, d_state] the recurrent SSM state
+    // They are updated once per decoded token and reset with the cache.
+    struct MambaState {
+        Tensor conv;   // [conv_dim, d_conv-1]
+        Tensor ssm;    // [n_heads, d_head, d_state]
+        std::vector<float> conv_host;
+        std::vector<float> ssm_host;
+    };
+    std::vector<MambaState> mamba_states_;
+    bool mamba_states_ready_ = false;
+
     std::vector<float> logits_host_;
     std::vector<i32>   history_;
     GenerationStats    stats_;

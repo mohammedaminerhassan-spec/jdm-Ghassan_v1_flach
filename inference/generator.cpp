@@ -83,8 +83,33 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     topk_ids_host_.assign(FAST_TOPK_MAX, 0);
     logits_host_.assign(static_cast<size_t>(c.vocab_size), 0.0f);
 
-    log_info(strfmt("[gen ] context %d | kv cache %s | device %s",
-                    max_context_, human_bytes(cache_.bytes()).c_str(), device_name(dev)));
+    // The Mamba-2 layers keep their own recurrent state.
+    {
+        const int d_inner  = c.mamba_expand * c.hidden_size;
+        const int conv_dim = d_inner + 2 * c.mamba_n_groups * c.mamba_d_state;
+        const int conv_k   = c.mamba_d_conv;
+        const int conv_win = conv_k > 1 ? conv_k - 1 : 1;
+        mamba_states_.clear();
+        for (int l = 0; l < c.num_layers; ++l) {
+            const bool is_mamba = (c.arch == ModelConfig::ArchGranite) &&
+                                  l < static_cast<int>(c.layer_types.size()) &&
+                                  c.layer_types[static_cast<size_t>(l)] == 0;
+            if (!is_mamba) continue;
+            MambaState st;
+            st.conv = Tensor::zeros({conv_dim, conv_win}, DType::F32, dev);
+            st.ssm  = Tensor::zeros({c.mamba_n_heads, c.mamba_d_head, c.mamba_d_state}, DType::F32, dev);
+            st.conv_host.assign(static_cast<size_t>(conv_dim) * conv_win, 0.0f);
+            st.ssm_host.assign(static_cast<size_t>(c.mamba_n_heads) * c.mamba_d_head * c.mamba_d_state, 0.0f);
+            mamba_states_.push_back(std::move(st));
+        }
+        mamba_states_ready_ = !mamba_states_.empty();
+    }
+
+    log_info(strfmt("[gen ] context %d | kv cache %s | device %s%s",
+                    max_context_, human_bytes(cache_.bytes()).c_str(), device_name(dev),
+                    mamba_states_ready_
+                        ? strfmt(" | mamba states %zu layer(s)", mamba_states_.size()).c_str()
+                        : ""));
 }
 
 void Generator::reset() {
@@ -92,6 +117,11 @@ void Generator::reset() {
     history_.clear();
     stats_ = GenerationStats{};
     absolute_pos_ = 0;
+    // The Mamba-2 recurrent state belongs to the conversation: reset it.
+    for (MambaState& st : mamba_states_) {
+        st.conv_host.assign(st.conv_host.size(), 0.0f);
+        st.ssm_host.assign(st.ssm_host.size(), 0.0f);
+    }
 }
 
 float* Generator::decode_step_logits(i32 token, int position) {
@@ -108,11 +138,17 @@ float* Generator::decode_step_logits(i32 token, int position) {
     const int H   = c.num_heads;
     const int KV  = c.num_kv_heads;
     const int hd  = c.head_dim();
-    const float scale = (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale(c);
+    const float scale = (c.attention_multiplier > 0.0f)
+                            ? c.attention_multiplier
+                            : (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale(c);
     Device dev = model_.device();
 
     device_copy(tok_dev_.data_ptr(), dev, &token, Device::CPU, sizeof(i32));
     ops::embedding_forward(dev, tok_dev_.i32p(), model_.tok_embeddings().w.f32(), x_.f32(), 1, d, V);
+    // Granite scales the embeddings (12x). The decode path must do it too,
+    // or the served model differs from the prefill.
+    if (c.embedding_multiplier != 1.0f)
+        ops::scale_inplace(dev, x_.f32(), c.embedding_multiplier, d);
 
     const int slot = cache_.allocate_slot();
 
@@ -120,6 +156,42 @@ float* Generator::decode_step_logits(i32 token, int position) {
         LayerParams& L = model_.layer(l);
 
         ops::rmsnorm_forward(dev, x_.f32(), L.attn_norm.w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
+
+        // IBM Granite-4.0: this layer is a Mamba-2 SSM, not an attention
+        // layer. It has no KV cache entry and no query/key/value.
+        const bool is_mamba_layer =
+            (c.arch == ModelConfig::ArchGranite) &&
+            l < static_cast<int>(c.layer_types.size()) &&
+            c.layer_types[static_cast<size_t>(l)] == 0;
+        if (is_mamba_layer) {
+            decode_mamba_layer(l, xb_.f32(), proj_.f32());
+            if (c.residual_multiplier != 1.0f)
+                ops::scale_inplace(dev, proj_.f32(), c.residual_multiplier, d);
+            ops::add_inplace(dev, x_.f32(), proj_.f32(), d);
+
+            ops::rmsnorm_forward(dev, x_.f32(), L.ffn_norm.w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
+            if (L.has_moe()) {
+                const float* bias = model_.moe_bias_ptr(l);
+                ops::moe_forward_bias(dev, xb_.f32(), L.router.w.f32(), bias,
+                                      L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
+                                      L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
+                                      L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
+                                      L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
+                                      proj_.f32(), nullptr, nullptr, nullptr,
+                                      moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
+                                      1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
+                                      c.shared_width());
+            } else {
+                ops::linear_forward(dev, xb_.f32(), L.w_gate.w.f32(), gate_.f32(), 1, d, F);
+                ops::linear_forward(dev, xb_.f32(), L.w_up.w.f32(),   up_.f32(),   1, d, F);
+                ops::swiglu_forward(dev, gate_.f32(), up_.f32(), act_.f32(), F);
+                ops::linear_forward(dev, act_.f32(), L.w_down.w.f32(), proj_.f32(), 1, F, d);
+            }
+            if (c.residual_multiplier != 1.0f)
+                ops::scale_inplace(dev, proj_.f32(), c.residual_multiplier, d);
+            ops::add_inplace(dev, x_.f32(), proj_.f32(), d);
+            continue;
+        }
 
         float* qp = q_.f32();
         float* kp = k_.f32();
@@ -136,6 +208,12 @@ float* Generator::decode_step_logits(i32 token, int position) {
             ops::linear_forward(dev, xb_.f32(), L.wv.w.f32(), vp, 1, d, kvd);
         }
 
+        if (L.has_qkv_bias()) {
+            ops::add_bias(dev, L.bq.w.f32(), qp, 1, qd);
+            ops::add_bias(dev, L.bk.w.f32(), kp, 1, kvd);
+            ops::add_bias(dev, L.bv.w.f32(), vp, 1, kvd);
+        }
+
         if (c.use_qk_norm && L.qk_qnorm.w.defined()) {
             ops::rmsnorm_forward(dev, qp, L.qk_qnorm.w.f32(), qp,
                                  nullptr, H, hd, c.rms_eps);
@@ -146,17 +224,34 @@ float* Generator::decode_step_logits(i32 token, int position) {
         const float* rope_freq = model_.rope_inv_freq_ptr();
         GAI_CHECK(rope_freq != nullptr, "decode: RoPE frequency cache is missing");
 
-        if (l == 0)
-            device_copy(pos_dev_.data_ptr(), dev, &position, Device::CPU, sizeof(i32));
-        ops::rope_forward_cached(dev, qp, kp, pos_dev_.i32p(), rope_freq, 1, H, KV, hd,
-                                 c.rope_type);
+        if (c.position_embedding != 1) {
+            if (l == 0)
+                device_copy(pos_dev_.data_ptr(), dev, &position, Device::CPU, sizeof(i32));
+            ops::rope_forward_cached(dev, qp, kp, pos_dev_.i32p(), rope_freq, 1, H, KV, hd,
+                                     c.rope_type);
+        }
 
         {
-            size_t bytes = sizeof(float) * static_cast<size_t>(kvd);
-            char* kdst = reinterpret_cast<char*>(cache_.k(l)) + static_cast<size_t>(slot) * bytes;
-            char* vdst = reinterpret_cast<char*>(cache_.v(l)) + static_cast<size_t>(slot) * bytes;
-            device_copy(kdst, dev, kp, dev, bytes);
-            device_copy(vdst, dev, vp, dev, bytes);
+            if (cache_.fp16()) {
+                // Store fp16: half the cache memory and half the decode
+                // bandwidth at long contexts.
+                u16 kh[static_cast<size_t>(kvd)];
+                u16 vh[static_cast<size_t>(kvd)];
+                for (int i = 0; i < kvd; ++i) {
+                    kh[i] = fp32_to_fp16(kp[i]);
+                    vh[i] = fp32_to_fp16(vp[i]);
+                }
+                u16* kdst = cache_.k_f16(l) + static_cast<size_t>(slot) * kvd;
+                u16* vdst = cache_.v_f16(l) + static_cast<size_t>(slot) * kvd;
+                device_copy(kdst, dev, kh, Device::CPU, sizeof(u16) * static_cast<size_t>(kvd));
+                device_copy(vdst, dev, vh, Device::CPU, sizeof(u16) * static_cast<size_t>(kvd));
+            } else {
+                size_t bytes = sizeof(float) * static_cast<size_t>(kvd);
+                char* kdst = reinterpret_cast<char*>(cache_.k(l)) + static_cast<size_t>(slot) * bytes;
+                char* vdst = reinterpret_cast<char*>(cache_.v(l)) + static_cast<size_t>(slot) * bytes;
+                device_copy(kdst, dev, kp, dev, bytes);
+                device_copy(vdst, dev, vp, dev, bytes);
+            }
         }
 
         {
@@ -165,13 +260,25 @@ float* Generator::decode_step_logits(i32 token, int position) {
             // while the cache holds at least that many tokens; a short
             // prompt would otherwise trip the kernel's range check.
             const int pinned = std::min(cache_.pinned_prefix(), cache_.length());
-            ops::attention_decode_ring(dev, q_.f32(), cache_.k(l), cache_.v(l), attn_.f32(),
-                                       H, KV, hd, cache_.ring_start(), pinned,
-                                       cache_.length(), cache_.capacity(), scale, scores_.f32(),
-                                       c.sliding_window);
+            // The query must be the one that was actually produced above.
+            // With the fused fp16 QKV path the query lives in `qkv_`, not in
+            // `q_` (which stays uninitialized in that path).
+            if (cache_.fp16()) {
+                ops::attention_decode_ring_fp16(dev, qp, cache_.k_f16(l), cache_.v_f16(l),
+                                                attn_.f32(), H, KV, hd, cache_.ring_start(),
+                                                pinned, cache_.length(), cache_.capacity(),
+                                                scale, scores_.f32(), c.sliding_window);
+            } else {
+                ops::attention_decode_ring(dev, qp, cache_.k(l), cache_.v(l), attn_.f32(),
+                                           H, KV, hd, cache_.ring_start(), pinned,
+                                           cache_.length(), cache_.capacity(), scale, scores_.f32(),
+                                           c.sliding_window);
+            }
         }
 
         ops::linear_forward(dev, attn_.f32(), L.wo.w.f32(), proj_.f32(), 1, qd, d);
+        if (c.residual_multiplier != 1.0f)
+            ops::scale_inplace(dev, proj_.f32(), c.residual_multiplier, d);
         ops::add_inplace(dev, x_.f32(), proj_.f32(), d);
 
         ops::rmsnorm_forward(dev, x_.f32(), L.ffn_norm.w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
@@ -184,19 +291,138 @@ float* Generator::decode_step_logits(i32 token, int position) {
                                   L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
                                   proj_.f32(), nullptr, nullptr, nullptr,
                                   moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
-                                  1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k);
+                                  1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
+                                  c.shared_width());
         } else {
             ops::linear_forward(dev, xb_.f32(), L.w_gate.w.f32(), gate_.f32(), 1, d, F);
             ops::linear_forward(dev, xb_.f32(), L.w_up.w.f32(),   up_.f32(),   1, d, F);
             ops::swiglu_forward(dev, gate_.f32(), up_.f32(), act_.f32(), F);
             ops::linear_forward(dev, act_.f32(), L.w_down.w.f32(), proj_.f32(), 1, F, d);
         }
+        if (c.residual_multiplier != 1.0f)
+            ops::scale_inplace(dev, proj_.f32(), c.residual_multiplier, d);
         ops::add_inplace(dev, x_.f32(), proj_.f32(), d);
     }
 
     ops::rmsnorm_forward(dev, x_.f32(), model_.final_norm().w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
     ops::linear_forward(dev, xb_.f32(), model_.lm_head().w.f32(), logits_dev_.f32(), 1, d, V);
+    if (c.logits_scaling != 1.0f)
+        ops::scale_inplace(dev, logits_dev_.f32(), 1.0f / c.logits_scaling, V);
     return logits_dev_.f32();
+}
+
+// IBM Granite-4.0: one Mamba-2 layer over a single token, using the
+// recurrent state carried between the decoded tokens.
+//
+//   projected = in_proj(x) -> [gate | bc | dt]
+//   bc       = causal depthwise conv1d over the last (d_conv-1) values of
+//               the state + the new value, then SiLU
+//   x, B, C  = split(bc)
+//   dt       = softplus(dt + dt_bias)
+//   state    = exp(A*dt) * state + (dt*B) (x)      per head
+//   y        = C . state + D * x
+//   out      = rmsnorm(y * silu(gate)) * norm_weight, then out_proj
+void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* out) {
+    const ModelConfig& c = model_.config();
+    const LayerParams& L = model_.layer(layer_index);
+    const Device dev = model_.device();
+
+    const int d        = c.hidden_size;
+    const int d_inner  = c.mamba_expand * d;
+    const int n_heads  = c.mamba_n_heads;
+    const int d_head   = c.mamba_d_head;
+    const int d_state  = c.mamba_d_state;
+    const int n_groups = c.mamba_n_groups;
+    const int conv_k   = c.mamba_d_conv;
+    const int conv_dim = d_inner + 2 * n_groups * d_state;
+    const int proj     = d_inner + conv_dim + n_heads;
+    const int conv_win = conv_k > 1 ? conv_k - 1 : 1;
+
+    // The mamba states are stored in the same order as the mamba layers.
+    size_t si = 0;
+    for (int l = 0; l < layer_index && l < static_cast<int>(c.layer_types.size()); ++l)
+        if (c.layer_types[static_cast<size_t>(l)] == 0) ++si;
+    if (si >= mamba_states_.size()) {
+        GAI_FAIL("granite mamba: the recurrent state is missing");
+    }
+    MambaState& st = mamba_states_[si];
+
+    // ---- 1) in_proj
+    std::vector<float> proj_buf(static_cast<size_t>(proj));
+    ops::linear_forward(dev, x_in, L.mamba_in_proj.w.f32(), proj_buf.data(), 1, d, proj);
+
+    // ---- 2) split
+    const float* gate = proj_buf.data();
+    const float* bc   = gate + d_inner;
+    const float* dt_r = bc + conv_dim;
+
+    // ---- 3) causal depthwise conv1d over the carried window + SiLU
+    std::vector<float> bc_out(static_cast<size_t>(conv_dim));
+    for (int ch = 0; ch < conv_dim; ++ch) {
+        float acc = L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32()[ch] : 0.0f;
+        for (int j = 0; j < conv_k; ++j) {
+            // The window holds the previous (conv_k-1) values, oldest first.
+            const float v = (j == conv_k - 1) ? bc[ch]
+                                               : st.conv_host[static_cast<size_t>(ch) * conv_win + j];
+            acc += L.mamba_conv_w.w.f32()[static_cast<size_t>(ch) * conv_k + j] * v;
+        }
+        bc_out[static_cast<size_t>(ch)] = acc / (1.0f + std::exp(-acc));
+    }
+    // shift the window
+    for (int ch = 0; ch < conv_dim; ++ch)
+        for (int j = 0; j + 1 < conv_win; ++j)
+            st.conv_host[static_cast<size_t>(ch) * conv_win + j] =
+                st.conv_host[static_cast<size_t>(ch) * conv_win + j + 1];
+    if (conv_win > 0)
+        for (int ch = 0; ch < conv_dim; ++ch)
+            st.conv_host[static_cast<size_t>(ch) * conv_win + (conv_win - 1)] =
+                bc[static_cast<size_t>(ch)];
+
+    // ---- 4) split bc -> x, B, C
+    const float* xs  = bc_out.data();
+    const float* Bm  = xs + d_inner;
+    const float* Cm  = Bm + n_groups * d_state;
+
+    // ---- 5) recurrent SSM update
+    std::vector<float> y(static_cast<size_t>(d_inner));
+    const float* A_log = L.mamba_A_log.w.f32();
+    const float* dt_bias = L.mamba_dt_bias.w.f32();
+    const float* D = L.mamba_D.w.f32();
+    for (int h = 0; h < n_heads; ++h) {
+        const float a = -std::exp(A_log[h]);
+        float dtb = dt_r[h] + dt_bias[h];
+        const float dt_ = (dtb > 20.0f) ? dtb : std::log1p(std::exp(dtb));
+        const float dA = std::exp(a * dt_);
+        for (int hh = 0; hh < d_head; ++hh) {
+            const int i = h * d_head + hh;
+            const float xv = xs[i];
+            float* srow = st.ssm_host.data() +
+                          ((static_cast<size_t>(h) * d_head + hh) * d_state);
+            float acc = 0.0f;
+            for (int j = 0; j < d_state; ++j) {
+                srow[j] = dA * srow[j] + (Bm[j] * dt_) * xv;
+                acc += Cm[j] * srow[j];
+            }
+            y[static_cast<size_t>(i)] = acc + D[h] * xv;
+        }
+    }
+
+    // ---- 6) gated RMSNorm + out_proj
+    std::vector<float> normed(static_cast<size_t>(d_inner));
+    const float* nw = L.mamba_norm.w.f32();
+    double var = 0.0;
+    for (int i = 0; i < d_inner; ++i) {
+        const float g = gate[i] / (1.0f + std::exp(-gate[i]));
+        normed[static_cast<size_t>(i)] = y[static_cast<size_t>(i)] * g;
+        var += static_cast<double>(normed[static_cast<size_t>(i)]) *
+               static_cast<double>(normed[static_cast<size_t>(i)]);
+    }
+    var /= static_cast<double>(d_inner);
+    const float inv = 1.0f / std::sqrt(static_cast<float>(var) + c.rms_eps);
+    for (int i = 0; i < d_inner; ++i)
+        normed[static_cast<size_t>(i)] = normed[static_cast<size_t>(i)] * inv * nw[i];
+
+    ops::linear_forward(dev, normed.data(), L.mamba_out_proj.w.f32(), out, 1, d_inner, d);
 }
 
 float* Generator::decode_step(i32 token, int position) {
@@ -222,11 +448,25 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
         return;
     }
     const ModelConfig& c = model_.config();
+
+    // IBM Granite-4.0: the hybrid model has Mamba-2 layers, whose recurrent
+    // state is built token by token. The batched prefill below is an
+    // attention-only path, so the hybrid model prefills through the decode
+    // path (same math, one token at a time).
+    if (c.arch == ModelConfig::ArchGranite && mamba_states_ready_) {
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            decode_step(tokens[i], start_pos + static_cast<int>(i));
+            push_history(tokens[i]);
+        }
+        return;
+    }
     Device dev = model_.device();
     const int P = static_cast<int>(tokens.size());
     const int d = c.hidden_size, qd = c.q_dim(), kvd = c.kv_dim();
     const int H = c.num_heads, KV = c.num_kv_heads, hd = c.head_dim();
-    const float scale = (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale(c);
+    const float scale = (c.attention_multiplier > 0.0f)
+                            ? c.attention_multiplier
+                            : (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale(c);
 
     Tensor ids({P}, DType::I32, Device::CPU);
     std::memcpy(ids.data_ptr(), tokens.data(), sizeof(i32) * tokens.size());
@@ -258,15 +498,20 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     Tensor atmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
 
     ops::embedding_forward(dev, d_ids.i32p(), model_.tok_embeddings().w.f32(), x.f32(), P, d, c.vocab_size);
+    // Granite scales the embeddings (12x). The prefill must do it too, or it
+    // disagrees with the decode path and with the model's forward.
+    if (c.embedding_multiplier != 1.0f)
+        ops::scale_inplace(dev, x.f32(), c.embedding_multiplier, (i64)P * d);
 
-    // The vision features replace the embedding of the placeholder tokens.
+    // Caller-supplied embedding override (e.g. image features injected at
+    // placeholder positions by a multimodal front-end).
     if (embed_override && override_pos && n_override > 0) {
         float* xh = x.f32();
         for (int i = 0; i < n_override; ++i) {
             const int p = override_pos[i];
             if (p < 0 || p >= P) continue;
-            std::memcpy(xh + static_cast<size_t>(p) * d,
-                        embed_override + static_cast<size_t>(i) * d,
+            device_copy(xh + static_cast<size_t>(p) * d, dev,
+                        embed_override + static_cast<size_t>(i) * d, Device::CPU,
                         sizeof(float) * static_cast<size_t>(d));
         }
     }
@@ -291,20 +536,42 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
             ops::linear_forward(dev, xb.f32(), L.wv.w.f32(), vp, P, d, kvd);
         }
 
+        if (L.has_qkv_bias()) {
+            ops::add_bias(dev, L.bq.w.f32(), qp, P, qd);
+            ops::add_bias(dev, L.bk.w.f32(), kp, P, kvd);
+            ops::add_bias(dev, L.bv.w.f32(), vp, P, kvd);
+        }
+
         if (c.use_qk_norm && L.qk_qnorm.w.defined()) {
             ops::rmsnorm_forward(dev, qp, L.qk_qnorm.w.f32(), qp,
                                  nullptr, (i64)P * H, hd, c.rms_eps);
             ops::rmsnorm_forward(dev, kp, L.qk_knorm.w.f32(), kp,
                                  nullptr, (i64)P * KV, hd, c.rms_eps);
         }
-        ops::rope_forward_cached(dev, qp, kp, d_pos.i32p(), rope_freq, P, H, KV, hd,
-                                 c.rope_type);
+        if (c.position_embedding != 1) {  // 1 = NoPE (Granite: no positional embedding)
+            ops::rope_forward_cached(dev, qp, kp, d_pos.i32p(), rope_freq, P, H, KV, hd,
+                                     c.rope_type);
+        }
 
-        device_copy(cache_.k(l), dev, kp, dev, sizeof(float) * (size_t)P * kvd);
-        device_copy(cache_.v(l), dev, vp, dev, sizeof(float) * (size_t)P * kvd);
+        if (cache_.fp16()) {
+            const size_t n = static_cast<size_t>(P) * static_cast<size_t>(kvd);
+            std::vector<u16> kh(n), vh(n);
+            for (size_t i = 0; i < n; ++i) {
+                kh[i] = fp32_to_fp16(kp[i]);
+                vh[i] = fp32_to_fp16(vp[i]);
+            }
+            device_copy(cache_.k_f16(l), dev, kh.data(), Device::CPU, sizeof(u16) * n);
+            device_copy(cache_.v_f16(l), dev, vh.data(), Device::CPU, sizeof(u16) * n);
+        } else {
+            device_copy(cache_.k(l), dev, kp, dev, sizeof(float) * (size_t)P * kvd);
+            device_copy(cache_.v(l), dev, vp, dev, sizeof(float) * (size_t)P * kvd);
+        }
         ops::attention_forward_ex(dev, qp, kp, vp, att.f32(), nullptr,
                                   1, P, H, KV, hd, scale, c.sliding_window);
         ops::linear_forward(dev, att.f32(), L.wo.w.f32(), proj.f32(), P, qd, d);
+        // Granite scales every branch before the residual add.
+        if (c.residual_multiplier != 1.0f)
+            ops::scale_inplace(dev, proj.f32(), c.residual_multiplier, (i64)P * d);
         ops::add_inplace(dev, x.f32(), proj.f32(), (i64)P * d);
         ops::rmsnorm_forward(dev, x.f32(), L.ffn_norm.w.f32(), xb.f32(), nullptr, P, d, c.rms_eps);
         if (L.has_moe()) {
@@ -316,17 +583,20 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
                                   L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
                                   proj.f32(), nullptr, nullptr, nullptr,
                                   mg.f32(), mu.f32(), ma.f32(),
-                                  P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k);
+                                  P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
+                                  c.shared_width());
         } else {
             ops::linear_forward(dev, xb.f32(), L.w_gate.w.f32(), gtmp.f32(), P, d, c.intermediate_size);
             ops::linear_forward(dev, xb.f32(), L.w_up.w.f32(), utmp.f32(), P, d, c.intermediate_size);
             ops::swiglu_forward(dev, gtmp.f32(), utmp.f32(), atmp.f32(), (i64)P * c.intermediate_size);
             ops::linear_forward(dev, atmp.f32(), L.w_down.w.f32(), proj.f32(), P, c.intermediate_size, d);
         }
+        // Granite scales every branch before the residual add.
+        if (c.residual_multiplier != 1.0f)
+            ops::scale_inplace(dev, proj.f32(), c.residual_multiplier, (i64)P * d);
         ops::add_inplace(dev, x.f32(), proj.f32(), (i64)P * d);
     }
     cache_.set_length(P);
-
     ops::rmsnorm_forward(dev, x.f32() + (size_t)(P - 1) * d,
                          model_.final_norm().w.f32(), hlast_.f32(),
                          nullptr, 1, d, c.rms_eps);
@@ -430,7 +700,7 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
     auto use_fast_for = [&](int hist_size) {
         const int w = sc.repetition_window > 0 ? sc.repetition_window : hist_size;
 
-        const bool topk_ok = want_greedy || (K > 0 && V >= 64 * K && V <= 64 * 512);
+        const bool topk_ok = want_greedy || (K > 0 && V >= K && V <= 262144);
         return sc.gpu_fast_sample && dev == Device::CUDA && V >= 512 &&
                w <= FAST_HIST_MAX && sc.no_repeat_ngram == 0 && topk_ok;
     };
@@ -465,8 +735,9 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
             next = sampler.sample(logits_host_.data(), V, history_);
         }
 
-        bool is_stop = std::find(cfg.stop_tokens.begin(), cfg.stop_tokens.end(), next)
-                       != cfg.stop_tokens.end();
+        std::vector<i32> stops = cfg.stop_tokens;
+        if (stops.empty()) stops.push_back(tok_.eos_id());
+        bool is_stop = std::find(stops.begin(), stops.end(), next) != stops.end();
         if (is_stop) break;
 
         out.push_back(next);
@@ -522,63 +793,34 @@ std::string Generator::chat(const std::vector<Message>& msgs, const GenerationCo
     GAI_CHECK(cfg.max_context == 0 || cfg.max_context == max_context_,
               "GenerationConfig::max_context must match the Generator context");
     reset();
-    // The chat format is a property of the tokenizer, not of the engine:
-    // native Gai checkpoints use <|system|>/<|user|>/<|assistant|>, HF
-    // checkpoints use ChatML / Llama-3 / Mistral markers.
-    const ChatStyle style = detect_chat_style(tok_);
-    const int n_img_tokens = has_vision() ? vision_->config().n_patches() : 0;
-    std::vector<int> img_pos;
-    std::vector<i32> ids = encode_chat(tok_, style, msgs, true, nullptr,
-                                       &img_pos, n_img_tokens);
 
-    // Encode the attached images with the vision tower.
-    std::vector<float> feats;
-    if (!img_pos.empty()) {
-        GAI_CHECK(has_vision(),
-                  "the prompt carries an image but the model has no vision tower");
-        for (const Message& m : msgs) {
-            if (!m.has_image()) continue;
-            std::vector<float> f;
-            vision_->encode(m.pixels.data(), f);
-            feats.insert(feats.end(), f.begin(), f.end());
-        }
-        const size_t want = img_pos.size() *
-                            static_cast<size_t>(model_.config().hidden_size);
-        GAI_CHECK(feats.size() == want,
-                  strfmt("vision: %zu image features for %zu placeholders",
-                         feats.size() / static_cast<size_t>(model_.config().hidden_size),
-                         img_pos.size()));
-    }
+    // The chat format follows the vocabulary: Granite-4 speaks the role-tag
+    // format (<|start_of_role|>...<|end_of_role|>), Qwen3 speaks ChatML.
+    const ChatTemplate tmpl =
+        (tok_.token_to_id("<|start_of_role|>") >= 0 && tok_.token_to_id("<|end_of_role|>") >= 0)
+            ? ChatTemplate::Granite
+            : ChatTemplate::ChatML;
 
+    std::vector<i32> ids = encode_chat(tok_, tmpl, msgs, /*add_generation_prompt=*/true);
+
+    // Trim the conversation at message boundaries (never mid-message) so the
+    // chat structure stays valid: drop the earliest non-system message
+    // until the rendered prompt fits the budget.
     int budget = max_context_ - cfg.max_new_tokens - 4;
-    int drop = 0;
     if (budget > 0 && static_cast<int>(ids.size()) > budget) {
-        drop = static_cast<int>(ids.size()) - budget;
-        ids.erase(ids.begin() + 1, ids.begin() + 1 + drop);
-        log_warn(strfmt("chat: history truncated by %d tokens", drop));
-        // The placeholders move with the tokens; the ones that were cut
-        // away lose their features.
-        std::vector<int> kept_pos;
-        std::vector<float> kept_feat;
-        const size_t d = static_cast<size_t>(model_.config().hidden_size);
-        for (size_t i = 0; i < img_pos.size(); ++i) {
-            const int p = img_pos[i];
-            if (p == 0) { kept_pos.push_back(0); }
-            else if (p <= drop) { continue; }  // cut away
-            else {
-                kept_pos.push_back(p - drop);
-                kept_feat.insert(kept_feat.end(),
-                                 feats.begin() + static_cast<ptrdiff_t>(i * d),
-                                 feats.begin() + static_cast<ptrdiff_t>((i + 1) * d));
-            }
+        std::vector<Message> trimmed = msgs;
+        for (int guard = 0; guard < 1024; ++guard) {
+            size_t drop_at = 0;
+            if (!trimmed.empty() && trimmed.front().role == Role::System) drop_at = 1;
+            if (trimmed.size() <= drop_at + 1) break;
+            trimmed.erase(trimmed.begin() + static_cast<std::ptrdiff_t>(drop_at));
+            ids = encode_chat(tok_, tmpl, trimmed, true);
+            if (static_cast<int>(ids.size()) <= budget) break;
         }
-        img_pos.swap(kept_pos);
-        feats.swap(kept_feat);
+        log_warn(strfmt("chat: history truncated to fit the context budget (%d tokens)",
+                        budget));
     }
-    prefill(ids, drop,
-            feats.empty() ? nullptr : feats.data(),
-            img_pos.empty() ? nullptr : img_pos.data(),
-            static_cast<int>(img_pos.size()));
+    prefill(ids, 0, nullptr, nullptr, 0);
     std::vector<i32> gen = generate(cfg, on_token);
     return tok_.decode(gen, true);
 }

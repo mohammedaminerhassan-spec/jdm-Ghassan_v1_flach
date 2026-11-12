@@ -264,24 +264,6 @@ void GGUFWriter::set_quantization_version(uint32_t v) {
 void GGUFWriter::set_size_label(const std::string& s) {
     add_custom_metadata("general.size_label", s);
 }
-void GGUFWriter::set_gtok_blob(const std::vector<uint8_t>& blob) {
-
-    GGUFMetadataValue v;
-    v.type = GGUFType::ARRAY;
-    uint32_t elem_type = static_cast<uint32_t>(GGUFType::UINT8);
-    uint64_t count     = static_cast<uint64_t>(blob.size());
-    auto push = [&](const void* d, size_t n) {
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(d);
-        v.data.insert(v.data.end(), p, p + n);
-    };
-    push(&elem_type, 4);
-    push(&count, 8);
-    if (!blob.empty()) push(blob.data(), blob.size());
-    metadata_["ghassan.tokenizer.gtok"] = std::move(v);
-}
-void GGUFWriter::set_normalizer_config(uint32_t bits) {
-    set_u32("ghassan.normalizer.config", bits);
-}
 void GGUFWriter::set_tokenizer_add_bos(bool add) {
     add_custom_metadata("tokenizer.ggml.add_bos_token", add);
 }
@@ -412,26 +394,31 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
         for (size_t b = 0; b < nblocks; ++b) {
             size_t start = b * 32;
             size_t end   = std::min(start + 32, n);
+            uint8_t* block = out.data() + b * 18;
+
+            // GGML's Q4_0 reference (quantize_row_q4_0_ref):
+            //   amax = max|x|, d = amax / -8, id = 1/d,
+            //   xi = min(15, (int8)(x*id + 8.5f)), d = (x0*xi0 + x1*xi1)
+            // The block stores d as f16 and the nibbles as (xi - 8) so the
+            // reconstruction is (q - 8) * d.
             float amax = 0.f;
             for (size_t i = start; i < end; ++i) amax = std::max(amax, std::abs(src[i]));
-            uint8_t* block = out.data() + b * 18;
-            if (!std::isfinite(amax)) {
+            if (!std::isfinite(amax) || amax == 0.f) {
                 uint16_t zero_scale = fp32_to_fp16(0.0f);
                 memcpy(block, &zero_scale, 2);
-
                 std::memset(block + 2, 0x88, 16);
                 continue;
             }
-            float scale = amax / 8.f;
-            float inv   = (scale != 0.f) ? (1.f / scale) : 0.f;
-            uint16_t sh = fp32_to_fp16(scale);
+            const float d    = amax / -8.f;          // negative: the sign carries the scale
+            const float id   = 1.0f / d;
+            uint16_t sh = fp32_to_fp16(d);
             memcpy(block, &sh, 2);
             for (size_t j = 0; j < 16; ++j) {
-                float f0 = (start + j        < end) ? src[start + j]        : 0.f;
-                float f1 = (start + j + 16  < end) ? src[start + j + 16]    : 0.f;
-                int q0 = std::max(-8, std::min(7, static_cast<int>(std::lround(f0 * inv)))) + 8;
-                int q1 = std::max(-8, std::min(7, static_cast<int>(std::lround(f1 * inv)))) + 8;
-                block[2 + j] = static_cast<uint8_t>((q1 << 4) | q0);
+                const float f0 = (start + j       < end) ? src[start + j]       : 0.f;
+                const float f1 = (start + j + 16  < end) ? src[start + j + 16]  : 0.f;
+                const int   xi0 = std::max(0, std::min(15, static_cast<int>(f0 * id + 8.5f)));
+                const int   xi1 = std::max(0, std::min(15, static_cast<int>(f1 * id + 8.5f)));
+                block[2 + j] = static_cast<uint8_t>((xi1 << 4) | xi0);
             }
         }
         return out;
@@ -664,20 +651,6 @@ bool GGUFReader::read_metadata(std::istream& is, uint64_t count) {
                 push(&elem_type_u32, 4);
                 push(&arr_count, 8);
 
-                if (key == "ghassan.tokenizer.gtok" && elem_type == GGUFType::UINT8) {
-
-                    if (arr_count > (1ull << 30)) return false;
-                    gtok_blob_.resize(static_cast<size_t>(arr_count));
-                    if (arr_count > 0 &&
-                        !is.read(reinterpret_cast<char*>(gtok_blob_.data()),
-                                 static_cast<std::streamsize>(arr_count)))
-                        return false;
-                    if (!gtok_blob_.empty())
-                        push(gtok_blob_.data(), gtok_blob_.size());
-                    metadata_[key] = std::move(val);
-                    continue;
-                }
-
                 const bool raw_skip = (elem_type != GGUFType::STRING &&
                                        elem_type != GGUFType::FLOAT32 &&
                                        elem_type != GGUFType::INT32 &&
@@ -806,24 +779,106 @@ bool GGUFReader::get_bool(const std::string& key, bool def) const {
     return def;
 }
 
-std::vector<uint8_t> GGUFReader::get_blob(const std::string& key) const {
-    std::vector<uint8_t> out;
-    auto it = metadata_.find(key);
-    if (it == metadata_.end() || it->second.type != GGUFType::ARRAY) return out;
-    const auto& d = it->second.data;
-    if (d.size() < 12) return out;
-    uint32_t et = 0;
-    uint64_t n = 0;
-    memcpy(&et, d.data(), 4);
-    memcpy(&n, d.data() + 4, 8);
-    if (et != static_cast<uint32_t>(GGUFType::UINT8)) return out;
-    if (12 + n > d.size()) return out;
-    out.assign(d.begin() + 12, d.begin() + 12 + static_cast<size_t>(n));
+std::vector<i32> GGUFReader::eos_ids() const {
+    std::vector<i32> out;
+    // Only push an id when the key is actually present. Falling back to 0
+    // would make the generator stop on the very first sampled token (0 is a
+    // perfectly ordinary token in most vocabularies).
+    auto it = metadata_.find("tokenizer.ggml.eos_token_id");
+    if (it != metadata_.end() && it->second.type == GGUFType::UINT32) {
+        out.push_back(static_cast<i32>(it->second.data.size() >= 8
+                                           ? (static_cast<uint64_t>(it->second.data[0]) |
+                                              (static_cast<uint64_t>(it->second.data[1]) << 8) |
+                                              (static_cast<uint64_t>(it->second.data[2]) << 16) |
+                                              (static_cast<uint64_t>(it->second.data[3]) << 24))
+                                           : 0u));
+    }
+    it = metadata_.find("tokenizer.ggml.eot_token_id");
+    if (it != metadata_.end() && it->second.type == GGUFType::UINT32 &&
+        it->second.data.size() >= 4) {
+        const i32 eot = static_cast<i32>(it->second.data[0] |
+                                         (static_cast<uint32_t>(it->second.data[1]) << 8) |
+                                         (static_cast<uint32_t>(it->second.data[2]) << 16) |
+                                         (static_cast<uint32_t>(it->second.data[3]) << 24));
+        if (std::find(out.begin(), out.end(), eot) == out.end()) out.push_back(eot);
+    }
     return out;
 }
 
-ModelConfig GGUFReader::model_config() const {
+bool GGUFReader::has_tokenizer() const {
+    return !tokenizer_tokens_.empty();
+}
 
+bool GGUFReader::load_tokenizer(Tokenizer& tk) const {
+    if (tokenizer_tokens_.empty()) return false;
+    std::vector<std::pair<std::string, std::string>> merges;
+    merges.reserve(tokenizer_merges_.size());
+    for (const auto& m : tokenizer_merges_) {
+        size_t sp = m.find(' ');
+        if (sp == std::string::npos || sp == 0 || sp + 1 >= m.size()) continue;
+        std::string l = m.substr(0, sp), r = m.substr(sp + 1);
+
+        bool escaped = (m.find('\\') != std::string::npos);
+        if (escaped) {
+            merges.emplace_back(unescape_merge_piece(l), unescape_merge_piece(r));
+        } else {
+            size_t rsp = m.rfind(' ');
+            merges.emplace_back(m.substr(0, rsp), m.substr(rsp + 1));
+        }
+    }
+
+    // A byte-level BPE vocabulary (GPT-2/Qwen/Llama-3 family). The normalizer
+    // is gone: text goes through the byte-level pre-tokenizer verbatim.
+    const std::string pre = get_string("tokenizer.ggml.pre", "gpt-2");
+    VocabOptions opts;
+    {
+        if (pre == "qwen2" || pre == "qwen-2" || pre == "qwen" || pre == "qwen2.5")
+            opts.pretok = PreTokKind::Qwen;
+        else
+            opts.pretok = PreTokKind::Gpt2;
+    }
+    opts.add_bos = get_bool("tokenizer.ggml.add_bos_token", false);
+    opts.add_eos = get_bool("tokenizer.ggml.add_eos_token", false);
+    opts.bos_id  = static_cast<i32>(get_uint("tokenizer.ggml.bos_token_id", 151643));
+    opts.eos_id  = static_cast<i32>(get_uint("tokenizer.ggml.eos_token_id", 151645));
+    opts.pad_id  = static_cast<i32>(get_uint("tokenizer.ggml.padding_token_id", 151643));
+    opts.unk_id  = static_cast<i32>(get_uint("tokenizer.ggml.unknown_token_id", 151643));
+
+    // The exporter writes GGUF token_type 3 = control, 4 = user-defined
+    // (added) and 2 = unknown, so the reader recovers both sets from the
+    // types table without trusting any name.
+    std::vector<i32> special_ids;
+    std::vector<i32> added_ids;
+    if (tokenizer_token_types_.size() == tokenizer_tokens_.size()) {
+        for (size_t i = 0; i < tokenizer_token_types_.size(); ++i) {
+            const int t = tokenizer_token_types_[i];
+            if (t == 3 || t == 2) special_ids.push_back(static_cast<i32>(i));
+            if (t == 3 || t == 4 || t == 2) added_ids.push_back(static_cast<i32>(i));
+        }
+    }
+    auto mark = [&](i32 id) {
+        if (id >= 0) special_ids.push_back(id);
+    };
+    mark(opts.bos_id);
+    mark(opts.eos_id);
+    mark(opts.pad_id);
+    opts.special_ids = std::move(special_ids);
+    opts.added_ids  = std::move(added_ids);
+
+    tk.build(tokenizer_tokens_, merges, opts);
+
+    if (!tk.has_byte_map()) {
+        log_error(strfmt("gguf_format: the tokenizer in this file has no byte-level "
+                         "alphabet (pre='%s', vocab=%d). The Gai engine encodes "
+                         "against byte-level BPE only; SentencePiece/unigram "
+                         "vocabularies are not supported.",
+                         pre.c_str(), tk.vocab_size()));
+        return false;
+    }
+    return tk.vocab_size() > 0;
+}
+
+ModelConfig GGUFReader::model_config() const {
     const bool has_native = metadata_.count("ghassan.block_count") != 0;
     const bool has_llama = metadata_.count("llama.block_count") != 0;
 
@@ -852,7 +907,6 @@ ModelConfig GGUFReader::model_config() const {
         c.rope_theta        = get_float("ghassan.rope.freq_base", c.rope_theta);
         c.rope_scale        = get_float("ghassan.rope.scale", c.rope_scale);
         c.rope_yarn_mscale  = get_float("ghassan.rope.yarn_mscale", c.rope_yarn_mscale);
-
         c.rope_yarn_low     = get_float("ghassan.rope.yarn_low", c.rope_yarn_low);
         c.rope_yarn_high    = get_float("ghassan.rope.yarn_high", c.rope_yarn_high);
         c.sliding_window    = static_cast<int>(get_uint("ghassan.sliding_window", static_cast<uint64_t>(c.sliding_window)));
@@ -860,8 +914,54 @@ ModelConfig GGUFReader::model_config() const {
         c.moe_aux_free      = get_bool("ghassan.moe.aux_free", c.moe_aux_free);
         c.rms_eps           = get_float("ghassan.attention.layer_norm_rms_epsilon", c.rms_eps);
         c.use_qk_norm       = get_bool("ghassan.use_qk_norm", c.use_qk_norm);
+        c.use_qkv_bias      = get_bool("ghassan.use_qkv_bias", c.use_qkv_bias);
         c.z_loss_scale      = get_float("ghassan.z_loss_scale", c.z_loss_scale);
         c.tie_embeddings    = get_bool("ghassan.tie_word_embeddings", true);
+        // IBM Granite-4.0 hybrid: the layer kinds and the multipliers are
+        // part of the architecture, so they must survive the round trip.
+        c.arch                   = get_bool("ghassan.granite", false)
+                                       ? ModelConfig::ArchGranite : ModelConfig::ArchQwen;
+        c.position_embedding     = static_cast<int>(get_uint("ghassan.position_embedding",
+                                                               static_cast<uint64_t>(c.position_embedding)));
+        c.head_dim_override      = static_cast<int>(get_uint("ghassan.attention.head_dim",
+                                                               static_cast<uint64_t>(c.head_dim_override)));
+        c.shared_expert_intermediate_size =
+            static_cast<int>(get_uint("ghassan.moe.shared_intermediate_size",
+                                       static_cast<uint64_t>(c.shared_expert_intermediate_size)));
+        c.embedding_multiplier   = get_float("ghassan.embedding_multiplier", c.embedding_multiplier);
+        c.residual_multiplier    = get_float("ghassan.residual_multiplier", c.residual_multiplier);
+        c.attention_multiplier   = get_float("ghassan.attention_multiplier", c.attention_multiplier);
+        c.logits_scaling         = get_float("ghassan.logits_scaling", c.logits_scaling);
+        c.mamba_n_heads          = static_cast<int>(get_uint("ghassan.mamba.n_heads",
+                                                               static_cast<uint64_t>(c.mamba_n_heads)));
+        c.mamba_d_head           = static_cast<int>(get_uint("ghassan.mamba.d_head",
+                                                               static_cast<uint64_t>(c.mamba_d_head)));
+        c.mamba_d_state          = static_cast<int>(get_uint("ghassan.mamba.d_state",
+                                                               static_cast<uint64_t>(c.mamba_d_state)));
+        c.mamba_n_groups         = static_cast<int>(get_uint("ghassan.mamba.n_groups",
+                                                               static_cast<uint64_t>(c.mamba_n_groups)));
+        c.mamba_d_conv           = static_cast<int>(get_uint("ghassan.mamba.d_conv",
+                                                               static_cast<uint64_t>(c.mamba_d_conv)));
+        c.mamba_expand           = static_cast<int>(get_uint("ghassan.mamba.expand",
+                                                               static_cast<uint64_t>(c.mamba_expand)));
+        c.mamba_chunk_size       = static_cast<int>(get_uint("ghassan.mamba.chunk_size",
+                                                               static_cast<uint64_t>(c.mamba_chunk_size)));
+        c.mamba_conv_bias        = get_bool("ghassan.mamba.conv_bias", c.mamba_conv_bias);
+        c.mamba_proj_bias        = get_bool("ghassan.mamba.proj_bias", c.mamba_proj_bias);
+        {
+            // The layer kinds: a comma separated list of 0 (mamba) / 1 (attention).
+            const std::string lt = get_string("ghassan.layer_types", "");
+            if (!lt.empty()) {
+                c.layer_types.clear();
+                size_t i = 0;
+                while (i < lt.size()) {
+                    size_t comma = lt.find(',', i);
+                    c.layer_types.push_back(lt[i] == '1' ? 1 : 0);
+                    if (comma == std::string::npos) break;
+                    i = comma + 1;
+                }
+            }
+        }
     } else {
         c.use_moe           = false;
         c.max_seq_len       = static_cast<int>(get_uint("llama.context_length", static_cast<uint64_t>(c.max_seq_len)));
@@ -869,9 +969,6 @@ ModelConfig GGUFReader::model_config() const {
         c.rms_eps           = get_float("llama.attention.layer_norm_rms_epsilon", c.rms_eps);
         c.tie_embeddings    = get_bool("llama.tie_word_embeddings", true);
 
-        // llama.cpp writes the MoE description for mixture-of-experts
-        // checkpoints. Without this the model would be read as a dense one
-        // and every expert tensor would be missing.
         const uint64_t ne = get_uint("llama.expert_count", 0);
         if (ne > 0 && ne <= 64) {
             c.use_moe        = true;
@@ -879,13 +976,10 @@ ModelConfig GGUFReader::model_config() const {
             c.moe_top_k      = static_cast<int>(get_uint("llama.expert_used_count", 2));
             c.moe_expert_dim = static_cast<int>(get_uint("llama.expert_feed_forward_length",
                                                          static_cast<uint64_t>(c.intermediate_size)));
-            c.moe_shared     = false;  // llama.cpp has no shared expert
+            c.moe_shared     = false;
             c.moe_aux_scale  = get_float("llama.moe.aux_scale", 0.0f);
         }
 
-        // Qwen3 normalises the query and the key per head before the
-        // attention. llama.cpp writes no flag for it: the presence of the
-        // tensors is the signal.
         if (!c.use_qk_norm) {
             for (const auto& ti : tensor_infos_) {
                 if (ti.name.find("attn_q_norm.weight") != std::string::npos) {
@@ -897,90 +991,6 @@ ModelConfig GGUFReader::model_config() const {
     }
     c.validate();
     return c;
-}
-
-bool GGUFReader::has_tokenizer() const {
-    return !gtok_blob_.empty() || !tokenizer_tokens_.empty();
-}
-
-bool GGUFReader::load_tokenizer(Tokenizer& tk) const {
-
-    if (!gtok_blob_.empty()) {
-        fs::path tmp = fs::temp_directory_path() /
-            ("gguf_tok_" + std::to_string(fnv1a64(gtok_blob_.data(), gtok_blob_.size())) + ".gtok");
-        {
-            std::ofstream o(tmp, std::ios::binary);
-            if (!o.good()) return false;
-            o.write(reinterpret_cast<const char*>(gtok_blob_.data()),
-                    static_cast<std::streamsize>(gtok_blob_.size()));
-            if (!o.good()) return false;
-        }
-        bool ok = tk.load(tmp.string());
-        std::error_code ec;
-        fs::remove(tmp, ec);
-
-        return ok;
-    }
-
-    if (tokenizer_tokens_.empty()) return false;
-    std::vector<std::pair<std::string, std::string>> merges;
-    merges.reserve(tokenizer_merges_.size());
-    for (const auto& m : tokenizer_merges_) {
-        size_t sp = m.find(' ');
-        if (sp == std::string::npos || sp == 0 || sp + 1 >= m.size()) continue;
-        std::string l = m.substr(0, sp), r = m.substr(sp + 1);
-
-        bool escaped = (m.find('\\') != std::string::npos);
-        if (escaped) {
-            merges.emplace_back(unescape_merge_piece(l), unescape_merge_piece(r));
-        } else {
-            size_t rsp = m.rfind(' ');
-            merges.emplace_back(m.substr(0, rsp), m.substr(rsp + 1));
-        }
-    }
-
-    // A foreign (HuggingFace) vocabulary brings its own pre-tokenizer and
-    // normalization behaviour. Applying the Gai normalizer to it would
-    // strip diacritics / lowercase the text and produce token ids the model
-    // was never trained on: a silent train/serve skew.
-    const std::string pre = get_string("tokenizer.ggml.pre", "gpt-2");
-    Tokenizer::VocabOptions opts;
-    opts.foreign = true;
-    opts.pretok  = (pre == "gpt-2" || pre == "llama3" || pre == "llama-v3")
-                       ? Tokenizer::PreTokMode::Gpt2
-                       : Tokenizer::PreTokMode::Ghassan;
-    opts.add_bos = get_bool("tokenizer.ggml.add_bos_token", false);
-    opts.add_eos = get_bool("tokenizer.ggml.add_eos_token", false);
-    opts.bos_id  = static_cast<i32>(get_uint("tokenizer.ggml.bos_token_id", 0));
-    opts.eos_id  = static_cast<i32>(get_uint("tokenizer.ggml.eos_token_id", 0));
-    opts.pad_id  = static_cast<i32>(get_uint("tokenizer.ggml.padding_token_id", 0));
-    opts.unk_id  = static_cast<i32>(get_uint("tokenizer.ggml.unknown_token_id", 0));
-    opts.default_system = get_string("ghassan.default_system", "");
-
-    // The Gai normalizer must stay off for a foreign vocabulary.
-    NormalizerConfig ncfg;
-    ncfg.strip_diacritics    = false;
-    ncfg.strip_tatweel       = false;
-    ncfg.unify_presentation  = false;
-    ncfg.arabic_digits_ascii = false;
-    ncfg.fold_letters        = false;
-    ncfg.lowercase_latin     = false;
-    ncfg.collapse_whitespace = false;
-    ncfg.strip_control       = false;
-    ncfg.strip_zero_width    = false;
-    ncfg.collapse_repeats    = false;
-    ncfg.fold_fullwidth      = false;
-
-    tk.build(tokenizer_tokens_, merges, ncfg, opts);
-
-    if (!tk.has_byte_map()) {
-        log_error(strfmt("gguf_format: the tokenizer in this file has no byte-level "
-                         "alphabet (pre='%s', vocab=%d). The Gai engine encodes against "
-                         "byte-level BPE only; SentencePiece/unigram vocabularies are "
-                         "not supported yet.", pre.c_str(), tk.vocab_size()));
-        return false;
-    }
-    return tk.vocab_size() > 0;
 }
 
 const GGUFTensorInfo* GGUFReader::find_tensor(const std::string& name) const {
@@ -1006,6 +1016,9 @@ std::string llama_tensor_name(const std::string& internal) {
     if (rest == "wk")        return blk + "attn_k.weight";
     if (rest == "wv")        return blk + "attn_v.weight";
     if (rest == "wo")        return blk + "attn_output.weight";
+    if (rest == "bq")        return blk + "attn_q.bias";
+    if (rest == "bk")        return blk + "attn_k.bias";
+    if (rest == "bv")        return blk + "attn_v.bias";
     if (rest == "ffn_norm")  return blk + "ffn_norm.weight";
     if (rest == "w_gate")    return blk + "ffn_gate.weight";
     if (rest == "w_up")      return blk + "ffn_up.weight";
@@ -1080,6 +1093,9 @@ std::string llama_moe_tensor_name(const std::string& internal) {
     if (rest == "wk")        return blk + "attn_k.weight";
     if (rest == "wv")        return blk + "attn_v.weight";
     if (rest == "wo")        return blk + "attn_output.weight";
+    if (rest == "bq")        return blk + "attn_q.bias";
+    if (rest == "bk")        return blk + "attn_k.bias";
+    if (rest == "bv")        return blk + "attn_v.bias";
     if (rest == "ffn_norm")  return blk + "ffn_norm.weight";
 
     if (rest == "moe_router") return blk + "ffn_gate_inp.weight";
@@ -1270,39 +1286,40 @@ bool load_model_from_gguf(const std::string& path, Model& model) {
 ExportProfileGGUF gguf_profile_for(const std::string& name) {
     ExportProfileGGUF p;
     p.name = name;
-    if (name == "fp32") {
-        p.default_type = p.embedding_type = p.norm_type = p.output_type = GGMLType::F32;
-    } else if (name == "fp16") {
-        p.default_type   = GGMLType::F16;
-        p.embedding_type = GGMLType::F16;
-        p.norm_type      = GGMLType::F32;
-        p.output_type    = GGMLType::F16;
-    } else if (name == "q8_k" || name == "int8" || name == "q6_k" || name == "q5_k_m" || name == "q5_k_s") {
-
-        if (name == "q6_k" || name == "q5_k_m" || name == "q5_k_s")
+    if (name == "q8_k" || name == "int8" || name == "q6_k" || name == "q5_k_m" || name == "q5_k_s") {
+        // NOTE: true K-quant writers are not implemented; q8_k maps to the
+        // Q8_0 codec (GGML-compatible, 8-bit).
+        if (name != "q8_k" && name != "int8")
             log_warn("[gguf] profile " + name + " mapped to Q8_0 (nearest implemented; true K-quant writer is roadmap)");
         p.name           = "q8_k";
         p.default_type   = GGMLType::Q8_0;
         p.embedding_type = GGMLType::Q8_0;
         p.norm_type      = GGMLType::F32;
+        p.output_type    = GGMLType::Q8_0;
+    } else if (name == "fp16" || name == "f16" || name == "f16_t" || name == "half") {
+        // Compute is fp16 tensor-core on T4; the export is fp16 too, which is
+        // bit-consistent with the compute path and needs no lossy quantizer.
+        p.name           = "fp16";
+        p.default_type   = GGMLType::F16;
+        p.embedding_type = GGMLType::F16;
+        p.norm_type      = GGMLType::F32;
         p.output_type    = GGMLType::F16;
     } else if (name == "q4_0" || name == "int4" || name == "q4_k_m" || name == "q4_k_s" || name == "q4_k") {
-
-        if (name == "q4_k_m" || name == "q4_k_s" || name == "q4_k")
+        if (name != "q4_0" && name != "int4")
             log_warn("[gguf] profile " + name + " mapped to Q4_0 (nearest implemented; true K-quant writer is roadmap)");
         p.name           = "q4_0";
         p.default_type   = GGMLType::Q4_0;
         p.embedding_type = GGMLType::Q8_0;
         p.norm_type      = GGMLType::F32;
-        p.output_type    = GGMLType::F16;
+        p.output_type    = GGMLType::Q8_0;
     } else {
-        GAI_FAIL("gguf_format: unknown profile: " + name + " (fp32|fp16|q8_k|q4_0|q4_k_m|q6_k)");
+        GAI_FAIL("gguf_format: unknown profile: " + name + " (q8_k|q4_0|fp16)");
     }
     return p;
 }
 
 void export_model_gguf(const std::string& path, Model& model,
-                       const std::string& tokenizer_path,
+                       const Tokenizer& tokenizer,
                        const ExportProfileGGUF& profile,
                        const std::map<std::string, std::string>& extra_meta,
                        const std::string& compat) {
@@ -1325,33 +1342,19 @@ void export_model_gguf(const std::string& path, Model& model,
     }
     const std::string arch = (want_llama || want_moe) ? "llama" : "ghassan";
 
-    GAI_CHECK(!tokenizer_path.empty(),
-              "gguf_format: --tokenizer is required for GGUF export (vocab is embedded)");
-    Tokenizer tok;
-    GAI_CHECK(tok.load(tokenizer_path),
-              "gguf_format: cannot load tokenizer: " + tokenizer_path);
-    GAI_CHECK(tok.vocab_size() == cfg.vocab_size,
-              strfmt("gguf_format: tokenizer/model vocab mismatch: %d vs %d",
-                     tok.vocab_size(), cfg.vocab_size));
-
-    std::vector<uint8_t> gtok_blob;
-    {
-        std::ifstream tf(tokenizer_path, std::ios::binary);
-        GAI_CHECK(tf.good(), "gguf_format: cannot reopen tokenizer: " + tokenizer_path);
-        tf.seekg(0, std::ios::end);
-        std::streamsize sz = tf.tellg();
-        GAI_CHECK(sz > 0, "gguf_format: empty tokenizer file: " + tokenizer_path);
-        tf.seekg(0, std::ios::beg);
-        gtok_blob.resize(static_cast<size_t>(sz));
-        GAI_CHECK(static_cast<bool>(tf.read(reinterpret_cast<char*>(gtok_blob.data()), sz)),
-                  "gguf_format: cannot read tokenizer: " + tokenizer_path);
-    }
+    const Tokenizer& tok = tokenizer;
+    GAI_CHECK(tok.vocab_size() <= cfg.vocab_size,
+              strfmt("gguf_format: the vocabulary (%d tokens) exceeds the model embedding "
+                     "(%d rows); refuse to export", tok.vocab_size(), cfg.vocab_size));
+    if (tok.vocab_size() < cfg.vocab_size)
+        log_info(strfmt("gguf_format: tokenizer has %d tokens, embedding has %d rows "
+                        "(padding) - exporting", tok.vocab_size(), cfg.vocab_size));
 
     GGUFWriter w(path);
 
     w.set_arch(arch);
     {
-        std::string name = "Ghassan";
+        std::string name = "Ghassan v1 Flash";
         {
             u64 n = static_cast<u64>(model.num_parameters());
             std::string scale = n >= 1000000000ull
@@ -1366,7 +1369,7 @@ void export_model_gguf(const std::string& path, Model& model,
         if (itn != extra_meta.end() && !itn->second.empty()) name = itn->second;
         w.set_model_name(name);
     }
-    w.set_description("Ghassan language model");
+    w.set_description("Ghassan v1 Flash");
     w.set_general_type("model");
     {
         u64 n = static_cast<u64>(model.num_parameters());
@@ -1417,26 +1420,62 @@ void export_model_gguf(const std::string& path, Model& model,
         af32("moe.jitter", cfg.moe_jitter);
         af32("z_loss_scale", cfg.z_loss_scale);
         w.add_custom_metadata(akey("use_qk_norm"), cfg.use_qk_norm);
+        w.add_custom_metadata(akey("use_qkv_bias"), cfg.use_qkv_bias);
         w.set_norm_type("rmsnorm");
         w.set_ffn_type(cfg.use_moe ? "swiglu_moe" : "swiglu");
         w.set_attn_type("gqa_causal");
+
+        // IBM Granite-4.0 hybrid: the architecture description that the
+        // reader needs to rebuild the very same model (layer kinds, the
+        // multipliers and the mamba dimensions).
+        if (cfg.arch == ModelConfig::ArchGranite) {
+            w.add_custom_metadata(akey("granite"), true);
+            au64("position_embedding", static_cast<uint64_t>(cfg.position_embedding));
+            au64("attention.head_dim", static_cast<uint64_t>(cfg.head_dim()));
+            au64("moe.shared_intermediate_size",
+                 static_cast<uint64_t>(cfg.shared_expert_intermediate_size));
+            af32("embedding_multiplier", cfg.embedding_multiplier);
+            af32("residual_multiplier", cfg.residual_multiplier);
+            af32("attention_multiplier", cfg.attention_multiplier);
+            af32("logits_scaling", cfg.logits_scaling);
+            au64("mamba.n_heads", static_cast<uint64_t>(cfg.mamba_n_heads));
+            au64("mamba.d_head", static_cast<uint64_t>(cfg.mamba_d_head));
+            au64("mamba.d_state", static_cast<uint64_t>(cfg.mamba_d_state));
+            au64("mamba.n_groups", static_cast<uint64_t>(cfg.mamba_n_groups));
+            au64("mamba.d_conv", static_cast<uint64_t>(cfg.mamba_d_conv));
+            au64("mamba.expand", static_cast<uint64_t>(cfg.mamba_expand));
+            au64("mamba.chunk_size", static_cast<uint64_t>(cfg.mamba_chunk_size));
+            w.add_custom_metadata(akey("mamba.conv_bias"), cfg.mamba_conv_bias);
+            w.add_custom_metadata(akey("mamba.proj_bias"), cfg.mamba_proj_bias);
+            {
+                std::string lt;
+                lt.reserve(cfg.layer_types.size() * 2);
+                for (size_t i = 0; i < cfg.layer_types.size(); ++i) {
+                    if (i) lt += ',';
+                    lt += static_cast<char>('0' + (cfg.layer_types[i] ? 1 : 0));
+                }
+                w.add_custom_metadata(akey("layer_types"), lt);
+            }
+        }
     }
 
     w.set_tokenizer_model("gpt2");
-    w.set_tokenizer_pre("gpt-2");
+    w.set_tokenizer_pre(tok.pretok_kind() == PreTokKind::Qwen ? "qwen2" : "gpt-2");
     w.set_tokenizer_tokens(tok.vocab_entries());
     {
         std::vector<float> scores(static_cast<size_t>(tok.vocab_size()), 0.0f);
         w.set_tokenizer_scores(scores);
         std::vector<int32_t> types;
         types.reserve(static_cast<size_t>(tok.vocab_size()));
-        // GGUF spec: 0=normal,1=unknown,2=control,3=user-defined,4=unused,5=byte
+        // GGUF token types: 1 = normal, 2 = unknown, 3 = control,
+        // 4 = user-defined (an "added" token that is not a control token).
+        // The distinction matters: an added token is still matched literally
+        // in the text, while a control token is skipped on decode.
         for (int i = 0; i < tok.vocab_size(); ++i) {
-            int32_t t = 1; // GGUF: 1 = normal
-            if (i == special::UNK) t = 2; // unknown
-            else if (i < special::COUNT) t = 3; // control
-            else if (i < special::COUNT + 256) t = 6; // byte
-            types.push_back(t);
+            const i32 id = static_cast<i32>(i);
+            if (tok.is_special(id))           types.push_back(3);
+            else if (tok.is_added(id))         types.push_back(4);
+            else                               types.push_back(1);
         }
         w.set_tokenizer_token_types(types);
     }
@@ -1446,36 +1485,29 @@ void export_model_gguf(const std::string& path, Model& model,
             merges.push_back(escape_merge_piece(pr.first) + " " + escape_merge_piece(pr.second));
         w.set_tokenizer_merges(merges);
     }
-    w.set_tokenizer_bos_id(static_cast<uint32_t>(special::BOS));
-    w.set_tokenizer_eos_id(static_cast<uint32_t>(special::EOS));
-    w.set_tokenizer_unk_id(static_cast<uint32_t>(special::UNK));
-    w.set_tokenizer_pad_id(static_cast<uint32_t>(special::PAD));
-    w.set_tokenizer_add_bos(true);
-    w.set_tokenizer_add_eos(false);
+    w.set_tokenizer_bos_id(static_cast<uint32_t>(tok.bos_id()));
+    w.set_tokenizer_eos_id(static_cast<uint32_t>(tok.eos_id()));
+    w.set_tokenizer_unk_id(static_cast<uint32_t>(tok.unk_id()));
+    w.set_tokenizer_pad_id(static_cast<uint32_t>(tok.pad_id()));
+    w.set_tokenizer_add_bos(tok.add_bos());
+    w.set_tokenizer_add_eos(tok.add_eos());
+    // ChatML template (Qwen-compatible): llama.cpp reads tokenizer.chat_template.
     w.set_tokenizer_chat_template(
         "{%- for message in messages %}"
-        "{%- if message['role'] == 'system' %}"
-        "{{- '<s><|system|>' + message['content'] + '<|end|>' }}"
-        "{%- elif message['role'] == 'user' %}"
-        "{{- '<|user|>' + message['content'] + '<|end|>' }}"
-        "{%- elif message['role'] == 'assistant' %}"
-        "{{- '<|assistant|>' + message['content'] + '<|end|>' }}"
-        "{%- endif %}{%- endfor %}"
-        "{%- if add_generation_prompt %}{{- '<|assistant|>' }}{%- endif %}");
-    w.set_gtok_blob(gtok_blob);
-    w.set_normalizer_config(tok.normalizer_config().pack());
+        "{{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
+        "{%- endfor %}"
+        "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}");
 
     w.add_custom_metadata("ghassan.tokenizer.pre_tokenizer",
-                          std::string("darija_byte_bpe_v1:leading-space-glue,nl-separator,byte-fallback"));
-    w.add_custom_metadata("ghassan.tokenizer.canonical",
-                          std::string("gtok-blob:tokenizer.ggml.tokens+merges reconstruct; "
-                                      "authoritative=ghassan.gtok_blob"));
-    w.add_custom_metadata("ghassan.tokenizer.specials", (uint64_t)special::COUNT);
+                          std::string("byte_bpe:gpt2_pretokenizer,byte_fallback"));
+    w.add_custom_metadata("ghassan.tokenizer.specials",
+                          static_cast<uint64_t>(tok.special_ids().size()));
 
     w.set_quantization_profile(profile.name);
     uint32_t file_type = 1;
     if (profile.default_type == GGMLType::Q8_0) file_type = 7;
     if (profile.default_type == GGMLType::Q4_0) file_type = 2;
+    if (profile.default_type == GGMLType::F16)  file_type = 1;
     w.set_file_type(file_type);
 
     for (const auto& [k, v] : extra_meta) {

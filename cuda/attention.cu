@@ -1,4 +1,5 @@
 #include "cuda/cuda_ops.h"
+#include "core/dtype.h"
 #include "cuda/cuda_utils.h"
 #include "core/ops.h"
 
@@ -16,8 +17,15 @@ namespace cuda_ops {
     GAI_FAIL(std::string("CUDA ") + #x + ": " + cudaGetErrorString(_e)); } while (0)
 
 static constexpr int WARP_A = 32;
-static constexpr int KV_TILE = 64;
 static constexpr int MAX_HD  = 128;
+
+// The KV tile is sized so the shared memory stays inside the 48KB the T4
+// offers. head_dim 64 -> 64 rows (33KB), head_dim 128 -> 32 rows (33KB).
+static inline int kv_tile_for(int hd) {
+    if (hd <= 64) return 64;
+    if (hd <= 96) return 48;
+    return 32;
+}
 
 static constexpr int DECODE_BLOCK = 128;
 static constexpr size_t DECODE_SHMEM_FLOATS = 40;
@@ -51,13 +59,13 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
 __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict__ k,
                            const float* __restrict__ v, float* __restrict__ out,
                            float* __restrict__ probs, const i32* __restrict__ segment_ids,
-                           int T, int H, int KV, int hd, float scale) {
+                           int T, int H, int KV, int hd, float scale, int kv_tile) {
     extern __shared__ float sh[];
     float* sQ   = sh;
     float* sK   = sQ + hd;
-    float* sV   = sK + KV_TILE * hd;
-    float* sS   = sV + KV_TILE * hd;
-    float* sAcc = sS + KV_TILE;
+    float* sV   = sK + kv_tile * hd;
+    float* sS   = sV + kv_tile * hd;
+    float* sAcc = sS + kv_tile;
 
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -78,8 +86,8 @@ __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict_
     float run_sum = 0.0f;
     const int len = t + 1;
 
-    for (int base = 0; base < len; base += KV_TILE) {
-        const int tile = min(KV_TILE, len - base);
+    for (int base = 0; base < len; base += kv_tile) {
+        const int tile = min(kv_tile, len - base);
 
         for (int idx = lane; idx < tile * hd; idx += WARP_A) {
             int j = idx / hd;
@@ -160,9 +168,10 @@ void attention_forward(const float* q, const float* k, const float* v,
     GAI_CHECK(H % KV == 0, "cuda attention_forward: H must be a multiple of KV");
     dim3 grid(T, H, B);
 
-    size_t sh = sizeof(float) * (size_t(hd) + size_t(KV_TILE) * hd * 2 + KV_TILE + size_t(hd));
+    const int kv_tile = kv_tile_for(hd);
+    size_t sh = sizeof(float) * (size_t(hd) + size_t(kv_tile) * hd * 2 + kv_tile + size_t(hd));
     GAI_CHECK(sh <= 48 * 1024, "cuda attention_forward: shared memory over T4 limit (use smaller head_dim)");
-    k_attn_fwd<<<grid, WARP_A, sh>>>(q, k, v, out, probs, nullptr, T, H, KV, hd, scale);
+    k_attn_fwd<<<grid, WARP_A, sh>>>(q, k, v, out, probs, nullptr, T, H, KV, hd, scale, kv_tile);
     CU_CHECK2(cudaGetLastError());
 }
 
@@ -630,7 +639,7 @@ __global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restr
                                const float* __restrict__ dout,
                                float* __restrict__ dk, float* __restrict__ dv,
                                const float* __restrict__ dots,
-                               int T, int H, int KV, int hd, float scale) {
+                               int T, int H, int KV, int hd, float scale, int kv_tile) {
     // Grid is (ceil(T/64), KV, B): this block EXCLUSIVELY owns the dk/dv rows
     // of its 64-wide j-tile -> no atomics. Per (t,h) it reads the row dot
     // (computed exactly once by the dq kernel), accumulates this tile's dv/dk
@@ -639,9 +648,9 @@ __global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restr
     const int jt = blockIdx.x;
     const int kvh = blockIdx.y;
     const int b = blockIdx.z;
-    const int base = jt * KV_TILE;
+    const int base = jt * kv_tile;
     if (base >= T) return;
-    const int tile = min(KV_TILE, T - base);
+    const int tile = min(kv_tile, T - base);
     const int group = H / KV;
     const int lane = threadIdx.x;
 
@@ -649,10 +658,10 @@ __global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restr
     const size_t kvs = size_t(T) * KV * hd;
 
     extern __shared__ float sh[];
-    float* s_dv = sh;                          // [KV_TILE * hd]
-    float* s_dk = sh + (size_t)KV_TILE * hd;
-    float* s_go = sh + (size_t)2 * KV_TILE * hd;  // [MAX_HD] do-row cache
-    for (int i = lane; i < KV_TILE * hd; i += WARP_A) { s_dv[i] = 0.0f; s_dk[i] = 0.0f; }
+    float* s_dv = sh;                          // [kv_tile * hd]
+    float* s_dk = sh + (size_t)kv_tile * hd;
+    float* s_go = sh + (size_t)2 * kv_tile * hd;  // [MAX_HD] do-row cache
+    for (int i = lane; i < kv_tile * hd; i += WARP_A) { s_dv[i] = 0.0f; s_dk[i] = 0.0f; }
     __syncthreads();
 
     // [FIX] Register budget: two [MAX_HD] register arrays (go_reg+vbuf = 256+
@@ -722,10 +731,11 @@ void attention_backward(const float* q, const float* k, const float* v,
     CU_CHECK2(cudaGetLastError());
     // dk/dv pass: one block per (j-tile,kvh,b), exclusive tile rows.
     // Stream order guarantees the dots written above are visible here.
-    dim3 grid_dkv((T + KV_TILE - 1) / KV_TILE, KV, B);
-    const size_t shmem = sizeof(float) * (size_t(2) * KV_TILE * hd + MAX_HD);
+    const int kv_tile = kv_tile_for(hd);
+    dim3 grid_dkv((T + kv_tile - 1) / kv_tile, KV, B);
+    const size_t shmem = sizeof(float) * (size_t(2) * kv_tile * hd + MAX_HD);
     GAI_CHECK(shmem <= 48 * 1024, "cuda attention_backward: shared memory over T4 limit");
-    k_attn_bwd_dkv<<<grid_dkv, WARP_A, shmem>>>(q, k, v, probs, dout, dk, dv, g_attn_dots, T, H, KV, hd, scale);
+    k_attn_bwd_dkv<<<grid_dkv, WARP_A, shmem>>>(q, k, v, probs, dout, dk, dv, g_attn_dots, T, H, KV, hd, scale, kv_tile);
     CU_CHECK2(cudaGetLastError());
 }
 
@@ -782,7 +792,7 @@ __global__ void k_attn_decode(const float* __restrict__ q, const float* __restri
         sm[33] = t;
     }
     __syncthreads();
-    float inv = 1.0f / sm[33];
+    float inv = sm[33] > 0.0f ? 1.0f / sm[33] : 0.0f;  // all-masked guard
 
     float* o = out + size_t(h) * hd;
     for (int c = threadIdx.x; c < hd; c += blockDim.x) {
@@ -1046,6 +1056,76 @@ __global__ void k_attn_decode_ring(const float* __restrict__ q, const float* __r
     }
 }
 
+// fp16 KV cache variant: the cache is read as packed halves and converted
+// on the fly. At a 32k context this halves both the memory footprint and
+// the bandwidth of the decode step.
+__global__ void k_attn_decode_ring_fp16(const float* __restrict__ q, const u16* __restrict__ kc,
+                                         const u16* __restrict__ vc, float* __restrict__ out,
+                                         int H, int KV, int hd, int cur_len, int ring_start,
+                                         int pinned_prefix, int ring_capacity, float scale,
+                                         float* __restrict__ scratch, int j0) {
+    extern __shared__ float sm[];
+    const int h = blockIdx.x;
+    const int group = H / KV;
+    const int kvh = h / group;
+    const float* qh = q + size_t(h) * hd;
+    float* s = scratch + size_t(h) * cur_len;
+
+    float local_max = -FLT_MAX;
+    for (int j = threadIdx.x + j0; j < cur_len; j += blockDim.x) {
+        size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
+        const u16* kh = kc + (slot * size_t(KV) + kvh) * hd;
+        float d = 0.0f;
+#pragma unroll 4
+        for (int c = 0; c < hd; ++c) d += qh[c] * fp16_to_fp32(kh[c]);
+        d *= scale;
+        s[j] = d;
+        local_max = fmaxf(local_max, d);
+    }
+    int lane = threadIdx.x % WARP_A, wid = threadIdx.x / WARP_A;
+#pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if (lane == 0) sm[wid] = local_max;
+    __syncthreads();
+    int nw = (blockDim.x + WARP_A - 1) / WARP_A;
+    if (threadIdx.x == 0) {
+        float m = sm[0];
+        for (int i = 1; i < nw; ++i) m = fmaxf(m, sm[i]);
+        sm[32] = m;
+    }
+    __syncthreads();
+    float mx = sm[32];
+
+    float local_sum = 0.0f;
+    for (int j = threadIdx.x + j0; j < cur_len; j += blockDim.x) {
+        float p = __expf(s[j] - mx);
+        s[j] = p;
+        local_sum += p;
+    }
+#pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1) local_sum += __shfl_xor_sync(0xffffffffu, local_sum, o);
+    if (lane == 0) sm[wid] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < nw; ++i) t += sm[i];
+        sm[33] = t;
+    }
+    __syncthreads();
+    float inv = sm[33] > 0.0f ? 1.0f / sm[33] : 0.0f;
+
+    float* o = out + size_t(h) * hd;
+    for (int c = threadIdx.x; c < hd; c += blockDim.x) {
+        float a = 0.0f;
+        for (int j = j0; j < cur_len; ++j) {
+            size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
+            a += s[j] * fp16_to_fp32(vc[(slot * size_t(KV) + kvh) * hd + c]);
+        }
+        o[c] = a * inv;
+    }
+}
+
 void attention_decode_ex(const float* q, const float* kc, const float* vc,
                          float* out, int H, int KV, int hd, int cur_len, int max_len,
                          float scale, float* scratch, int window) {
@@ -1089,6 +1169,33 @@ void attention_decode_ring(const float* q, const float* kc, const float* vc,
     size_t sh = sizeof(float) * DECODE_SHMEM_FLOATS;
     k_attn_decode_ring<<<H, block, sh>>>(q, kc, vc, out, H, KV, hd, cur_len, ring_start,
                                          pinned_prefix, ring_capacity, scale, scratch, j0);
+    CU_CHECK2(cudaGetLastError());
+}
+
+void attention_decode_ring_fp16(const float* q, const u16* kc, const u16* vc,
+                                float* out, int H, int KV, int hd, int ring_start,
+                                int pinned_prefix, int cur_len, int cache_max,
+                                float scale, float* scratch, int window) {
+    GAI_CHECK(H > 0 && KV > 0 && hd > 0, "cuda attention_decode_ring_fp16: empty shape");
+    GAI_CHECK(H % KV == 0, "cuda attention_decode_ring_fp16: H must be a multiple of KV");
+    GAI_CHECK(cur_len >= 0 && cache_max >= 0 && cur_len <= cache_max,
+              "cuda attention_decode_ring_fp16: length exceeds cache capacity");
+    GAI_CHECK(pinned_prefix >= 0 && pinned_prefix <= cur_len,
+              "cuda attention_decode_ring_fp16: pinned prefix out of range");
+    const int ring_capacity = cache_max - pinned_prefix;
+    if (cur_len > pinned_prefix) {
+        GAI_CHECK(ring_capacity > 0, "cuda attention_decode_ring_fp16: ring has no rolling slots");
+        GAI_CHECK(ring_start >= 0 && ring_start < ring_capacity,
+                  "cuda attention_decode_ring_fp16: ring start out of range");
+    }
+    if (H <= 0 || cur_len <= 0) return;
+    int j0 = (window > 0 && cur_len > window) ? cur_len - window : 0;
+    int block = DECODE_BLOCK;
+    GAI_CHECK((block + WARP_A - 1) / WARP_A + 2 <= (int)DECODE_SHMEM_FLOATS,
+              "cuda attention_decode_ring_fp16: block exceeds shared-memory budget");
+    size_t sh = sizeof(float) * DECODE_SHMEM_FLOATS;
+    k_attn_decode_ring_fp16<<<H, block, sh>>>(q, kc, vc, out, H, KV, hd, cur_len, ring_start,
+                                              pinned_prefix, ring_capacity, scale, scratch, j0);
     CU_CHECK2(cudaGetLastError());
 }
 

@@ -311,6 +311,14 @@ void add_inplace(Device dev, float* a, const float* b, i64 n) {
     GAI_DISPATCH(dev, add_inplace(a, b, n));
 }
 
+void add_bias(Device dev, const float* b, float* y, i64 rows, int cols) {
+    GAI_DISPATCH(dev, add_bias(b, y, rows, cols));
+}
+
+void bias_backward(Device dev, const float* dy, float* db, i64 rows, int cols) {
+    GAI_DISPATCH(dev, bias_backward(dy, db, rows, cols));
+}
+
 void scale_inplace(Device dev, float* a, float s, i64 n) {
     GAI_DISPATCH(dev, scale_inplace(a, s, n));
 }
@@ -418,6 +426,35 @@ void swiglu_backward(Device dev, const float* g, const float* u, const float* do
     GAI_DISPATCH(dev, swiglu_backward(g, u, dout, dg, du, n));
 }
 
+void mamba2_forward(Device dev,
+                    const float* x,
+                    const float* w_in,
+                    const float* conv_w,
+                    const float* conv_b,
+                    const float* dt_bias,
+                    const float* a_log,
+                    const float* D,
+                    const float* norm_w,
+                    const float* w_out,
+                    float* state,
+                    float* out,
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::mamba2_forward(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                                  norm_w, w_out, state, out,
+                                  B, T, d, d_inner, conv_dim, n_heads,
+                                  d_head, d_state, k, eps);
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::mamba2_forward(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                        state, out, B, T, d, d_inner, conv_dim, n_heads,
+                        d_head, d_state, k, eps);
+}
+
 void attention_forward(Device dev, const float* q, const float* k, const float* v,
                        float* out, float* probs,
                        int B, int T, int H, int KV, int hd, float scale) {
@@ -453,6 +490,24 @@ void attention_decode_ring(Device dev,
     cpu::attention_decode_ring(q, kcache, vcache, out, H, KV, hd, ring_start,
                                pinned_prefix, cur_len, cache_max, scale,
                                scratch, window);
+}
+
+void attention_decode_ring_fp16(Device dev,
+                                 const float* q, const u16* kcache, const u16* vcache,
+                                 float* out, int H, int KV, int hd, int ring_start,
+                                 int pinned_prefix, int cur_len, int cache_max,
+                                 float scale, float* scratch, int window) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::attention_decode_ring_fp16(q, kcache, vcache, out, H, KV, hd, ring_start,
+                                             pinned_prefix, cur_len, cache_max, scale,
+                                             scratch, window);
+        return;
+    }
+#endif
+    cpu::attention_decode_ring_fp16(q, kcache, vcache, out, H, KV, hd, ring_start,
+                                    pinned_prefix, cur_len, cache_max, scale,
+                                    scratch, window);
 }
 
 void attention_forward_ex(Device dev,
@@ -505,13 +560,13 @@ void moe_forward(Device dev,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                 i64 N, int d, int E, int ne, int K) {
+                 i64 N, int d, int E, int ne, int K, int SH) {
     Timer t;
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
         cuda_ops::moe_forward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
                               out, probs_cache, idx_cache, w_cache,
-                              s_gate, s_up, s_act, N, d, E, ne, K);
+                              s_gate, s_up, s_act, N, d, E, ne, K, SH);
         perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
@@ -519,7 +574,7 @@ void moe_forward(Device dev,
     (void)dev;
     cpu::moe_forward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
                      out, probs_cache, idx_cache, w_cache,
-                     s_gate, s_up, s_act, N, d, E, ne, K);
+                     s_gate, s_up, s_act, N, d, E, ne, K, SH);
     perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
 }
 
@@ -530,11 +585,11 @@ void moe_forward_bias(Device dev,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K) {
+                      i64 N, int d, int E, int ne, int K, int SH) {
     if (!router_bias) {
 
         moe_forward(dev, x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
-                    probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K);
+                    probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K, SH);
         return;
     }
     Timer t;
@@ -542,7 +597,7 @@ void moe_forward_bias(Device dev,
     if (dev == Device::CUDA) {
         cuda_ops::moe_forward_bias(x, router_w, router_bias, gates, ups, downs, sh_g, sh_u, sh_d,
                                    out, probs_cache, idx_cache, w_cache,
-                                   s_gate, s_up, s_act, N, d, E, ne, K);
+                                   s_gate, s_up, s_act, N, d, E, ne, K, SH);
         perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
@@ -550,7 +605,7 @@ void moe_forward_bias(Device dev,
     (void)dev;
     cpu::moe_forward_bias(x, router_w, router_bias, gates, ups, downs, sh_g, sh_u, sh_d,
                           out, probs_cache, idx_cache, w_cache,
-                          s_gate, s_up, s_act, N, d, E, ne, K);
+                          s_gate, s_up, s_act, N, d, E, ne, K, SH);
     perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
 }
 
@@ -566,7 +621,7 @@ void moe_backward(Device dev,
                   float* drouter_w, float* dgates, float* dups, float* ddowns,
                   float* dsh_g, float* dsh_u, float* dsh_d,
                   float* s_dact,
-                  i64 N, int d, int E, int ne, int K) {
+                  i64 N, int d, int E, int ne, int K, int SH) {
     Timer t;
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
@@ -574,7 +629,7 @@ void moe_backward(Device dev,
                                probs, idx, tw, s_gate, s_up, s_act,
                                aux_frac, aux_scale, dout, dx,
                                drouter_w, dgates, dups, ddowns,
-                               dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K);
+                               dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
         perf_note_moe_bwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
@@ -584,7 +639,7 @@ void moe_backward(Device dev,
                       probs, idx, tw, s_gate, s_up, s_act,
                       aux_frac, aux_scale, dout, dx,
                       drouter_w, dgates, dups, ddowns,
-                      dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K);
+                      dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
     perf_note_moe_bwd(static_cast<u64>(t.elapsed_us()));
 }
 

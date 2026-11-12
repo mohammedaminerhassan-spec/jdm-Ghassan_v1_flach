@@ -50,11 +50,13 @@ namespace {
 
 struct FwdScratch {
     std::vector<float> logits;
-    std::vector<float> g, u, a;
+    std::vector<float> g, u, a;       // routed experts (width E)
+    std::vector<float> sg, su, sa;    // shared expert (width SH)
     std::vector<float> tmp;
-    void ensure(int ne, int E, int d) {
+    void ensure(int ne, int E, int d, int SH) {
         if ((int)logits.size() < ne) logits.resize(ne);
         if ((int)g.size() < E) { g.resize(E); u.resize(E); a.resize(E); }
+        if ((int)sg.size() < SH) { sg.resize(SH); su.resize(SH); sa.resize(SH); }
         if ((int)tmp.size() < d) tmp.resize(d);
     }
 };
@@ -63,13 +65,17 @@ struct BwdScratch {
     std::vector<float> dp;
     std::vector<float> g, u, a;
     std::vector<float> dg, du, da;
+    std::vector<float> sg, su, sa;
+    std::vector<float> dsg, dsu, dsa;
     std::vector<float> dx;
     std::vector<float> tmp;
     std::vector<float> oute;
-    void ensure(int ne, int E, int d) {
+    void ensure(int ne, int E, int d, int SH) {
         if ((int)dlogit.size() < ne) { dlogit.resize(ne); dp.resize(ne); }
         if ((int)g.size() < E) { g.resize(E); u.resize(E); a.resize(E);
                                  dg.resize(E); du.resize(E); da.resize(E); }
+        if ((int)sg.size() < SH) { sg.resize(SH); su.resize(SH); sa.resize(SH);
+                                    dsg.resize(SH); dsu.resize(SH); dsa.resize(SH); }
         if ((int)dx.size() < d) { dx.resize(d); tmp.resize(d); oute.resize(d); }
     }
 };
@@ -106,7 +112,7 @@ void moe_forward(const float* x, const float* router_w,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                 i64 N, int d, int E, int ne, int K) {
+                 i64 N, int d, int E, int ne, int K, int SH) {
     if (N <= 0) return;
 
     GAI_CHECK(K >= 1 && K <= 8, "moe_forward: K must be in [1,8]");
@@ -117,7 +123,7 @@ void moe_forward(const float* x, const float* router_w,
 #endif
     {
         FwdScratch sc;
-        sc.ensure(ne, E, d);
+        sc.ensure(ne, E, d, SH);
 #ifdef GAI_OPENMP
         #pragma omp for schedule(static)
 #endif
@@ -151,10 +157,10 @@ void moe_forward(const float* x, const float* router_w,
             if (w_cache) std::memcpy(w_cache + t * K, t_w, sizeof(float) * (size_t)K);
 
             if (sh_g && sh_u && sh_d) {
-                linear_forward(xt, sh_g, sc.g.data(), 1, d, E);
-                linear_forward(xt, sh_u, sc.u.data(), 1, d, E);
-                swiglu_forward(sc.g.data(), sc.u.data(), sc.a.data(), E);
-                linear_forward(sc.a.data(), sh_d, outt, 1, E, d);
+                linear_forward(xt, sh_g, sc.sg.data(), 1, d, SH);
+                linear_forward(xt, sh_u, sc.su.data(), 1, d, SH);
+                swiglu_forward(sc.sg.data(), sc.su.data(), sc.sa.data(), SH);
+                linear_forward(sc.sa.data(), sh_d, outt, 1, SH, d);
             } else {
                 std::fill(outt, outt + d, 0.0f);
             }
@@ -185,7 +191,7 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K) {
+                      i64 N, int d, int E, int ne, int K, int SH) {
     if (N <= 0) return;
     GAI_CHECK(K >= 1 && K <= 8, "moe_forward_bias: K must be in [1,8]");
     GAI_CHECK(ne > 0 && ne <= 64, "moe_forward_bias: ne out of range");
@@ -195,7 +201,7 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
 #endif
     {
         FwdScratch sc;
-        sc.ensure(ne, E, d);
+        sc.ensure(ne, E, d, SH);
         std::vector<float> sel;
         sel.resize(static_cast<size_t>(ne));
 #ifdef GAI_OPENMP
@@ -238,10 +244,10 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
             if (w_cache) std::memcpy(w_cache + t * K, t_w, sizeof(float) * (size_t)K);
 
             if (sh_g && sh_u && sh_d) {
-                linear_forward(xt, sh_g, sc.g.data(), 1, d, E);
-                linear_forward(xt, sh_u, sc.u.data(), 1, d, E);
-                swiglu_forward(sc.g.data(), sc.u.data(), sc.a.data(), E);
-                linear_forward(sc.a.data(), sh_d, outt, 1, E, d);
+                linear_forward(xt, sh_g, sc.sg.data(), 1, d, SH);
+                linear_forward(xt, sh_u, sc.su.data(), 1, d, SH);
+                swiglu_forward(sc.sg.data(), sc.su.data(), sc.sa.data(), SH);
+                linear_forward(sc.sa.data(), sh_d, outt, 1, SH, d);
             } else {
                 std::fill(outt, outt + d, 0.0f);
             }
@@ -277,14 +283,14 @@ void moe_backward(const float* x, const float* router_w,
                   float* drouter_w, float* dgates, float* dups, float* ddowns,
                   float* dsh_g, float* dsh_u, float* dsh_d,
                   float* s_dact,
-                  i64 N, int d, int E, int ne, int K) {
+                  i64 N, int d, int E, int ne, int K, int SH) {
     if (N <= 0) return;
 
     GAI_CHECK(K >= 1 && K <= 8, "moe_backward: K must be in [1,8]");
     GAI_CHECK(ne > 0 && ne <= 64, "moe_backward: ne out of range");
 
     BwdScratch sc;
-    sc.ensure(ne, E, d);
+    sc.ensure(ne, E, d, SH);
 
     const float aux_coef = (aux_frac && aux_scale != 0.0f)
         ? aux_scale * (float)ne / (float)N : 0.0f;
@@ -477,7 +483,7 @@ void moe_forward_fused(const float* x, const float* router_w,
                        float* s_gate, float* s_up, float* s_act,
                        float* Xpack, float* Gpack, float* Upack, float* Apack,
                        float* Ypack, i32* grouped, int* counts, int* offsets,
-                       i64 N, int d, int E, int ne, int K) {
+                       i64 N, int d, int E, int ne, int K, int SH) {
     if (N <= 0) return;
     GAI_CHECK(K >= 1 && K <= 8, "moe_forward_fused: K must be in [1,8]");
     GAI_CHECK(ne > 0 && ne <= 64, "moe_forward_fused: ne out of range");
@@ -485,7 +491,7 @@ void moe_forward_fused(const float* x, const float* router_w,
 
     {
         FwdScratch sc;
-        sc.ensure(ne, E, d);
+        sc.ensure(ne, E, d, SH);
         for (i64 t = 0; t < N; ++t) {
             const float* xt = x + t * d;
             for (int e = 0; e < ne; ++e)
@@ -519,15 +525,17 @@ void moe_forward_fused(const float* x, const float* router_w,
               "moe_forward_fused requires idx/w caches (training/inference always pass them)");
 
     if (sh_g && sh_u && sh_d) {
-        std::vector<float> g(static_cast<size_t>(N) * E), u(static_cast<size_t>(N) * E),
-            a(static_cast<size_t>(N) * E);
+        // The shared expert has its own width (SH), not the routed width E
+        // (Granite-4: 1024 vs 512).
+        std::vector<float> g(static_cast<size_t>(N) * SH), u(static_cast<size_t>(N) * SH),
+            a(static_cast<size_t>(N) * SH);
         for (i64 t = 0; t < N; ++t) {
-            linear_forward(x + t * d, sh_g, g.data() + t * E, 1, d, E);
-            linear_forward(x + t * d, sh_u, u.data() + t * E, 1, d, E);
+            linear_forward(x + t * d, sh_g, g.data() + t * SH, 1, d, SH);
+            linear_forward(x + t * d, sh_u, u.data() + t * SH, 1, d, SH);
         }
-        swiglu_forward(g.data(), u.data(), a.data(), N * E);
+        swiglu_forward(g.data(), u.data(), a.data(), N * SH);
         for (i64 t = 0; t < N; ++t)
-            linear_forward(a.data() + t * E, sh_d, out + t * d, 1, E, d);
+            linear_forward(a.data() + t * SH, sh_d, out + t * d, 1, SH, d);
     } else {
         for (i64 t = 0; t < N; ++t)
             std::fill(out + t * d, out + t * d + d, 0.0f);

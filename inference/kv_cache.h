@@ -88,10 +88,25 @@ public:
         return slot;
     }
 
+    // The cache stores fp16 by default: for Qwen3-1.7B at a 32k context the
+    // difference is 7.0 GiB (fp32) vs 3.5 GiB (fp16) - the difference
+    // between fitting and OOM on a 16 GB T4. `k()`/`v()` return the fp32
+    // view used by the kernels; `k_f16()`/`v_f16()` the packed storage.
     float* k(int layer) { return k_[static_cast<size_t>(layer)].f32(); }
     float* v(int layer) { return v_[static_cast<size_t>(layer)].f32(); }
     const float* k(int layer) const { return k_[static_cast<size_t>(layer)].f32(); }
     const float* v(int layer) const { return v_[static_cast<size_t>(layer)].f32(); }
+
+    // Packed fp16 storage (what the kernels actually read).
+    u16* k_f16(int layer) { return k_[static_cast<size_t>(layer)].ptr<u16>(); }
+    u16* v_f16(int layer) { return v_[static_cast<size_t>(layer)].ptr<u16>(); }
+    const u16* k_f16(int layer) const { return k_[static_cast<size_t>(layer)].ptr<u16>(); }
+    const u16* v_f16(int layer) const { return v_[static_cast<size_t>(layer)].ptr<u16>(); }
+
+    // When true the cache keeps fp32 values (used by the training path and
+    // by the CPU reference kernels).
+    bool fp16() const { return fp16_; }
+    void set_fp16(bool on) { fp16_ = on; }
 
     size_t bytes() const;
 
@@ -103,6 +118,7 @@ private:
     int len_     = 0;
     int pinned_  = 0;
     int start_   = 0;
+    bool fp16_   = true;
 };
 
 }

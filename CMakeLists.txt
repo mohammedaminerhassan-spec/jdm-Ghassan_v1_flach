@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ghassan_ai LANGUAGES CXX VERSION 0.1.0)
+project(ghassan_ai LANGUAGES CXX VERSION 0.2.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,11 +27,9 @@ option(GAI_ENABLE_PARQUET "Build native Parquet input via Apache Arrow" OFF)
 
 function(gai_apply_cxx_flags target)
     if(MSVC)
-
         target_compile_options(${target} PRIVATE /W3 /WX /wd5105 /permissive- /Zc:preprocessor /bigobj /utf-8 /MP)
         target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2>)
     else()
-
         target_compile_options(${target} PRIVATE -Wall -Wextra -Werror
             -Wno-unused-parameter -Wno-missing-field-initializers
             -Wunused-but-set-variable -Wunused-variable)
@@ -60,7 +58,7 @@ if(GAI_ENABLE_CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
         if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-            # T4=75, but include 80/90 so the same binary JIT-runs on newer
+            # T4=75. Include 80/90 so the same binary JIT-runs on newer
             # Kaggle GPUs without recompiling. 75 stays first (fastest on T4).
             set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 90-real)
         endif()
@@ -83,12 +81,9 @@ file(GLOB_RECURSE GAI_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_SOURCE_DIR}/model/*.cpp
      ${CMAKE_SOURCE_DIR}/format/*.cpp
      ${CMAKE_SOURCE_DIR}/training/*.cpp
-     ${CMAKE_SOURCE_DIR}/dataset/*.cpp
      ${CMAKE_SOURCE_DIR}/inference/*.cpp
      ${CMAKE_SOURCE_DIR}/quantization/*.cpp
-     ${CMAKE_SOURCE_DIR}/evaluation/*.cpp
-     ${CMAKE_SOURCE_DIR}/server/*.cpp
-     ${CMAKE_SOURCE_DIR}/vision/*.cpp)
+     ${CMAKE_SOURCE_DIR}/evaluation/*.cpp)
 
 add_library(gai_core STATIC ${GAI_SOURCES})
 target_include_directories(gai_core PUBLIC ${CMAKE_SOURCE_DIR})
@@ -144,14 +139,13 @@ if(GAI_ENABLE_PARQUET)
         target_compile_definitions(gai_core PUBLIC GAI_PARQUET=1)
         message(STATUS "[ghassan-ai] parquet: Arrow ${Arrow_VERSION} (native lake input enabled)")
     else()
-        message(WARNING "[ghassan-ai] parquet: GAI_ENABLE_PARQUET=ON but Arrow/Parquet not found -> parquet route disabled (install Arrow: configs/kaggle/setup.sh --with-parquet)")
+        message(STATUS "[ghassan-ai] parquet: GAI_ENABLE_PARQUET=ON but Arrow/Parquet not found -> parquet route disabled")
     endif()
 endif()
 
 if(WIN32)
     target_compile_definitions(gai_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     if(NOT MSVC)
-        # MinGW needs the Winsock import library spelled out.
         target_link_libraries(gai_core PUBLIC ws2_32)
     endif()
 endif()
@@ -161,36 +155,37 @@ if(NOT MSVC)
     target_link_libraries(gai_core PUBLIC Threads::Threads)
 endif()
 
-add_executable(ghassan-ai      tools/inference_cli.cpp tools/serve_cli.cpp
-                                 tools/model_loader.cpp tools/cli_common.cpp)
-add_executable(train_tokenizer tools/tokenizer_trainer_cli.cpp tools/cli_common.cpp)
-# the dataset/ module is gone: the data pipeline is the Python one (tools/py)
-add_executable(gai_train       tools/training_cli.cpp tools/cli_common.cpp)
+add_executable(ghassan-ai      tools/inference_cli.cpp tools/model_loader.cpp tools/cli_common.cpp)
+add_executable(gai_train       tools/training_cli.cpp  tools/cli_common.cpp tools/model_loader.cpp)
 
-foreach(t ghassan-ai train_tokenizer gai_train)
+foreach(t ghassan-ai gai_train)
     target_link_libraries(${t} PRIVATE gai_core)
     gai_apply_cxx_flags(${t})
 endforeach()
 
 if(GAI_BUILD_TESTS)
-    enable_testing()
+    # The repository ships no test binaries: verification is done by the
+    # Kaggle smoke runs (load -> forward -> export -> reload). The option is
+    # kept so a local tests/ directory can still be added without editing
+    # the build.
     file(GLOB GAI_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/test_*.cpp)
     list(LENGTH GAI_TEST_SOURCES GAI_TEST_COUNT)
     if(GAI_TEST_COUNT EQUAL 0)
-        message(WARNING "[ghassan-ai] GAI_BUILD_TESTS=ON but no tests/test_*.cpp found -> no test targets")
+        message(STATUS "[ghassan-ai] no tests/test_*.cpp -> no test targets")
+    else()
+        enable_testing()
+        foreach(tsrc ${GAI_TEST_SOURCES})
+            get_filename_component(tname ${tsrc} NAME_WE)
+            add_executable(${tname} ${tsrc} ${CMAKE_SOURCE_DIR}/tools/cli_common.cpp)
+            target_link_libraries(${tname} PRIVATE gai_core)
+            gai_apply_cxx_flags(${tname})
+            add_test(NAME ${tname} COMMAND ${tname} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+            set_tests_properties(${tname} PROPERTIES TIMEOUT 120)
+        endforeach()
     endif()
-    foreach(tsrc ${GAI_TEST_SOURCES})
-        get_filename_component(tname ${tsrc} NAME_WE)
-        add_executable(${tname} ${tsrc} ${CMAKE_SOURCE_DIR}/tools/cli_common.cpp)
-        target_link_libraries(${tname} PRIVATE gai_core)
-        gai_apply_cxx_flags(${tname})
-        add_test(NAME ${tname} COMMAND ${tname} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-        set_tests_properties(${tname} PROPERTIES TIMEOUT 120)
-    endforeach()
 endif()
 
 message(STATUS "[ghassan-ai] build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "[ghassan-ai] cuda       : ${GAI_HAVE_CUDA} (ref sm_75 T4; override with -DCMAKE_CUDA_ARCHITECTURES)")
-message(STATUS "[ghassan-ai] nccl       : ${GAI_HAVE_NCCL}")
-message(STATUS "[ghassan-ai] parquet    : ${GAI_HAVE_PARQUET} (THE lake input; no JSON fallback)")
+message(STATUS "[ghassan-ai] nccl       : ${GAI_HAVE_NCCL} (multi-GPU DDP)")
+message(STATUS "[ghassan-ai] precision  : export = Q8_0 (8-bit max); compute = fp32/fp16 tensor cores")
