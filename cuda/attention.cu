@@ -1091,7 +1091,7 @@ __global__ void k_attn_decode_ring_fp16(const float* __restrict__ q, const u16* 
         const u16* kh = kc + (slot * size_t(KV) + kvh) * hd;
         float d = 0.0f;
 #pragma unroll 4
-        for (int c = 0; c < hd; ++c) d += qh[c] * fp16_to_fp32(kh[c]);
+        for (int c = 0; c < hd; ++c) d += qh[c] * __half2float(*reinterpret_cast<const __half*>(kh + c));
         d *= scale;
         s[j] = d;
         local_max = fmaxf(local_max, d);
@@ -1134,7 +1134,7 @@ __global__ void k_attn_decode_ring_fp16(const float* __restrict__ q, const u16* 
         float a = 0.0f;
         for (int j = j0; j < cur_len; ++j) {
             size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
-            a += s[j] * fp16_to_fp32(vc[(slot * size_t(KV) + kvh) * hd + c]);
+            a += s[j] * __half2float(*reinterpret_cast<const __half*>(vc + (slot * size_t(KV) + kvh) * hd + c));
         }
         o[c] = a * inv;
     }
