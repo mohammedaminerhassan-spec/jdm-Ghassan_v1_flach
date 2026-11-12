@@ -242,8 +242,8 @@ static int cmd_info(const Args& args) {
                   << "\n";
         std::cout << "\n  -- config --\n";
         std::cout << c.summary() << "\n";
-        const std::string gs = c.granite_summary();
-        if (!gs.empty()) std::cout << "\n  -- granite-4.0 --\n" << gs << "\n";
+        const std::string gs = c.hybrid_summary();
+        if (!gs.empty()) std::cout << "\n  -- hybrid --\n" << gs << "\n";
         std::cout << "\n  parameters  : " << human_count(Model::count_parameters(c))
                   << " (" << Model::count_parameters(c) << ")\n";
         std::cout << "  tie_embeddings: " << (c.tie_embeddings ? "yes" : "no") << "\n\n";

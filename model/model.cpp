@@ -642,7 +642,7 @@ std::string ModelConfig::summary() const {
 // fields that decide whether the model computes the same function as
 // HuggingFace: the multipliers, the Mamba-2 geometry, the position
 // embedding and the layer kinds.
-std::string ModelConfig::granite_summary() const {
+std::string ModelConfig::hybrid_summary() const {
     if (arch != ArchGranite) return {};
     std::ostringstream ss;
     ss << "  position    : " << (position_embedding == 1 ? "NoPE (no RoPE)" : "RoPE")

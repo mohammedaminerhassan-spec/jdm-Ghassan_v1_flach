@@ -834,7 +834,7 @@ bool GGUFReader::load_tokenizer(Tokenizer& tk) const {
     {
         if (pre == "qwen2" || pre == "qwen-2" || pre == "qwen" || pre == "qwen2.5")
             opts.pretok = PreTokKind::Qwen;
-        else if (pre == "granite" || pre == "granite-4" || pre == "granite-4.0")
+        else if (pre == "ghassan" || pre == "granite" || pre == "granite-4" || pre == "granite-4.0")
             opts.pretok = PreTokKind::Granite;
         else
             opts.pretok = PreTokKind::Gpt2;
@@ -921,7 +921,8 @@ ModelConfig GGUFReader::model_config() const {
         c.tie_embeddings    = get_bool("ghassan.tie_word_embeddings", true);
         // IBM Granite-4.0 hybrid: the layer kinds and the multipliers are
         // part of the architecture, so they must survive the round trip.
-        c.arch                   = get_bool("ghassan.granite", false)
+        c.arch                   = get_bool("ghassan.hybrid",
+                                       get_bool("ghassan.granite", false))
                                        ? ModelConfig::ArchGranite : ModelConfig::ArchQwen;
         c.position_embedding     = static_cast<int>(get_uint("ghassan.position_embedding",
                                                                static_cast<uint64_t>(c.position_embedding)));
@@ -1427,11 +1428,10 @@ void export_model_gguf(const std::string& path, Model& model,
         w.set_ffn_type(cfg.use_moe ? "swiglu_moe" : "swiglu");
         w.set_attn_type("gqa_causal");
 
-        // IBM Granite-4.0 hybrid: the architecture description that the
-        // reader needs to rebuild the very same model (layer kinds, the
-        // multipliers and the mamba dimensions).
+        // The hybrid flag: a Ghassan artifact must not carry the upstream
+        // architecture's brand. The reader accepts the legacy key too.
         if (cfg.arch == ModelConfig::ArchGranite) {
-            w.add_custom_metadata(akey("granite"), true);
+            w.add_custom_metadata(akey("hybrid"), true);
             au64("position_embedding", static_cast<uint64_t>(cfg.position_embedding));
             au64("attention.head_dim", static_cast<uint64_t>(cfg.head_dim()));
             au64("moe.shared_intermediate_size",
@@ -1467,9 +1467,9 @@ void export_model_gguf(const std::string& path, Model& model,
     // Qwen do not. Writing "gpt-2" for a Granite tokenizer re-encodes digits
     // wrongly after a reload.
     switch (tok.pretok_kind()) {
-        case PreTokKind::Qwen:   w.set_tokenizer_pre("qwen2"); break;
-        case PreTokKind::Granite: w.set_tokenizer_pre("granite"); break;
-        default:                 w.set_tokenizer_pre("gpt-2"); break;
+        case PreTokKind::Qwen:    w.set_tokenizer_pre("qwen2"); break;
+        case PreTokKind::Granite: w.set_tokenizer_pre("ghassan"); break;
+        default:                  w.set_tokenizer_pre("gpt-2"); break;
     }
     w.set_tokenizer_tokens(tok.vocab_entries());
     {
@@ -1535,7 +1535,7 @@ void export_model_gguf(const std::string& path, Model& model,
         if (tok.pretok_kind() == PreTokKind::Qwen)
             pretok_name = "byte_bpe:qwen_pretokenizer,byte_fallback";
         else if (tok.pretok_kind() == PreTokKind::Granite)
-            pretok_name = "byte_bpe:granite_pretokenizer(\\p{N}{1,3}),byte_fallback";
+            pretok_name = "byte_bpe:ghassan_pretokenizer(\\p{N}{1,3}),byte_fallback";
         w.add_custom_metadata("ghassan.tokenizer.pre_tokenizer",
                               std::string(pretok_name));
     }
