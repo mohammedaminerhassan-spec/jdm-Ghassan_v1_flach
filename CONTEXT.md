@@ -109,7 +109,9 @@ vocab 100352, tied embeddings, byte-level BPE (digits {1,3})
 23. **تقدير الـ KV cache كان كيغلط 10x** على Granite (40 طبقة بدل 4 attention).
 24. **pre-flight VRAM check**: خطأ واضح بدل CUDA OOM cryptic.
 25. **`gnorm %6.3f` كان كيخبي القيم الصغيرة** → ولا `%.4g` (الـ LoRA كان يبان 0.000).
-26. **`cuda/mamba.cu`**: `mamba_grid_for` (ميت) تحيّد. **`format/hf_checkpoint.h`**:
+26. **CPU kernels مقسّمة بالفئات**: `ops_cpu_dense.cpp` (الـ primitives المشتركة: GEMM، linear، elementwise، embedding، norms، RoPE، SwiGLU + loss + optimizer + sampler)، `ops_cpu_attention.cpp` (عائلة attention كاملة: prefill + backward + decode ring fp32/fp16)، `ops_cpu_moe.cpp` (MoE)، `ops_cpu_mamba.cpp` (Mamba-2)، `ops_cpu_simd.h` (helpers AVX2/FMA مشتركة). `core/ops_cpu.h` فيه banners كيقولو كل declaration فين كايتنفّذ.
+27. **dead code محيّد**: `jitter_u_for_test`، `moe_gather3_all`، `moe_scale_all`، `moe_forward_fused` (كانو غير للـ unit tests المحذوفين).
+28. **`cuda/mamba.cu`**: `mamba_grid_for` (ميت) تحيّد. **`format/hf_checkpoint.h`**:
     declaration قديم لـ `hf_tensor_name` (بـ arg واحد بلا definition) صلّح.
 
 ### 🔥 الـ BUGS الكبيرة اللي طلعو فالتحقق العددي (2026-11-12)

@@ -21,6 +21,22 @@ training/    trainer · AdamW / Lion / Muon · LoRA · dataloader · checkpoint
 tools/       ghassan-ai (serve/inspect/export) · gai_train
 ```
 
+### The CPU kernels
+
+They are split per family (`core/ops_cpu.h` maps every declaration to its
+file):
+
+| file | what it holds |
+|---|---|
+| `ops_cpu_dense.cpp` | the shared primitives: the GEMM, the linear ops, the elementwise ops, the embedding, the norms, the RoPE, the SwiGLU — plus the loss, the optimizer steps and the sampler helpers |
+| `ops_cpu_attention.cpp` | the attention family: the prefill, the backward, the incremental decode (the ring KV cache, fp32 and packed fp16) |
+| `ops_cpu_moe.cpp` | the mixture of experts: the routing, the expert GEMMs, the shared expert |
+| `ops_cpu_mamba.cpp` | the IBM Granite Mamba-2 layer |
+| `ops_cpu_simd.h` | the AVX2/FMA helpers shared by the above |
+
+A **dense** model and a **MoE** model share the primitives: the dense model is
+the same path with the MoE block replaced by a plain MLP.
+
 ## Build
 
 **Linux / Kaggle (with CUDA):**

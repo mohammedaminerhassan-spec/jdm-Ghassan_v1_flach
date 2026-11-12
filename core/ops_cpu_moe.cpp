@@ -35,7 +35,6 @@ static inline float jitter_u_cpu(gai::i64 tt, int ee) {
 namespace gai {
 namespace cpu {
 
-float jitter_u_for_test(i64 tt, int ee) { return jitter_u_cpu(tt, ee); }
 }
 }
 
@@ -104,6 +103,14 @@ inline void topk_pick(const float* p, int ne, int K, i32* idx, float* w) {
     }
 }
 
+}
+
+void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
+
+    for (i64 s = 0; s < NK; ++s) {
+        const int e = idx[s];
+        if (e >= 0 && e < ne) acc[e] += 1.0f;
+    }
 }
 
 void moe_forward(const float* x, const float* router_w,
@@ -415,32 +422,6 @@ void moe_pack_all(const float* x, const i32* grouped, float* out,
     }
 }
 
-void moe_gather3_all(const float* s_gate, const float* s_up, const float* s_act,
-                     const i32* grouped, float* G, float* U, float* A,
-                     i64 NK, int E) {
-
-    for (i64 s = 0; s < NK; ++s) {
-        const i64 slot = grouped[s];
-        std::memcpy(G + s * E, s_gate + slot * E, sizeof(float) * static_cast<size_t>(E));
-        std::memcpy(U + s * E, s_up + slot * E, sizeof(float) * static_cast<size_t>(E));
-        std::memcpy(A + s * E, s_act + slot * E, sizeof(float) * static_cast<size_t>(E));
-    }
-}
-
-void moe_scale_all(const float* dout, const float* w, const i32* grouped,
-                   float* S, i64 NK, int d, int K) {
-
-    for (i64 s = 0; s < NK; ++s) {
-        const i64 slot = grouped[s];
-        const i64 t = slot / K;
-        const i64 k = slot % K;
-        const float wv = w ? w[t * K + k] : 1.0f;
-        const float* r = dout + t * d;
-        float* o = S + s * d;
-        for (int j = 0; j < d; ++j) o[j] = r[j] * wv;
-    }
-}
-
 void moe_save3_all(const float* G, const float* U, const float* A,
                    const i32* grouped, float* s_gate, float* s_up, float* s_act,
                    i64 NK, int E) {
@@ -465,115 +446,6 @@ void moe_scatter_add_all(float* out, const float* Y, const i32* grouped,
         const float* r = Y + s * d;
         for (int j = 0; j < d; ++j) o[j] += wv * r[j];
     }
-}
-
-void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
-
-    for (i64 s = 0; s < NK; ++s) {
-        const int e = idx[s];
-        if (e >= 0 && e < ne) acc[e] += 1.0f;
-    }
-}
-
-void moe_forward_fused(const float* x, const float* router_w,
-                       const float* gates, const float* ups, const float* downs,
-                       const float* sh_g, const float* sh_u, const float* sh_d,
-                       float* out,
-                       float* probs_cache, i32* idx_cache, float* w_cache,
-                       float* s_gate, float* s_up, float* s_act,
-                       float* Xpack, float* Gpack, float* Upack, float* Apack,
-                       float* Ypack, i32* grouped, int* counts, int* offsets,
-                       i64 N, int d, int E, int ne, int K, int SH) {
-    if (N <= 0) return;
-    GAI_CHECK(K >= 1 && K <= 8, "moe_forward_fused: K must be in [1,8]");
-    GAI_CHECK(ne > 0 && ne <= 64, "moe_forward_fused: ne out of range");
-    const i64 NK = N * K;
-
-    {
-        FwdScratch sc;
-        sc.ensure(ne, E, d, SH);
-        for (i64 t = 0; t < N; ++t) {
-            const float* xt = x + t * d;
-            for (int e = 0; e < ne; ++e)
-                sc.logits[e] = dot_row(xt, router_w + (size_t)e * d, d);
-            {
-                float jj = g_jitter_cpu.load(std::memory_order_relaxed);
-                if (jj > 0.0f && probs_cache) {
-                    for (int e = 0; e < ne; ++e)
-                        sc.logits[e] *= (1.0f + jj * 2.0f * jitter_u_cpu(t, e));
-                }
-            }
-            softmax_row(sc.logits.data(), ne);
-            i32 t_idx[8];
-            float t_w[8];
-            topk_pick(sc.logits.data(), ne, K, t_idx, t_w);
-            float sum_w = 0.0f;
-            for (int k = 0; k < K; ++k) sum_w += t_w[k];
-            float inv_w = sum_w > 1e-8f ? (1.0f / sum_w) : 0.0f;
-            for (int k = 0; k < K; ++k) t_w[k] *= inv_w;
-            if (probs_cache) std::memcpy(probs_cache + t * ne, sc.logits.data(),
-                                         sizeof(float) * (size_t)ne);
-            if (idx_cache) std::memcpy(idx_cache + t * K, t_idx, sizeof(i32) * (size_t)K);
-            if (w_cache) std::memcpy(w_cache + t * K, t_w, sizeof(float) * (size_t)K);
-        }
-    }
-
-    const i32* idx_use = idx_cache ? idx_cache : nullptr;
-    const float* w_use = w_cache ? w_cache : nullptr;
-
-    GAI_CHECK(idx_use != nullptr && w_use != nullptr,
-              "moe_forward_fused requires idx/w caches (training/inference always pass them)");
-
-    if (sh_g && sh_u && sh_d) {
-        // The shared expert has its own width (SH), not the routed width E
-        // (Granite-4: 1024 vs 512).
-        std::vector<float> g(static_cast<size_t>(N) * SH), u(static_cast<size_t>(N) * SH),
-            a(static_cast<size_t>(N) * SH);
-        for (i64 t = 0; t < N; ++t) {
-            linear_forward(x + t * d, sh_g, g.data() + t * SH, 1, d, SH);
-            linear_forward(x + t * d, sh_u, u.data() + t * SH, 1, d, SH);
-        }
-        swiglu_forward(g.data(), u.data(), a.data(), N * SH);
-        for (i64 t = 0; t < N; ++t)
-            linear_forward(a.data() + t * SH, sh_d, out + t * d, 1, SH, d);
-    } else {
-        for (i64 t = 0; t < N; ++t)
-            std::fill(out + t * d, out + t * d + d, 0.0f);
-    }
-
-    moe_group_slots(idx_use, N, K, ne, grouped, counts, offsets);
-
-    moe_pack_all(x, grouped, Xpack, NK, d, K);
-
-    for (int e = 0; e < ne; ++e) {
-        const int ns = counts[e];
-        if (ns == 0) continue;
-        const float* ge = gates + (size_t)e * E * d;
-        const float* ue = ups   + (size_t)e * E * d;
-        float* Gp = Gpack + (size_t)offsets[e] * E;
-        float* Up = Upack + (size_t)offsets[e] * E;
-        const float* Xp = Xpack + (size_t)offsets[e] * d;
-        for (int s = 0; s < ns; ++s) {
-            linear_forward(Xp + (size_t)s * d, ge, Gp + (size_t)s * E, 1, d, E);
-            linear_forward(Xp + (size_t)s * d, ue, Up + (size_t)s * E, 1, d, E);
-        }
-    }
-
-    swiglu_forward(Gpack, Upack, Apack, NK * E);
-
-    moe_save3_all(Gpack, Upack, Apack, grouped, s_gate, s_up, s_act, NK, E);
-
-    for (int e = 0; e < ne; ++e) {
-        const int ns = counts[e];
-        if (ns == 0) continue;
-        const float* de = downs + (size_t)e * d * E;
-        const float* Ap = Apack + (size_t)offsets[e] * E;
-        float* Yp = Ypack + (size_t)offsets[e] * d;
-        for (int s = 0; s < ns; ++s)
-            linear_forward(Ap + (size_t)s * E, de, Yp + (size_t)s * d, 1, E, d);
-    }
-
-    moe_scatter_add_all(out, Ypack, grouped, w_use, NK, d, K);
 }
 
 }

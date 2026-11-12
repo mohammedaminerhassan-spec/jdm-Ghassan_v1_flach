@@ -1,5 +1,22 @@
 #pragma once
 
+// The CPU kernels. They are split per family, and every declaration below
+// names the file that implements it:
+//
+//   core/ops_cpu_dense.cpp    the shared primitives (the GEMM, the linear
+//                             ops, the elementwise ops, the embedding, the
+//                             norms, the RoPE, the SwiGLU), the loss, the
+//                             optimizer steps and the sampler helpers
+//   core/ops_cpu_attention.cpp the attention family (the prefill, the
+//                             backward, the incremental decode)
+//   core/ops_cpu_moe.cpp      the mixture of experts (the routing, the expert
+//                             GEMMs, the shared expert)
+//   core/ops_cpu_mamba.cpp    the IBM Granite Mamba-2 layer
+//   core/ops_cpu_simd.h       the AVX2/FMA helpers shared by the above
+//
+// The dense and the MoE models share the primitives: a "dense" model is the
+// same code path with the MoE block replaced by a plain MLP.
+
 #include "core/common.h"
 #include "core/dtype.h"
 #include <vector>
@@ -7,6 +24,8 @@
 
 namespace gai {
 namespace cpu {
+
+// ---- the GEMM and the linear ops (ops_cpu_dense.cpp)
 
 void gemm(bool trans_a, bool trans_b, int M, int N, int K,
           float alpha, const float* A, int lda, const float* B, int ldb,
@@ -18,21 +37,29 @@ void split_qkv(const float* qkv, float* q, float* k, float* v, i64 n, int qd, in
 void linear_backward(const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N);
 
+// ---- the elementwise ops (ops_cpu_dense.cpp)
+
 void add(const float* a, const float* b, float* out, i64 n);
 void add_inplace(float* a, const float* b, i64 n);
 void add_bias(const float* b, float* y, i64 rows, int cols);
 void bias_backward(const float* dy, float* db, i64 rows, int cols);
 void scale_inplace(float* a, float s, i64 n);
 
+// ---- the embedding (ops_cpu_dense.cpp)
+
 void embedding_forward(const i32* ids, const float* table, float* out,
                        i64 ntok, int dim, int vocab);
 void embedding_backward(const i32* ids, const float* dout, float* dtable,
                         i64 ntok, int dim, int vocab);
 
+// ---- the norms (ops_cpu_dense.cpp)
+
 void rmsnorm_forward(const float* x, const float* weight, float* out, float* rrms,
                      i64 rows, int dim, float eps);
 void rmsnorm_backward(const float* x, const float* weight, const float* dout,
                       const float* rrms, float* dx, float* dweight, i64 rows, int dim);
+
+// ---- the RoPE (ops_cpu_dense.cpp)
 
 void rope_forward(float* q, float* k, const i32* pos,
                   i64 ntok, int n_heads, int n_kv, int head_dim, float theta);
@@ -50,9 +77,13 @@ void rope_forward_cached(float* q, float* k, const i32* pos, const float* inv_fr
 void rope_backward_cached(float* dq, float* dk, const i32* pos, const float* inv_freq,
                           i64 ntok, int n_heads, int n_kv, int head_dim, int rope_type);
 
+// ---- the SwiGLU (the dense FFN and the expert FFN) (ops_cpu_dense.cpp)
+
 void swiglu_forward(const float* g, const float* u, float* out, i64 n);
 void swiglu_backward(const float* g, const float* u, const float* dout,
                      float* dg, float* du, i64 n);
+
+// ---- the mixture of experts (ops_cpu_moe.cpp)
 
 void moe_forward(const float* x, const float* router_w,
                  const float* gates, const float* ups, const float* downs,
@@ -88,13 +119,6 @@ void moe_group_slots(const i32* idx, i64 N, int K, int ne,
 void moe_pack_all(const float* x, const i32* grouped, float* out,
                   i64 NK, int d, int K);
 
-void moe_gather3_all(const float* s_gate, const float* s_up, const float* s_act,
-                     const i32* grouped, float* G, float* U, float* A,
-                     i64 NK, int E);
-
-void moe_scale_all(const float* dout, const float* w, const i32* grouped,
-                   float* S, i64 NK, int d, int K);
-
 void moe_save3_all(const float* G, const float* U, const float* A,
                    const i32* grouped, float* s_gate, float* s_up, float* s_act,
                    i64 NK, int E);
@@ -104,17 +128,13 @@ void moe_scatter_add_all(float* out, const float* Y, const i32* grouped,
 
 void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne);
 
-void moe_forward_fused(const float* x, const float* router_w,
-                       const float* gates, const float* ups, const float* downs,
-                       const float* sh_g, const float* sh_u, const float* sh_d,
-                       float* out,
-                       float* probs_cache, i32* idx_cache, float* w_cache,
-                       float* s_gate, float* s_up, float* s_act,
-                       float* Xpack, float* Gpack, float* Upack, float* Apack,
-                       float* Ypack, i32* grouped, int* counts, int* offsets,
-                       i64 N, int d, int E, int ne, int K, int SH);
+void set_moe_jitter_cpu(float j);
+void set_moe_jitter_seed_cpu(u64 seed);
 
-// IBM Granite-4.0: one Mamba-2 layer over a whole sequence.
+void softmax_row(float* x, int n);
+
+// ---- the IBM Granite Mamba-2 layer (ops_cpu_mamba.cpp)
+//
 //   x      [B, T, d]        the layer input
 //   w_in   [proj_size, d]   in_proj weight
 //   conv_w [conv_dim, k]    depthwise conv weight
@@ -137,6 +157,8 @@ void mamba2_forward(const float* x,
                     float* out,
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                     int d_head, int d_state, int k, float eps);
+
+// ---- the attention (ops_cpu_attention.cpp)
 
 void attention_forward(const float* q, const float* k, const float* v,
                        float* out, float* probs,
@@ -170,6 +192,8 @@ void attention_decode_ring_fp16(const float* q, const u16* kcache, const u16* vc
                                 int pinned_prefix, int cur_len, int cache_max,
                                 float scale, float* scratch, int window);
 
+// ---- the loss (ops_cpu_dense.cpp)
+
 void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogits,
                            i64 n, int V, double* out_loss_sum, i64* out_count,
                            float z_scale = 0.0f);
@@ -178,6 +202,8 @@ void sce_acc_begin();
 void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
                     i64 n, int V, float z_scale = 0.0f);
 void sce_acc_end(double* out_loss_sum, i64* out_count);
+
+// ---- the optimizer steps (ops_cpu_dense.cpp)
 
 void adamw_step(float* w, const float* g, float* m, float* v, i64 n,
                 float lr, float beta1, float beta2, float eps, float weight_decay,
@@ -191,12 +217,7 @@ double global_sq_norm(const float* g, i64 n);
 
 double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& parts);
 
-void set_moe_jitter_cpu(float j);
-void set_moe_jitter_seed_cpu(u64 seed);
-
-float jitter_u_for_test(i64 token, int expert);
-
-void softmax_row(float* x, int n);
+// ---- the sampler helpers (ops_cpu_dense.cpp)
 
 void topk_select(const float* logits, int V, int K, float* out_vals, i32* out_ids);
 
