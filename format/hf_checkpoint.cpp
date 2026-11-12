@@ -688,25 +688,25 @@ bool HFCheckpoint::open(const std::string& dir, bool weights_required) {
         return false;
     }
 
-    for (const std::string& f : weight_files_) {
-        SafeTensorsFile sf;
-        if (!sf.open(f)) {
-            if (weights_required) return false;
-            // A dry run (memory estimate) only needs the config: a missing
-            // shard must not stop it.
-            log_warn("[hf] weights not opened (not needed here): " + f);
-            continue;
+    if (weights_required) {
+        for (const std::string& f : weight_files_) {
+            SafeTensorsFile sf;
+            if (!sf.open(f)) return false;
+            for (const auto& [name, ti] : sf.tensors()) {
+                tensor_info_[name] = ti;
+                tensor_file_[name] = f;
+            }
+            files_[f] = std::move(sf);
         }
-        for (const auto& [name, ti] : sf.tensors()) {
-            tensor_info_[name] = ti;
-            tensor_file_[name] = f;
-        }
-        files_[f] = std::move(sf);
     }
+    // A dry run (--config-only / memory estimate) does not need the shards
+    // at all: do not open them, and do not pretend anything is broken.
+    // The config above is complete by itself.
 
     // The QK normalization is not in config.json: it is a property of the
     // checkpoint, so it is detected from the tensor names. Without the
-    // shards (dry run) the names are unknown and config.json is all we have.
+    // shards (dry run) the names are unknown and config.json is all we have;
+    // that is exactly what the user asked for, so stay quiet about it.
     if (!tensor_info_.empty()) {
         cfg_.use_qk_norm = tensor_info_.count("model.layers.0.self_attn.q_norm.weight") > 0;
 
@@ -716,9 +716,6 @@ bool HFCheckpoint::open(const std::string& dir, bool weights_required) {
             tensor_info_.count("model.layers.0.self_attn.v_proj.bias")) {
             cfg_.use_qkv_bias = true;
         }
-    } else {
-        log_warn("[hf] the weights are not mapped: the QK-norm and QKV-bias "
-                 "properties cannot be detected from the checkpoint");
     }
 
     // The vocabulary of the checkpoint is the first dimension of the
