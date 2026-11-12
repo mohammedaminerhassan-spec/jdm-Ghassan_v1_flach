@@ -36,6 +36,7 @@ static void usage() {
     "  ghassan-ai generate   --model <hf-dir|model.gguf> --prompt \"hello\"\n"
     "  ghassan-ai info       --model <model.gguf|hf-dir>\n"
     "  ghassan-ai quantize   --model <hf-dir|model.gguf> --out out.gguf [--profile q8_k|q4_0]\n"
+    "                         [--model-name \"Ghassan v1 Flash\"] [--compat native|llama|llama_moe]\n"
     "  ghassan-ai bench      --model <model.gguf|hf-dir> [--tokens 64]\n"
     "  ghassan-ai tokenize   --model <hf-dir|model.gguf> --text \"salam\"\n"
     "                          [--ids \"1 2 3\"]  decode an explicit token sequence\n"
@@ -302,15 +303,21 @@ static int cmd_quantize(const Args& args) {
 
     log_info(strfmt("[quant] %s -> %s   profile=%s (GGUF, 8-bit max)", in.c_str(), out.c_str(), prof.c_str()));
 
+    // The --model-name flag is honored by --compat exports; wire it up here
+    // too, or the artifact ships under the auto-generated label instead of
+    // the one the user asked for.
+    std::map<std::string, std::string> meta;
+    if (args.has("model-name")) meta["model_name"] = args.str("model-name");
+
     const ExportProfileGGUF profile = gguf_profile_for(prof);
     if (have_embedded) {
-        export_model_gguf(out, model, embedded_tok, profile, {}, args.str("compat", "native"));
+        export_model_gguf(out, model, embedded_tok, profile, meta, args.str("compat", "native"));
     } else {
         Tokenizer tk;
         std::vector<i32> eos_ids;
         GAI_CHECK(load_tokenizer_auto(args.str("tokenizer"), tk, eos_ids),
                   "cannot load tokenizer: " + args.str("tokenizer"));
-        export_model_gguf(out, model, tk, profile, {}, args.str("compat", "native"));
+        export_model_gguf(out, model, tk, profile, meta, args.str("compat", "native"));
     }
     return 0;
 }
