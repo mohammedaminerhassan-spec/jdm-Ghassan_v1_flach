@@ -95,34 +95,49 @@ attention scale (`attention_multiplier`, not `1/sqrt(head_dim)`), the packed
 Granite MoE layout (`block_sparse_moe.input_linear` / `output_linear`) and the
 shared expert with its own width.
 
-`granite_tiny/` is a tiny checkpoint with the **same tensor names and layout**
-as the real model (random weights): it makes the repo testable without the
-13.9 GB of real weights.
+`granite-documentation/granit filles confiques/` holds the **official
+HuggingFace files** of `ibm-granite/granite-4.0-h-tiny` (the config, the
+tokenizer and the tensor index). The weights themselves (13.9 GB, 3 shards) are
+not in the repository: they are attached to the Kaggle notebook as a dataset.
 
 ## Verification
 
-The Granite path is checked against **independent reference implementations**
-(a separate Python implementation of the Mamba-2 and the attention blocks,
-written from the reference modelling code), not only against itself:
+The Granite path is checked three ways, not only against itself:
+
+**1. The official config, parsed by the engine == `transformers`' own parse**
+(29/29 fields: the vocabulary, the layer kinds, the multipliers, the Mamba-2
+geometry, the MoE, the shared expert width, NoPE).
+
+**2. The official tensor index.** The real safetensors headers (fetched from
+HuggingFace with a range request, without downloading 13.9 GB) hold **586
+tensors** and **6,939,037,248 parameters**; the engine expects exactly the
+same names and the same byte layouts, including the 3-D packed MoE experts
+(`[64, 1024, 1536]` and `[64, 1536, 512]`).
+
+**3. The forward pass, against independent reference implementations** (a
+separate implementation of the Mamba-2 and the attention blocks, written from
+the reference modelling code):
 
 * the Mamba-2 block (conv1d + selective scan + gated norm) matches to ~1e-8
 * the attention block (GQA + NoPE + the attention multiplier + the causal
   mask) matches to ~1e-7
+* the **complete multi-layer Granite forward** (Mamba-2 + attention + the MoE
+  + the shared expert + the multipliers) matches to ~4.6e-7
 * the decode path (the KV cache + the Mamba-2 recurrent state) reproduces the
   full-prefill greedy continuation
 * the LoRA path: init -> train -> checkpoint -> restore -> merge -> export
 * the GGUF round trip, the chat template (byte-exact against
   `transformers.apply_chat_template`) and the tokenizer
 
-## Memory (Granite-4.0-H-Tiny, 6.54 B parameters)
+## Memory (Granite-4.0-H-Tiny, 6.939 B parameters)
 
 | block | size |
 |---|---|
-| weights, fp32 masters | 24.38 GiB |
-| weights, fp16 (what a GGUF holds) | 12.19 GiB |
-| fp16 weight cache (on top of the masters) | 12.48 GiB |
+| weights, fp32 masters | **25.85 GiB** |
+| weights, fp16 (what a GGUF holds) | 12.92 GiB |
+| fp16 weight cache (on top of the masters) | 12.95 GiB |
 | mamba-2 recurrent state | 55 MiB |
-| KV cache, fp16, @131072 ctx | 1.00 GiB |
+| KV cache, fp16, @131072 ctx | 1.00 GiB (only the 4 attention layers keep one) |
 
 A single 16 GB T4 cannot hold the fp32 masters: the engine says so up front
 instead of dying inside `cudaMalloc`. The **fp16 weight storage mode** (no fp32
@@ -130,8 +145,21 @@ masters) is the next step to run Granite on a T4.
 
 ## Documentation
 
-* `GRANITE.md` — the architecture, the memory budget and the Kaggle runbook
-* `CONTEXT.md` — the project state, the decisions and the known gaps
+`granite-documentation/` holds the project documentation (the architecture
+notes, the adaptation plan, the state of the project and the official
+HuggingFace files of the checkpoint).
+
+The Kaggle runbook is a single cell:
+
+```bash
+!bash "kaggle configue/kaggle_granite_run.sh"
+```
+
+The verification suite (the reference implementations, the fixture generators
+and the comparisons against `transformers` and against the real safetensors
+headers) lives outside the repository, in
+`C:\Users\Ghassan PC\Documents\ghassan-verify\` — the engine itself stays
+C++ only.
 
 ## License
 

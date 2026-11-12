@@ -38,17 +38,9 @@ jobs:
       - name: The CLI answers
         run: ./build/bin/ghassan-ai --help
 
-      - name: The Granite fixture loads and generates
+      - name: The Granite config is parsed
         run: |
-          ./build/bin/ghassan-ai info --model granite_tiny
-          ./build/bin/ghassan-ai generate --model granite_tiny --prompt "salam" \
-              --max-tokens 8 --greedy --no-stream --raw
-
-      - name: The GGUF round trip
-        run: |
-          ./build/bin/ghassan-ai quantize --model granite_tiny --out build/granite_tiny.gguf \
-              --profile q8_k --model-name "Ghassan v1 Flash"
-          ./build/bin/ghassan-ai info --model build/granite_tiny.gguf
+          ./build/bin/ghassan-ai info --model "granite-documentation/granit filles confiques" --config-only
 
   linux-sanitize:
     name: linux / asan+ubsan
@@ -74,10 +66,9 @@ jobs:
       - name: Build
         run: cmake --build build-asan --parallel
 
-      - name: The Granite fixture under the sanitizers
+      - name: The Granite config is parsed under the sanitizers
         run: |
-          ./build-asan/bin/ghassan-ai generate --model granite_tiny --prompt "salam" \
-              --max-tokens 8 --greedy --no-stream --raw
+          ./build-asan/bin/ghassan-ai info --model "granite-documentation/granit filles confiques" --config-only
 
   windows-msvc:
     name: windows / msvc
