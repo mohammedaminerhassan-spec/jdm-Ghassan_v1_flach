@@ -8,10 +8,6 @@
 
 namespace gai {
 
-// NOTE: device_name() is declared in core/tensor.h (where Device lives) and
-// defined once in core/tensor.cpp. It is NOT redeclared here to avoid a
-// duplicate declaration across headers.
-bool        is_gpu(Device d);
 
 struct DeviceInfo {
     bool        cuda_available = false;
@@ -45,7 +41,6 @@ void* device_alloc(size_t nbytes, Device dev, DType dt = DType::F32);
 void  device_free(void* ptr, Device dev);
 void  device_memset_zero(void* ptr, size_t nbytes, Device dev);
 void  device_copy(void* dst, Device dst_dev, const void* src, Device src_dev, size_t nbytes);
-void  device_synchronize(Device dev);
 
 void  device_stage_f32_2d(const void* src, Device src_dev, i64 rows, i64 cols,
                           std::vector<float>& out, size_t block_bytes = (4u << 20));

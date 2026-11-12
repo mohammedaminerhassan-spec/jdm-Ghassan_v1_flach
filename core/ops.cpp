@@ -56,8 +56,6 @@ void set_moe_jitter_seed(u64 s) {
     cuda_ops::set_moe_jitter_seed(s);
 #endif
 }
-u64 moe_jitter_seed() { return g_jitter_seed.load(std::memory_order_relaxed); }
-
 void set_gemm_fp16(bool on) {
     g_gemm_fp16.store(on, std::memory_order_relaxed);
 #ifdef GAI_CUDA
@@ -202,24 +200,6 @@ PerfCounters perf_counters() {
     c.muon_ns_iters   = g_perf_muon_ns_iters.load(std::memory_order_relaxed);
     c.muon_ns_us      = g_perf_muon_ns_us.load(std::memory_order_relaxed);
     return c;
-}
-void perf_reset() {
-    g_perf_gemm.store(0, std::memory_order_relaxed);
-    g_perf_fp16.store(0, std::memory_order_relaxed);
-    g_perf_h2d.store(0, std::memory_order_relaxed);
-    g_perf_d2h.store(0, std::memory_order_relaxed);
-    g_perf_moe_fwd.store(0, std::memory_order_relaxed);
-    g_perf_moe_fwd_us.store(0, std::memory_order_relaxed);
-    g_perf_moe_bwd.store(0, std::memory_order_relaxed);
-    g_perf_moe_bwd_us.store(0, std::memory_order_relaxed);
-    g_perf_sce.store(0, std::memory_order_relaxed);
-    g_perf_sce_us.store(0, std::memory_order_relaxed);
-    g_perf_sync.store(0, std::memory_order_relaxed);
-    g_perf_opt.store(0, std::memory_order_relaxed);
-    g_perf_opt_us.store(0, std::memory_order_relaxed);
-    g_perf_muon_ns.store(0, std::memory_order_relaxed);
-    g_perf_muon_ns_iters.store(0, std::memory_order_relaxed);
-    g_perf_muon_ns_us.store(0, std::memory_order_relaxed);
 }
 std::string perf_report() {
     PerfCounters c = perf_counters();

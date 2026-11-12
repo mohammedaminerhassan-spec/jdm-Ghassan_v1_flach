@@ -27,8 +27,6 @@
 namespace gai {
 namespace fs = std::filesystem;
 
-bool is_gpu(Device d) { return d == Device::CUDA; }
-
 namespace {
 
 struct FileId {
@@ -340,17 +338,6 @@ void device_stage_f32_2d(const void* src, Device src_dev, i64 rows, i64 cols,
                     base + static_cast<size_t>(r) * row_bytes, src_dev,
                     static_cast<size_t>(n) * row_bytes);
     }
-}
-
-void device_synchronize(Device dev) {
-#ifdef GAI_CUDA
-    if (dev == Device::CUDA) {
-        cuda::synchronize();
-        ops::perf_note_sync();
-    }
-#else
-    (void)dev;
-#endif
 }
 
 }

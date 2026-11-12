@@ -32,10 +32,6 @@ DType dtype_from_name(const std::string& s) {
     GAI_FAIL("unknown dtype: " + s);
 }
 
-bool dtype_is_quantized(DType t) {
-    return t == DType::Q8_0 || t == DType::Q4_0 || t == DType::Q4_1;
-}
-
 int dtype_block_size(DType t) {
     switch (t) {
         case DType::Q8_0: return Q8_BLOCK;

@@ -54,7 +54,6 @@ static_assert(sizeof(BlockQ4_1) == 4 + Q4_BLOCK / 2, "BlockQ4_1 layout");
 
 const char* dtype_name(DType t);
 DType       dtype_from_name(const std::string& s);
-bool        dtype_is_quantized(DType t);
 int         dtype_block_size(DType t);
 size_t      dtype_block_bytes(DType t);
 size_t      dtype_nbytes(DType t, size_t numel);

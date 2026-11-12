@@ -291,6 +291,20 @@ static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems
     }
 }
 
+// The backward staging pool (the fp16 mirror, the expanded dk/dv and the
+// dS/dP buffer). It is reused across the steps, so it is not a per-step
+// leak, but it must be released with the other workspaces: otherwise a
+// process that trains and exits keeps its VRAM allocated (and a server that
+// reloads a bigger model holds both the old and the new pool).
+void attn_free_pool() {
+    if (g_attn_mir) { CU_CHECK2(cudaFree(g_attn_mir)); g_attn_mir = nullptr; }
+    g_attn_mir_cap = 0;
+    if (g_attn_exp) { CU_CHECK2(cudaFree(g_attn_exp)); g_attn_exp = nullptr; }
+    g_attn_exp_cap = 0;
+    if (g_attn_dsb) { CU_CHECK2(cudaFree(g_attn_dsb)); g_attn_dsb = nullptr; }
+    g_attn_dsb_cap = 0;
+}
+
 __global__ void k_attn_cvt_flat(const float* __restrict__ src, __half* __restrict__ dst, i64 n) {
     i64 i = (i64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __float2half(src[i]);

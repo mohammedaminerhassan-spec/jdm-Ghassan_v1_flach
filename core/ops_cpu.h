@@ -113,18 +113,9 @@ void moe_backward(const float* x, const float* router_w,
                   float* s_dact,
                   i64 N, int d, int E, int ne, int K, int SH);
 
-void moe_group_slots(const i32* idx, i64 N, int K, int ne,
-                     i32* grouped, int* counts, int* offsets);
 
-void moe_pack_all(const float* x, const i32* grouped, float* out,
-                  i64 NK, int d, int K);
 
-void moe_save3_all(const float* G, const float* U, const float* A,
-                   const i32* grouped, float* s_gate, float* s_up, float* s_act,
-                   i64 NK, int E);
 
-void moe_scatter_add_all(float* out, const float* Y, const i32* grouped,
-                         const float* w, i64 NK, int d, int K);
 
 void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne);
 

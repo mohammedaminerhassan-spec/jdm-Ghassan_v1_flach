@@ -37,7 +37,6 @@ struct PerfCounters {
     u64 muon_ns_us      = 0;
 };
 PerfCounters perf_counters();
-void         perf_reset();
 std::string  perf_report();
 
 void perf_note_fp16_gemm();
@@ -65,7 +64,6 @@ void set_moe_jitter(float j);
 float moe_jitter();
 
 void set_moe_jitter_seed(u64 seed);
-u64 moe_jitter_seed();
 
 void gemm(Device dev,
           bool trans_a, bool trans_b,

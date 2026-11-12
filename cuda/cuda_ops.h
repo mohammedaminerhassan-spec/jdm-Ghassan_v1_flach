@@ -199,6 +199,10 @@ void phase_reset();
 void phase_shutdown();
 std::string phase_report();
 void  reserve_workspaces(size_t gemm_bytes, size_t moe_bytes);
+
+// Releases the cached workspaces (the GEMM pool, the MoE pool, the attention
+// backward staging pool and the Mamba-2 scratch). Called at shutdown.
+void  free_workspaces();
 void  moe_reserve_workspace(size_t bytes);
 
 size_t pool_bytes();
