@@ -1,12 +1,21 @@
 # Ghassan v1 Flash — a from-scratch LLM engine (C++20 / CUDA)
 
-The **body**: a self-contained inference + training engine, no external
-libraries, no Python, no PyTorch. The **mind**: the weights, which come
-straight from a HuggingFace safetensors checkpoint.
+**The body**: a self-contained inference + training engine — no external
+libraries, **no Python, no PyTorch**. **The mind**: the weights, straight from
+a HuggingFace safetensors checkpoint.
 
-The engine runs **IBM Granite-4.0-H-Tiny** (`GraniteMoeHybridForCausalLM`: a
-hybrid Mamba-2 + GQA + MoE model) directly from its safetensors, and exports a
-self-contained **GGUF** named *Ghassan v1 Flash*.
+It **runs, trains and exports**:
+
+- **IBM Granite-4.0-H-Tiny** (`GraniteMoeHybridForCausalLM`: a hybrid
+  **Mamba-2 + GQA + MoE** model, 6.939 B parameters) directly from its
+  safetensors — the multipliers, the NoPE path, the attention scale and the
+  packed MoE layout are implemented exactly, and verified against
+  `transformers` and against the real safetensors headers.
+- a **self-contained GGUF** named *Ghassan v1 Flash* (Q4_0 / Q8_0 / fp16),
+  self-contained: the vocabulary, the merges and the chat template are
+  embedded.
+- **LoRA fine-tuning** from a dense model (init -> train -> checkpoint ->
+  restore -> merge -> export), with AdamW / Lion / Muon and a DDP trainer.
 
 ```
 core/        tensors · dtypes · device (CPU/CUDA) · ops · mmap · RNG · unicode · JSON
@@ -19,6 +28,14 @@ evaluation/  perplexity
 cuda/        attention · MoE · Mamba-2 kernels (sm_75 / T4 and up)
 training/    trainer · AdamW / Lion / Muon · LoRA · dataloader · checkpoint
 tools/       ghassan-ai (serve/inspect/export) · gai_train
+```
+
+```bash
+ghassan-ai info     --model <hf-dir|model.gguf>
+ghassan-ai generate --model <hf-dir> --prompt "hi" --max-tokens 64
+ghassan-ai quantize --model <hf-dir> --out ghassan-v1-flash.gguf \
+    --profile q8_k --model-name "Ghassan v1 Flash"
+gai_train --config <recipe.yaml>
 ```
 
 ### The CPU kernels
