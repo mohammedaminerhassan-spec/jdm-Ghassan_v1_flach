@@ -510,6 +510,8 @@ void GGUFWriter::write() {
         uint64_t pad_to = align_up(cur, 32);
         for (uint64_t i = cur; i < pad_to; ++i) f.put('\0');
 
+        log_info(strfmt("[gguf] quantizing %zu tensors to the target dtypes...",
+                        tdata.size()));
         for (size_t ti = 0; ti < tdata.size(); ++ti) {
             const auto& td = tdata[ti];
             const Tensor& src = tensors_[ti].second.first;
@@ -524,6 +526,12 @@ void GGUFWriter::write() {
             uint64_t padded = align_up(after, 32);
             for (uint64_t i = after; i < padded; ++i) f.put('\0');
             (void)before;
+            // Progress: a 6.9B export spends minutes inside this loop with no
+            // other output; without a heartbeat the run looks hung.
+            if ((ti + 1) % 64 == 0 || ti + 1 == tdata.size()) {
+                log_info(strfmt("[gguf] quantized %zu/%zu tensors (%s)",
+                                ti + 1, tdata.size(), td.name.c_str()));
+            }
         }
 
         GAI_CHECK(f.good(), "gguf_format: write failed");
