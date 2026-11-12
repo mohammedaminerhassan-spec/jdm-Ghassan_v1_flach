@@ -622,6 +622,45 @@ std::string ModelConfig::summary() const {
     return ss.str();
 }
 
+// The Granite-4.0 specifics, printed by `ghassan-ai info`. They are the
+// fields that decide whether the model computes the same function as
+// HuggingFace: the multipliers, the Mamba-2 geometry, the position
+// embedding and the layer kinds.
+std::string ModelConfig::granite_summary() const {
+    if (arch != ArchGranite) return {};
+    std::ostringstream ss;
+    ss << "  position    : " << (position_embedding == 1 ? "NoPE (no RoPE)" : "RoPE")
+       << "\n  multipliers : embeddings x" << strfmt("%.6g", (double)embedding_multiplier)
+       << " | residual x" << strfmt("%.6g", (double)residual_multiplier)
+       << " | attention x" << strfmt("%.6g", (double)attention_multiplier)
+       << " | logits /" << strfmt("%.6g", (double)logits_scaling)
+       << "\n  mamba-2     : n_heads=" << mamba_n_heads << " d_head=" << mamba_d_head
+       << " d_state=" << mamba_d_state << " groups=" << mamba_n_groups
+       << " conv_k=" << mamba_d_conv << " expand=" << mamba_expand
+       << " chunk=" << mamba_chunk_size
+       << " | d_inner=" << (mamba_expand * hidden_size)
+       << " conv_dim=" << (mamba_expand * hidden_size + 2 * mamba_n_groups * mamba_d_state)
+       << "\n  layer types : ";
+    int n_mamba = 0, n_attn = 0;
+    for (int k : layer_types) (k == 0 ? n_mamba : n_attn)++;
+    ss << n_mamba << " mamba + " << n_attn << " attention";
+    if (n_attn > 0) {
+        ss << " (attention at layers";
+        bool first = true;
+        for (size_t i = 0; i < layer_types.size(); ++i) {
+            if (layer_types[i] != 1) continue;
+            if (!first) ss << ",";
+            first = false;
+            ss << " " << i;
+        }
+        ss << ")";
+    }
+    ss << "\n  shared expert: " << (moe_shared ? strfmt("width %d", shared_width()) : "none")
+       << "\n  routed expert: width " << moe_expert_dim << " | " << num_experts
+       << " experts | top-" << moe_top_k;
+    return ss.str();
+}
+
 float rope_theta_eff(const ModelConfig& m) { return rope_theta_eff_local(m); }
 float rope_mscale(const ModelConfig& m) { return rope_mscale_local(m); }
 
@@ -1605,6 +1644,37 @@ size_t Model::estimate_activation_bytes_for(const ModelConfig& cfg, bool fp16_on
 
 // F-23: mirrors the constructor's alloc_param() list exactly. Cross-checked
 // against Model::num_parameters() by tests/test_memory_plan.cpp.
+// The parameter count must mirror the checkpoint exactly, layer by layer: a
+// Granite hybrid has Mamba-2 layers (no attention weights) and attention
+// layers (no Mamba weights), and the shared expert has its own width (1024 on
+// Granite-4.0, not the routed expert width of 512).
+//
+// The old count assumed every layer had attention weights, never counted the
+// Mamba-2 weights and sized the shared expert with the routed width: it
+// under-reported Granite-4.0-H-Tiny by ~400 M parameters (6.54 B reported vs
+// the 6.939 B of the official index), so the memory plan and the OOM guards
+// were optimistic.
+static u64 mamba_layer_parameters(const ModelConfig& cfg) {
+    const u64 d      = static_cast<u64>(cfg.hidden_size);
+    const u64 d_inner = static_cast<u64>(cfg.mamba_expand) * d;
+    const u64 conv_dim = d_inner + 2ull * static_cast<u64>(cfg.mamba_n_groups) *
+                                      static_cast<u64>(cfg.mamba_d_state);
+    const u64 n_heads = static_cast<u64>(cfg.mamba_n_heads);
+    const u64 proj    = d_inner + conv_dim + n_heads;
+    const u64 k       = static_cast<u64>(cfg.mamba_d_conv);
+
+    u64 n = 0;
+    n += proj * d;                       // in_proj
+    n += conv_dim * k;                   // conv1d.weight
+    if (cfg.mamba_conv_bias) n += conv_dim;
+    n += n_heads;                        // dt_bias
+    n += n_heads;                        // A_log
+    n += n_heads;                        // D
+    n += d_inner;                        // norm.weight
+    n += d * d_inner;                    // out_proj
+    return n;
+}
+
 u64 Model::count_parameters(const ModelConfig& cfg) {
     const u64 d   = static_cast<u64>(cfg.hidden_size);
     const u64 V   = static_cast<u64>(cfg.vocab_size);
@@ -1612,21 +1682,34 @@ u64 Model::count_parameters(const ModelConfig& cfg) {
     const u64 kvd = static_cast<u64>(cfg.kv_dim());
     const u64 F   = static_cast<u64>(cfg.intermediate_size);
     const u64 E   = static_cast<u64>(cfg.moe_expert_dim);
+    const u64 SH  = static_cast<u64>(cfg.shared_width());
     const u64 ne  = static_cast<u64>(cfg.num_experts);
     const u64 L   = static_cast<u64>(cfg.num_layers);
     const u64 hd  = static_cast<u64>(cfg.head_dim());
 
+    // The layer kinds (Granite hybrid): 0 = mamba, 1 = attention. A model
+    // without layer_types is a plain transformer (every layer has attention).
+    auto layer_is_mamba = [&](u64 i) {
+        if (cfg.arch != ModelConfig::ArchGranite) return false;
+        if (i >= static_cast<u64>(cfg.layer_types.size())) return false;
+        return cfg.layer_types[static_cast<size_t>(i)] == 0;
+    };
+
     u64 n = V * d;                                    // tok_embeddings
     for (u64 i = 0; i < L; ++i) {
         n += d;                                      // attn_norm
-        n += qd * d + kvd * d + kvd * d + d * qd;    // wq, wk, wv, wo
         n += d;                                      // ffn_norm
-        if (cfg.use_qk_norm) n += 2 * hd;            // qk_qnorm, qk_knorm
+        if (layer_is_mamba(i)) {
+            n += mamba_layer_parameters(cfg);
+        } else {
+            n += qd * d + kvd * d + kvd * d + d * qd;  // wq, wk, wv, wo
+            if (cfg.use_qk_norm) n += 2 * hd;         // qk_qnorm, qk_knorm
+        }
         if (cfg.use_moe) {
             n += ne * d;                              // moe_router
-            n += ne * E * d + ne * E * d;             // moe_gate, moe_up
+            n += ne * E * d + ne * E * d;              // moe_gate, moe_up
             n += ne * d * E;                          // moe_down
-            if (cfg.moe_shared) n += E * d + E * d + d * E;
+            if (cfg.moe_shared) n += SH * d + SH * d + d * SH;
         } else {
             n += F * d + F * d + d * F;               // w_gate, w_up, w_down
         }
@@ -1646,26 +1729,45 @@ size_t Model::count_fp16_cache_bytes(const ModelConfig& cfg) {
     const u64 kvd = static_cast<u64>(cfg.kv_dim());
     const u64 F   = static_cast<u64>(cfg.intermediate_size);
     const u64 E   = static_cast<u64>(cfg.moe_expert_dim);
+    const u64 SH  = static_cast<u64>(cfg.shared_width());
     const u64 ne  = static_cast<u64>(cfg.num_experts);
     const u64 L   = static_cast<u64>(cfg.num_layers);
 
+    auto layer_is_mamba = [&](u64 i) {
+        if (cfg.arch != ModelConfig::ArchGranite) return false;
+        if (i >= static_cast<u64>(cfg.layer_types.size())) return false;
+        return cfg.layer_types[static_cast<size_t>(i)] == 0;
+    };
+
     // 2-D parameters (fp16_cache is allocated for shape.size() == 2 only).
     u64 n2 = 0;
+    u64 fused = 0;
     n2 += V * d;                                              // tok_embeddings
     for (u64 i = 0; i < L; ++i) {
-        n2 += qd * d + kvd * d + kvd * d + d * qd;           // wq, wk, wv, wo
+        if (layer_is_mamba(i)) {
+            // in_proj, out_proj, conv1d.weight (the 1-D ones have no cache)
+            const u64 d_inner = static_cast<u64>(cfg.mamba_expand) * d;
+            const u64 conv_dim = d_inner + 2ull * static_cast<u64>(cfg.mamba_n_groups) *
+                                          static_cast<u64>(cfg.mamba_d_state);
+            const u64 proj = d_inner + conv_dim + static_cast<u64>(cfg.mamba_n_heads);
+            n2 += proj * d;                                   // in_proj
+            n2 += conv_dim * static_cast<u64>(cfg.mamba_d_conv);
+            n2 += d * d_inner;                                // out_proj
+        } else {
+            n2 += qd * d + kvd * d + kvd * d + d * qd;         // wq, wk, wv, wo
+            // the per-layer fused QKV cache: [qd + 2*kvd, d]
+            fused += (qd + 2 * kvd) * d;
+        }
         if (cfg.use_moe) {
-            n2 += ne * d;                                    // router
-            n2 += ne * E * d + ne * E * d;                   // moe_gate, moe_up
-            n2 += ne * d * E;                                // moe_down
-            if (cfg.moe_shared) n2 += E * d + E * d + d * E;
+            n2 += ne * d;                                      // router
+            n2 += ne * E * d + ne * E * d;                     // moe_gate, moe_up
+            n2 += ne * d * E;                                  // moe_down
+            if (cfg.moe_shared) n2 += SH * d + SH * d + d * SH;
         } else {
             n2 += F * d + F * d + d * F;
         }
     }
     if (!cfg.tie_embeddings) n2 += V * d;                    // lm_head
-    // per-layer fused QKV cache: [qd + 2*kvd, d]
-    const u64 fused = L * (qd + 2 * kvd) * d;
     return static_cast<size_t>((n2 + fused) * sizeof(u16));
 }
 

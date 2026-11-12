@@ -39,7 +39,7 @@ Mamba-2: d_inner 3072 (expand 2), 48 head, d_head 64, d_state 128, groups 1, con
 MoE: 64 expert, top-6, expert width 512, shared expert width 1024
 multipliers: embeddings x12, residual x0.22, attention x1/128, logits /6
 vocab 100352, tied embeddings, byte-level BPE (digits {1,3})
-6.54B params (6.39B بلا embeddings) — 92% منهم MoE experts
+6.939B params (6.78B بلا embeddings) — 92% منهم MoE experts (العدد الرسمي بالضبط ✓)
 ```
 
 ### التحقق المحلي (CPU، tiny synthetic checkpoint بنفس الـ layout)
@@ -160,15 +160,15 @@ cmake --build build
 
 | block | size |
 |---|---|
-| weights fp32 masters | 24.38 GiB |
-| weights fp16 (اللي كيدخل فـ GGUF) | 12.19 GiB |
-| fp16 weight cache (increase فوق الـ masters) | 12.48 GiB |
+| weights fp32 masters | 25.85 GiB (6.939B params — exact) |
+| weights fp16 (اللي كيدخل فـ GGUF) | 12.92 GiB |
+| fp16 weight cache (increase فوق الـ masters) | 12.95 GiB |
 | mamba-2 states | 55 MiB |
 | KV fp16 @131072 | 1.00 GiB |
 | activations B=1 T=2048 (ckpt) | 7.68 GiB |
-| **full fine-tune (AdamW)** | **119.22 GiB** |
+| **full fine-tune (AdamW)** | **125.58 GiB** |
 
-**⇒ على T4 واحد (16 GB) Granite ما كيدخلش**: الـ masters fp32 وحدهم 24.4 GiB.
+**⇒ على T4 واحد (16 GB) Granite ما كيدخلش**: الـ masters fp32 وحدهم 25.85 GiB.
 الـ export كيمشي (CPU، ~25 GiB ديال RAM)؛ الـ inference على GPU كيتطلب
 **fp16 weight storage** (12.2 GiB).
 

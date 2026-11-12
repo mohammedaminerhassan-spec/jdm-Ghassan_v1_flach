@@ -579,8 +579,12 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
         if (j.has("layer_types") && j.at("layer_types").is_array()) {
             cfg_.layer_types.clear();
             for (const Json& el : j.at("layer_types").elements()) {
+                // The official checkpoint says "mamba" / "attention";
+                // transformers also emits "linear_attention" /
+                // "full_attention" for the same layers.
                 const std::string kind = el.as_string("mamba");
-                cfg_.layer_types.push_back(kind == "attention" ? 1 : 0);
+                const bool attn = (kind == "attention" || kind == "full_attention");
+                cfg_.layer_types.push_back(attn ? 1 : 0);
             }
         }
 

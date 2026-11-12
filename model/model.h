@@ -122,6 +122,9 @@ struct ModelConfig {
     void validate() const;
     static ModelConfig from_config(const Config& c, const std::string& prefix = "model");
     std::string summary() const;
+    // The Granite-4.0 specifics (the multipliers, the Mamba-2 geometry, the
+    // position embedding and the layer kinds). Empty for the other models.
+    std::string granite_summary() const;
 
     std::string arch_identity() const;
     bool same_architecture_as(const ModelConfig& o, std::string* reason = nullptr) const;

@@ -229,15 +229,23 @@ static int cmd_info(const Args& args) {
 
     // HuggingFace checkpoint directory
     if (fs::is_directory(path)) {
+        const bool config_only = args.flag("config-only", false);
         HFCheckpoint hf;
-        GAI_CHECK(hf.open(path), "not a usable HuggingFace checkpoint: " + path);
+        GAI_CHECK(hf.open(path, !config_only),
+                  "not a usable HuggingFace checkpoint: " + path);
         const ModelConfig& c = hf.config();
         std::cout << "\n  dir         : " << path << "\n";
         std::cout << "  format      : HuggingFace safetensors\n";
-        std::cout << "  weights     : " << hf.weight_files().size() << " file(s)\n";
+        std::cout << "  weights     : "
+                  << (config_only ? std::string("(not loaded: --config-only)")
+                                  : strfmt("%zu file(s)", hf.weight_files().size()))
+                  << "\n";
         std::cout << "\n  -- config --\n";
         std::cout << c.summary() << "\n";
-        std::cout << "\n  parameters  : " << human_count(Model::count_parameters(c)) << "\n";
+        const std::string gs = c.granite_summary();
+        if (!gs.empty()) std::cout << "\n  -- granite-4.0 --\n" << gs << "\n";
+        std::cout << "\n  parameters  : " << human_count(Model::count_parameters(c))
+                  << " (" << Model::count_parameters(c) << ")\n";
         std::cout << "  tie_embeddings: " << (c.tie_embeddings ? "yes" : "no") << "\n\n";
         return 0;
     }
