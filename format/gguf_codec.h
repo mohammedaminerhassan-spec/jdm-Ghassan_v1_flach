@@ -114,11 +114,24 @@ public:
     void add_tensor(const std::string& name, const Tensor& t, GGMLType dtype = GGMLType::F16);
     void write();
 
+    // The per-tensor reconstruction error of the file that was just written:
+    // how much of each tensor the chosen precision kept. It is the map from
+    // "the output is wrong" to "this tensor lost 12% of its range".
+    struct TensorError {
+        std::string name;
+        GGMLType    type = GGMLType::F32;
+        double      rel_rmse = 0.0;   // relative to the tensor's own range
+        double      max_rel = 0.0;    // the worst single element
+        u64         numel = 0;
+    };
+    const std::vector<TensorError>& tensor_errors() const { return errors_; }
+
 private:
     std::string path_;
     std::map<std::string, GGUFMetadataValue> metadata_;
     std::vector<std::pair<std::string, std::pair<Tensor, GGMLType>>> tensors_;
     std::vector<GGUFTensorInfo> tensor_infos_;
+    std::vector<TensorError> errors_;
 
     static uint64_t align_up(uint64_t x, uint64_t alignment = 32);
     template<typename T> static void write_pod(std::ostream& os, const T& v);
@@ -186,8 +199,40 @@ struct ExportProfileGGUF {
     GGMLType embedding_type = GGMLType::Q8_0;
     GGMLType norm_type = GGMLType::F32;
     GGMLType output_type = GGMLType::Q8_0;
+    // The precision of the numerically sensitive paths (the Mamba
+    // projections, the shared expert) when the default type is a lossy
+    // 4-bit one. F32 for the tiny fragile vectors.
+    GGMLType sensitive_type = GGMLType::Q8_0;
+    // The Mamba-2 input projection: dt = softplus(dt_raw + dt_bias) cancels
+    // almost all of dt_raw, so it needs a precision at least as good as the
+    // checkpoint's own bf16.
+    GGMLType recurrence_type = GGMLType::F16;
+    // True for the hybrid architectures (Granite): the Mamba-2 recurrence
+    // amplifies any weight error, so the mixed-precision policy applies.
+    bool hybrid = false;
     std::string name = "q8_k";
 };
+
+// The per-tensor dtype of the exported file.
+//
+// A single 4-bit precision for everything is NOT enough for a Granite-4.0
+// hybrid: some tensors are numerically fragile and a 4-bit error there is
+// amplified by the maths.
+//
+//   * mamba.A_log / mamba.dt_bias / mamba.D: the scan uses A = -exp(A_log)
+//     and dt = softplus(dt + dt_bias), so a 4-bit error on A_log (up to 20%
+//     on A) changes the state decay exp(A*dt) by 30% per step, and the 36
+//     Mamba layers compound it. The model then emits noise ("AVAVAV...").
+//   * mamba.conv1d.*: the causal convolution feeds the scan directly.
+//   * moe_router: it decides which of the 64 experts run; a coarse router
+//     flips the routing, so the token sees a different expert set.
+//
+// Those tensors are tiny (a few kB per layer), so they stay at full
+// precision. The bulk - the routed MoE experts - keeps the profile's
+// default precision, and the always-on paths (the Mamba projections, the
+// shared expert, the attention projections) are promoted to 8-bit. This is
+// the same philosophy as llama.cpp's Q4_K_M mixed profile.
+GGMLType gguf_dtype_for(const std::string& name, const ExportProfileGGUF& profile);
 
 ExportProfileGGUF gguf_profile_for(const std::string& name);
 

@@ -397,19 +397,36 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
             uint8_t* block = out.data() + b * 18;
 
             // GGML's Q4_0 reference (quantize_row_q4_0_ref):
-            //   amax = max|x|, d = amax / -8, id = 1/d,
-            //   xi = min(15, (int8)(x*id + 8.5f)), d = (x0*xi0 + x1*xi1)
-            // The block stores d as f16 and the nibbles as (xi - 8) so the
-            // reconstruction is (q - 8) * d.
+            //   find the SIGNED extreme: vmax = the value with the largest
+            //   |x| (its sign is kept), then
+            //   d = vmax / -8,  id = 1/d,
+            //   xi = min(15, (int8)(x*id + 8.5f))
+            //   and the block stores d as f16, so the reconstruction is
+            //   (xi - 8) * d.
+            //
+            // The signed extreme matters. With the ABSOLUTE maximum instead
+            // (d = amax / -8) the scale is always negative, so a block whose
+            // values are mostly negative (granite's mamba.dt_bias runs from
+            // -11.94 to -0.58) falls half outside the representable range and
+            // loses 12.5% of it. GGML's rule keeps the error at 6.25% and
+            // makes the bytes identical to llama.cpp's.
             float amax = 0.f;
-            for (size_t i = start; i < end; ++i) amax = std::max(amax, std::abs(src[i]));
+            float vmax = 0.f;
+            for (size_t i = start; i < end; ++i) {
+                const float v = src[i];
+                const float a = std::fabs(v);
+                if (a > amax) {
+                    amax = a;
+                    vmax = v;
+                }
+            }
             if (!std::isfinite(amax) || amax == 0.f) {
                 uint16_t zero_scale = fp32_to_fp16(0.0f);
                 memcpy(block, &zero_scale, 2);
                 std::memset(block + 2, 0x88, 16);
                 continue;
             }
-            const float d    = amax / -8.f;          // negative: the sign carries the scale
+            const float d    = vmax / -8.f;          // the sign follows the extreme
             const float id   = 1.0f / d;
             uint16_t sh = fp32_to_fp16(d);
             memcpy(block, &sh, 2);
@@ -519,6 +536,43 @@ void GGUFWriter::write() {
             if (cpu.dtype() != DType::F32) cpu = quant::dequantize(cpu, DType::F32);
             std::vector<uint8_t> payload = tensor_to_ggml_bytes(cpu, td.type);
             GAI_CHECK(payload.size() == td.nbytes, "gguf_format: payload size drift for " + td.name);
+
+            // Measure what the chosen precision actually kept, per tensor.
+            // This is the report that says WHERE a broken export lost its
+            // information (a 4-bit dt_bias is a 1.49 absolute error on the
+            // recurrence's time step), instead of "the output is wrong".
+            if (td.type != GGMLType::F32 && td.type != GGMLType::F16) {
+                TensorError te;
+                te.name = td.name;
+                te.type = td.type;
+                te.numel = static_cast<u64>(cpu.numel());
+                const float* src_f = cpu.f32();
+                const size_t n = static_cast<size_t>(cpu.numel());
+                double amax = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    const double a = std::fabs(static_cast<double>(src_f[i]));
+                    if (a > amax) amax = a;
+                }
+                // Decode the payload back and compare it with the source.
+                std::vector<float> back(n, 0.0f);
+                if (td.type == GGMLType::Q4_0) {
+                    quant::dequantize_q4_0(payload.data(), back.data(), static_cast<i64>(n));
+                } else if (td.type == GGMLType::Q8_0) {
+                    quant::dequantize_q8_0(payload.data(), back.data(), static_cast<i64>(n));
+                }
+                double se = 0.0;
+                double worst = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    const double d = static_cast<double>(back[i]) - static_cast<double>(src_f[i]);
+                    se += d * d;
+                    const double a = std::fabs(d);
+                    if (a > worst) worst = a;
+                }
+                te.rel_rmse = amax > 0.0 ? std::sqrt(se / static_cast<double>(n)) / amax : 0.0;
+                te.max_rel = amax > 0.0 ? worst / amax : 0.0;
+                errors_.push_back(std::move(te));
+            }
+
             uint64_t before = checked_stream_pos(f, "tensor write for " + td.name);
             f.write(reinterpret_cast<const char*>(payload.data()),
                     static_cast<std::streamsize>(payload.size()));
@@ -1116,17 +1170,6 @@ std::string llama_moe_tensor_name(const std::string& internal) {
     return {};
 }
 
-static float fp16_to_f32(uint16_t h) {
-    uint32_t sign = (h >> 15) & 1;
-    uint32_t exp  = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
-    uint32_t bits;
-    if (exp == 0)       bits = (sign << 31) | (mant << 13);
-    else if (exp == 31) bits = (sign << 31) | 0x7F800000 | (mant << 13);
-    else                bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-    float v; memcpy(&v, &bits, 4); return v;
-}
-
 // Reinterprets a flat CPU tensor as a 3D one without touching the data. The
 // GGUF writer emits the dimensions reversed, so a [a, b, c] tensor becomes
 // GGUF dims [c, b, a] -- which is the llama.cpp layout for the MoE expert
@@ -1193,12 +1236,12 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
         for (size_t i = 0; i < nelems; ++i) acc(dst[i]);
     } else if (ti->type == GGMLType::F16) {
         const uint16_t* src = reinterpret_cast<const uint16_t*>(raw.data());
-        for (size_t i = 0; i < nelems; ++i) { dst[i] = fp16_to_f32(src[i]); acc(dst[i]); }
+        for (size_t i = 0; i < nelems; ++i) { dst[i] = fp16_to_fp32(src[i]); acc(dst[i]); }
     } else if (ti->type == GGMLType::Q8_0) {
         size_t nblocks = (nelems + 31) / 32;
         for (size_t b = 0; b < nblocks; ++b) {
             const uint8_t* block = raw.data() + b * 34;
-            float scale = fp16_to_f32(*reinterpret_cast<const uint16_t*>(block));
+            float scale = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
             for (size_t i = 0; i < 32 && b*32+i < nelems; ++i) {
                 dst[b*32+i] = static_cast<int8_t>(block[2+i]) * scale;
                 acc(dst[b*32+i]);
@@ -1208,7 +1251,7 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
         size_t nblocks = (nelems + 31) / 32;
         for (size_t b = 0; b < nblocks; ++b) {
             const uint8_t* block = raw.data() + b * 18;
-            float scale = fp16_to_f32(*reinterpret_cast<const uint16_t*>(block));
+            float scale = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
             for (size_t j = 0; j < 16; ++j) {
                 if (b*32 + j >= nelems) break;
                 uint8_t byte = block[2+j];
@@ -1294,6 +1337,57 @@ bool load_model_from_gguf(const std::string& path, Model& model) {
     return true;
 }
 
+GGMLType gguf_dtype_for(const std::string& name, const ExportProfileGGUF& profile) {
+    // The norms are the scale of the residual stream: they stay F32.
+    if (name.find("norm") != std::string::npos) return profile.norm_type;
+    // The embedding (and the tied output projection) stay at the embedding
+    // precision: they are read by every token and every logit.
+    if (name == "tok_embeddings" || name == "lm_head") return profile.embedding_type;
+    // The router picks WHICH experts run. A 4-bit router (12% error on the
+    // real weights) changes the top-6 of 64 for many tokens, so the model
+    // reads a different expert set than the checkpoint: the output becomes
+    // noise. It is tiny (64 x 1536 per layer), so it stays at F32.
+    if (name.find("moe_router") != std::string::npos) return GGMLType::F32;
+    // The Mamba-2 fragile vectors, measured on the real checkpoint:
+    //   A_log    : the scan uses A = -exp(A_log); a 4-bit error there is a
+    //              12% error on A, which becomes a 30% error on exp(A*dt)
+    //              and compounds over the 36 Mamba layers.
+    //   dt_bias  : dt = softplus(dt_raw + dt_bias); a 4-bit dt_bias shifts dt
+    //              by up to 1.49 - the time step of the recurrence itself.
+    //   D        : the skip path of the SSM.
+    //   conv1d.* : the causal convolution that feeds the scan.
+    // All of them are a few kB per layer, so they stay at F32.
+    if (name.find("A_log") != std::string::npos ||
+        name.find("dt_bias") != std::string::npos ||
+        name.find("conv1d") != std::string::npos ||
+        name.find("mamba.D") != std::string::npos) {
+        return GGMLType::F32;
+    }
+    // The Mamba-2 projection needs the best precision of the file. Its dt
+    // rows produce dt_raw, and dt = softplus(dt_raw + dt_bias) cancels most
+    // of the value (granite's dt_bias runs from -11.94 to -0.58, so dt_raw
+    // lands on ~+12 and almost all of it disappears in the subtraction).
+    // The surviving dt is ~1e-2, so a relative error of 1% on dt_raw - which
+    // is what 4 bits give - becomes a 100% error on the recurrence's time
+    // step. The checkpoint itself is bf16 (a 0.2% relative error there), so
+    // F16 is the right target: it is finer than the original weights.
+    if (profile.hybrid && name.find("mamba.in_proj") != std::string::npos)
+        return profile.recurrence_type;
+
+    // The always-on paths - the Mamba output projection and the shared
+    // expert - are read by EVERY token, so their error is systematic (it
+    // does not average out the way it does for the routed experts). They
+    // get 8 bits when the profile's default is a lossy 4-bit one. This is
+    // the same mixed-precision philosophy as llama.cpp's Q4_K_M.
+    if (profile.default_type == GGMLType::Q4_0 && profile.hybrid) {
+        const bool always_on =
+            name.find("mamba.out_proj") != std::string::npos ||
+            name.find("moe_sh_") != std::string::npos;   // the shared expert
+        if (always_on) return profile.sensitive_type;
+    }
+    return profile.default_type;
+}
+
 ExportProfileGGUF gguf_profile_for(const std::string& name) {
     ExportProfileGGUF p;
     p.name = name;
@@ -1307,6 +1401,7 @@ ExportProfileGGUF gguf_profile_for(const std::string& name) {
         p.embedding_type = GGMLType::Q8_0;
         p.norm_type      = GGMLType::F32;
         p.output_type    = GGMLType::Q8_0;
+        p.sensitive_type = GGMLType::Q8_0;
     } else if (name == "fp16" || name == "f16" || name == "f16_t" || name == "half") {
         // Compute is fp16 tensor-core on T4; the export is fp16 too, which is
         // bit-consistent with the compute path and needs no lossy quantizer.
@@ -1315,6 +1410,7 @@ ExportProfileGGUF gguf_profile_for(const std::string& name) {
         p.embedding_type = GGMLType::F16;
         p.norm_type      = GGMLType::F32;
         p.output_type    = GGMLType::F16;
+        p.sensitive_type = GGMLType::F16;
     } else if (name == "q4_0" || name == "int4" || name == "q4_k_m" || name == "q4_k_s" || name == "q4_k") {
         if (name != "q4_0" && name != "int4")
             log_warn("[gguf] profile " + name + " mapped to Q4_0 (nearest implemented; true K-quant writer is roadmap)");
@@ -1323,6 +1419,11 @@ ExportProfileGGUF gguf_profile_for(const std::string& name) {
         p.embedding_type = GGMLType::Q8_0;
         p.norm_type      = GGMLType::F32;
         p.output_type    = GGMLType::Q8_0;
+        // The routed experts (92% of the parameters) take the 4-bit default;
+        // the always-on paths and the fragile vectors are promoted (see
+        // gguf_dtype_for). A uniform 4-bit export of Granite-4.0 is NOT
+        // usable: a 4-bit dt_bias shifts the recurrence's time step by 1.49.
+        p.sensitive_type = GGMLType::Q8_0;
     } else {
         GAI_FAIL("gguf_format: unknown profile: " + name + " (q8_k|q4_0|fp16)");
     }
@@ -1563,12 +1664,13 @@ void export_model_gguf(const std::string& path, Model& model,
     }
 
     u64 total_bytes = 0;
+    // The mixed-precision policy is architecture aware: only the hybrid
+    // (Mamba-2) models need it, because their recurrence amplifies a weight
+    // error exponentially.
+    ExportProfileGGUF prof = profile;
+    prof.hybrid = (cfg.arch == ModelConfig::ArchGranite);
     for (Parameter* p : model.parameters()) {
-        bool is_norm = p->name.find("norm") != std::string::npos;
-        bool is_emb  = (p->name == "tok_embeddings" || p->name == "lm_head");
-        GGMLType dt = is_norm ? profile.norm_type
-                    : is_emb  ? profile.embedding_type
-                              : profile.default_type;
+        GGMLType dt = gguf_dtype_for(p->name, prof);
         std::string wname = p->name;
         Tensor cpu = p->w.to(Device::CPU);
         if (cpu.dtype() != DType::F32) cpu = quant::dequantize(cpu, DType::F32);
@@ -1635,6 +1737,41 @@ void export_model_gguf(const std::string& path, Model& model,
                     path.c_str(), profile.name.c_str(), compat.c_str(),
                     model.parameters().size(),
                     human_bytes(total_bytes).c_str()));
+
+    // ---- the precision report: what each tensor kept.
+    // A broken export is diagnosed here, not by staring at gibberish: the
+    // tensors with the biggest relative loss are the ones that broke the
+    // model.
+    {
+        const auto& errs = w.tensor_errors();
+        if (!errs.empty()) {
+            std::vector<const GGUFWriter::TensorError*> sorted;
+            sorted.reserve(errs.size());
+            for (const auto& e : errs) sorted.push_back(&e);
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const GGUFWriter::TensorError* a, const GGUFWriter::TensorError* b) {
+                          return a->rel_rmse > b->rel_rmse;
+                      });
+            double worst = 0.0;
+            double mean = 0.0;
+            for (const auto* e : sorted) {
+                worst = std::max(worst, e->rel_rmse);
+                mean += e->rel_rmse;
+            }
+            mean /= static_cast<double>(sorted.size());
+            log_info(strfmt("[gguf] precision: %zu tensors quantized | mean relative RMSE %.4f%% | worst %.4f%%",
+                            sorted.size(), mean * 100.0, worst * 100.0));
+            log_info("[gguf] the 8 tensors that lost the most:");
+            const size_t top = std::min<size_t>(8, sorted.size());
+            for (size_t i = 0; i < top; ++i) {
+                const auto* e = sorted[i];
+                log_info(strfmt("[gguf]   %-44s %-5s rel RMSE %7.4f%%  worst element %7.4f%%",
+                                e->name.c_str(),
+                                e->type == GGMLType::Q4_0 ? "Q4_0" : "Q8_0",
+                                e->rel_rmse * 100.0, e->max_rel * 100.0));
+            }
+        }
+    }
 }
 
 }
