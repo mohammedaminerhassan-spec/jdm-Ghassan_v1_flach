@@ -813,7 +813,7 @@ bool HFCheckpoint::load_model(Model& model) const {
                                              (long long)t.numel(), (long long)((i64)shared * d)));
                             return false;
                         }
-                        p->w.copy_from(t);
+                        p->w.copy_from_f32(t);
                         continue;
                     }
                     const std::string hn = base + ".shared_mlp.input_linear.weight";
@@ -830,8 +830,13 @@ bool HFCheckpoint::load_model(Model& model) const {
                     }
                     const float* src = t.f32();
                     const size_t half = static_cast<size_t>(shared) * static_cast<size_t>(d);
-                    std::memcpy(p->w.f32(), leaf == "moe_sh_gate" ? src : src + half,
+                    // The data is staged on the host and copied in one go:
+                    // the copy honours the parameter's storage dtype (fp32 or
+                    // half) and moves the bytes to the device properly.
+                    Tensor stage(std::vector<i64>{static_cast<i64>(half)}, DType::F32, Device::CPU);
+                    std::memcpy(stage.f32(), leaf == "moe_sh_gate" ? src : src + half,
                                 half * sizeof(float));
+                    p->w.copy_from_f32(stage);
                     continue;
                 }
 
@@ -841,13 +846,16 @@ bool HFCheckpoint::load_model(Model& model) const {
                                          (long long)to.numel(), (long long)((i64)ne * E * d), ne, E, (long long)d));
                         return false;
                     }
+                    Tensor stage(std::vector<i64>{p->numel()}, DType::F32, Device::CPU);
+                    float* dst = stage.f32();
                     // Layout A: [ne*d, E] — d rows per expert, each [d, E].
                     if (to.ndim() == 2 && to.dim(0) == static_cast<i64>(ne) * d && to.dim(1) == E) {
                         for (int e = 0; e < ne; ++e) {
                             const float* src = to.f32() + static_cast<size_t>(e) * d * E;
-                            std::memcpy(p->w.f32() + static_cast<size_t>(e) * d * E, src,
+                            std::memcpy(dst + static_cast<size_t>(e) * d * E, src,
                                         static_cast<size_t>(d) * E * sizeof(float));
                         }
+                        p->w.copy_from_f32(stage);
                         continue;
                     }
                     // Layout B: [ne*E, d] — E rows per expert, each [E, d] (the IBM
@@ -857,18 +865,20 @@ bool HFCheckpoint::load_model(Model& model) const {
                         const size_t blk = static_cast<size_t>(E) * static_cast<size_t>(d);
                         for (int e = 0; e < ne; ++e) {
                             const float* src = to.f32() + static_cast<size_t>(e) * blk;
-                            float* dst = p->w.f32() + static_cast<size_t>(e) * blk;
+                            float* d_e = dst + static_cast<size_t>(e) * blk;
                             for (int i = 0; i < E; ++i)
                                 for (int j = 0; j < d; ++j)
-                                    dst[static_cast<size_t>(j) * static_cast<size_t>(E) + i] =
+                                    d_e[static_cast<size_t>(j) * static_cast<size_t>(E) + i] =
                                         src[static_cast<size_t>(i) * static_cast<size_t>(d) + j];
                         }
+                        p->w.copy_from_f32(stage);
                         continue;
                     }
                     // Layout C: [ne, d, E] (3D) — our exact layout per expert.
                     if (to.ndim() == 3 && to.dim(0) == ne && to.dim(1) == d && to.dim(2) == E) {
-                        std::memcpy(p->w.f32(), to.f32(),
+                        std::memcpy(dst, to.f32(),
                                     static_cast<size_t>(ne) * d * E * sizeof(float));
+                        p->w.copy_from_f32(stage);
                         continue;
                     }
                     // Layout D: [ne, E, d] (3D) — per-expert [E, d], transpose.
@@ -876,12 +886,13 @@ bool HFCheckpoint::load_model(Model& model) const {
                         const size_t blk = static_cast<size_t>(E) * static_cast<size_t>(d);
                         for (int e = 0; e < ne; ++e) {
                             const float* src = to.f32() + static_cast<size_t>(e) * blk;
-                            float* dst = p->w.f32() + static_cast<size_t>(e) * blk;
+                            float* d_e = dst + static_cast<size_t>(e) * blk;
                             for (int i = 0; i < E; ++i)
                                 for (int j = 0; j < d; ++j)
-                                    dst[static_cast<size_t>(j) * static_cast<size_t>(E) + i] =
+                                    d_e[static_cast<size_t>(j) * static_cast<size_t>(E) + i] =
                                         src[static_cast<size_t>(i) * static_cast<size_t>(d) + j];
                         }
+                        p->w.copy_from_f32(stage);
                         continue;
                     }
                     log_error(strfmt("[hf] granite output_linear unsupported shape [%lld,%lld,%lld]",
@@ -896,14 +907,17 @@ bool HFCheckpoint::load_model(Model& model) const {
                         return false;
                     }
                     const size_t block = static_cast<size_t>(E) * static_cast<size_t>(d);
+                    Tensor stage(std::vector<i64>{p->numel()}, DType::F32, Device::CPU);
+                    float* dst = stage.f32();
                     for (int e = 0; e < ne; ++e) {
                         // Per expert: gate block [E*d] then up block [E*d].
                         const float* src = ti.f32() + static_cast<size_t>(e) * 2 * block;
                         const size_t off = static_cast<size_t>(e) * block;
-                        std::memcpy(p->w.f32() + off,
+                        std::memcpy(dst + off,
                                     leaf == "moe_gate" ? src : src + block,
                                     block * sizeof(float));
                     }
+                    p->w.copy_from_f32(stage);
                     continue;
                 }
             }
@@ -933,7 +947,7 @@ bool HFCheckpoint::load_model(Model& model) const {
                                  static_cast<long long>(p->numel())));
                 return false;
             }
-            p->w.copy_from(flat);
+            p->w.copy_from_f32(flat);
             continue;
         }
         }  // is_moe_leaf
@@ -960,7 +974,7 @@ bool HFCheckpoint::load_model(Model& model) const {
                              static_cast<long long>(p->numel())));
             return false;
         }
-        p->w.copy_from(t);
+        p->w.copy_from_f32(t);
     }
 
     if (lm_head_from_emb) {

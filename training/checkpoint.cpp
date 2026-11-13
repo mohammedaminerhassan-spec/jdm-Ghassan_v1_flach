@@ -12,7 +12,7 @@ namespace gai {
 
 static constexpr u32 CKPT_MAGIC   = 0x54504B47u;
 
-static constexpr u32 CKPT_VERSION = 14u;
+static constexpr u32 CKPT_VERSION = 15u;
 static constexpr u8 OPT_ADAMW = 0u;
 static constexpr u8 OPT_LION  = 1u;
 static constexpr u8 OPT_MUON  = 2u;
@@ -94,6 +94,25 @@ static void wr_config(std::ostream& o, const ModelConfig& c) {
     wr(o, dense_ok);
     u8 qkv_bias = c.use_qkv_bias ? 1 : 0;
     wr(o, qkv_bias);
+    // v15: IBM Granite-4.0 hybrid geometry and multipliers
+    wr(o, c.shared_expert_intermediate_size);
+    wr(o, c.head_dim_override);
+    wr(o, c.position_embedding);
+    u8 arch = static_cast<u8>(c.arch);
+    wr(o, arch);
+    wr(o, c.embedding_multiplier);
+    wr(o, c.residual_multiplier);
+    wr(o, c.attention_multiplier);
+    wr(o, c.logits_scaling);
+    wr(o, c.mamba_n_heads);
+    wr(o, c.mamba_d_head);
+    wr(o, c.mamba_d_state);
+    wr(o, c.mamba_n_groups);
+    wr(o, c.mamba_d_conv);
+    wr(o, c.mamba_expand);
+    u32 n_lt = static_cast<u32>(c.layer_types.size());
+    wr(o, n_lt);
+    for (int lt : c.layer_types) wr(o, lt);
 }
 static bool rd_config_v6(std::istream& i, ModelConfig& c) {
     u8 tie = 0, moe = 0, sh = 0, qk = 0;
@@ -151,6 +170,33 @@ static bool rd_config_v14(std::istream& i, ModelConfig& c) {
     u8 qkv_bias = 0;
     if (!rd(i, qkv_bias)) return false;
     c.use_qkv_bias = qkv_bias != 0;
+    return true;
+}
+
+static bool rd_config_v15(std::istream& i, ModelConfig& c) {
+    if (!rd_config_v14(i, c)) return false;
+    if (!rd(i, c.shared_expert_intermediate_size)) return false;
+    if (!rd(i, c.head_dim_override)) return false;
+    if (!rd(i, c.position_embedding)) return false;
+    u8 arch = 0;
+    if (!rd(i, arch)) return false;
+    c.arch = static_cast<ModelConfig::Arch>(arch);
+    if (!rd(i, c.embedding_multiplier)) return false;
+    if (!rd(i, c.residual_multiplier)) return false;
+    if (!rd(i, c.attention_multiplier)) return false;
+    if (!rd(i, c.logits_scaling)) return false;
+    if (!rd(i, c.mamba_n_heads)) return false;
+    if (!rd(i, c.mamba_d_head)) return false;
+    if (!rd(i, c.mamba_d_state)) return false;
+    if (!rd(i, c.mamba_n_groups)) return false;
+    if (!rd(i, c.mamba_d_conv)) return false;
+    if (!rd(i, c.mamba_expand)) return false;
+    u32 n_lt = 0;
+    if (!rd(i, n_lt)) return false;
+    c.layer_types.resize(n_lt);
+    for (u32 idx = 0; idx < n_lt; ++idx) {
+        if (!rd(i, c.layer_types[idx])) return false;
+    }
     return true;
 }
 static bool rd_config_v5(std::istream& i, ModelConfig& c) {
@@ -229,6 +275,9 @@ static bool arch_match(const ModelConfig& a, const ModelConfig& b) {
           a.num_experts == b.num_experts && a.moe_top_k == b.moe_top_k &&
           a.moe_expert_dim == b.moe_expert_dim && a.moe_shared == b.moe_shared &&
           a.use_qk_norm == b.use_qk_norm && a.use_qkv_bias == b.use_qkv_bias))
+        return false;
+    if (a.arch != b.arch || a.shared_expert_intermediate_size != b.shared_expert_intermediate_size ||
+        a.position_embedding != b.position_embedding || a.head_dim_override != b.head_dim_override)
         return false;
     if (a.max_seq_len != b.max_seq_len || a.rope_theta != b.rope_theta ||
         a.rope_scale != b.rope_scale || a.rope_yarn_mscale != b.rope_yarn_mscale ||
@@ -535,7 +584,9 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
 
     ModelConfig cfg{};
-    if (version >= 14u) {
+    if (version >= 15u) {
+        if (!rd_config_v15(f, cfg)) return false;
+    } else if (version >= 14u) {
         if (!rd_config_v14(f, cfg)) return false;
     } else if (version >= 13u) {
         if (!rd_config_v13(f, cfg)) return false;
@@ -671,7 +722,9 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
-    if (version >= 14u) {
+    if (version >= 15u) {
+        if (!rd_config_v15(f, cfg)) return false;
+    } else if (version >= 14u) {
         if (!rd_config_v14(f, cfg)) return false;
     } else if (version >= 13u) {
         if (!rd_config_v13(f, cfg)) return false;
@@ -805,7 +858,9 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
-    if (version >= 14u) {
+    if (version >= 15u) {
+        if (!rd_config_v15(f, cfg)) return false;
+    } else if (version >= 14u) {
         if (!rd_config_v14(f, cfg)) return false;
     } else if (version >= 13u) {
         if (!rd_config_v13(f, cfg)) return false;
@@ -931,7 +986,9 @@ bool Checkpoint::peek(const std::string& path, ModelConfig& cfg, TrainState& sta
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
-    if (version >= 14u) {
+    if (version >= 15u) {
+        if (!rd_config_v15(f, cfg)) return false;
+    } else if (version >= 14u) {
         if (!rd_config_v14(f, cfg)) return false;
     } else if (version >= 13u) {
         if (!rd_config_v13(f, cfg)) return false;

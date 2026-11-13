@@ -1399,7 +1399,7 @@ bool load_model_from_gguf(const std::string& path, Model& model) {
                              static_cast<long long>(p->numel())));
             return false;
         }
-        p->w.copy_from(t);
+        p->w.copy_from_f32(t);
     }
     if (lm_head_from_emb) {
         log_info("[gguf] no output.weight in the file: the token embedding is used "

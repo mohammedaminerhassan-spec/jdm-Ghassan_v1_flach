@@ -437,9 +437,11 @@ double Muon::step(float lr, float grad_scale) {
             const int cols = static_cast<int>(p->shape[1]);
             orthogonalize(m_[i].f32(), Ostage, rows, cols);
 
+            // Apply decoupled weight decay directly to w before the orthogonalized gradient step:
+            // w_{t+1} = (1 - lr * wd) * w_t - lr * O_t
+            if (wd != 0.0f) ops::scale_inplace(dev, p->w.f32(), 1.0f - lr * wd, p->numel());
             ops::scale_inplace(dev, Ostage, -lr, p->numel());
             ops::add_inplace(dev, p->w.f32(), Ostage, p->numel());
-            if (wd != 0.0f) ops::scale_inplace(dev, p->w.f32(), 1.0f - lr * wd, p->numel());
         } else if (p->shape.size() == 1) {
 
             ops::adamw_step(dev, p->w.f32(), p->g.f32(), m_[i].f32(), v_[i].f32(),

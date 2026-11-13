@@ -279,6 +279,46 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
     }
 }
 
+void moe_forward_bias_half(const float* x, const float* router_w, const float* router_bias,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH) {
+    if (N <= 0) return;
+    // The reference half-precision MoE: the expert matrices are widened once
+    // per call and the fp32 kernel does the rest. It is correct but slow; the
+    // GPU version keeps the experts in half and feeds the tensor cores.
+    auto widen = [](const u16* src, size_t n, std::vector<float>& dst) {
+        dst.resize(n);
+        for (size_t i = 0; i < n; ++i) dst[i] = fp16_to_fp32(src[i]);
+        return dst.data();
+    };
+    std::vector<float> g_f, u_f, d_f, sg_f, su_f, sd_f;
+    const float* g_p = widen(gates, static_cast<size_t>(ne) * E * d, g_f);
+    const float* u_p = widen(ups,   static_cast<size_t>(ne) * E * d, u_f);
+    const float* d_p = widen(downs, static_cast<size_t>(ne) * d * E, d_f);
+    const float* sg_p = sh_g ? widen(sh_g, static_cast<size_t>(SH) * d, sg_f) : nullptr;
+    const float* su_p = sh_u ? widen(sh_u, static_cast<size_t>(SH) * d, su_f) : nullptr;
+    const float* sd_p = sh_d ? widen(sh_d, static_cast<size_t>(d) * SH, sd_f) : nullptr;
+    moe_forward_bias(x, router_w, router_bias, g_p, u_p, d_p, sg_p, su_p, sd_p,
+                     out, probs_cache, idx_cache, w_cache,
+                     s_gate, s_up, s_act, N, d, E, ne, K, SH);
+}
+
+void moe_forward_half(const float* x, const float* router_w,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH) {
+    moe_forward_bias_half(x, router_w, nullptr, gates, ups, downs, sh_g, sh_u, sh_d,
+                          out, probs_cache, idx_cache, w_cache,
+                          s_gate, s_up, s_act, N, d, E, ne, K, SH);
+}
+
 void moe_backward(const float* x, const float* router_w,
                   const float* gates, const float* ups, const float* downs,
                   const float* sh_g, const float* sh_u, const float* sh_d,

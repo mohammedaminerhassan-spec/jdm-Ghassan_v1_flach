@@ -83,6 +83,16 @@ void convert_f32_to_f16(Device dev, const float* src, u16* dst, i64 n);
 void register_fp16_weight(const float* master, const u16* half, i64 n);
 void unregister_fp16_weight(const float* master);
 
+// ---- the fp16 weight storage mode
+//
+// The big matrices are stored on the device in half precision (12.9 GiB for
+// the 6.94B Granite instead of the 25.9 GiB of fp32 masters), the
+// activations stay fp32 and every GEMM accumulates in fp32. These are the
+// same ops with half-precision WEIGHTS; the fragile vectors (the router,
+// dt_bias, A_log, D, conv1d, the norms) stay fp32.
+void embedding_forward_half(Device dev, const i32* ids, const u16* table, float* out,
+                            i64 ntok, int dim, int vocab);
+
 void linear_backward(Device dev, const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N);
 
@@ -147,6 +157,25 @@ void moe_forward_bias(Device dev,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
                       i64 N, int d, int E, int ne, int K, int SH);
+
+// The fp16 storage mode: the expert matrices (87% of the parameters) are
+// half, the router stays fp32.
+void moe_forward_half(Device dev,
+                      const float* x, const float* router_w,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH);
+void moe_forward_bias_half(Device dev,
+                      const float* x, const float* router_w, const float* router_bias,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH);
 void moe_backward(Device dev,
                   const float* x, const float* router_w,
                   const float* gates, const float* ups, const float* downs,
@@ -184,6 +213,46 @@ void mamba2_forward(Device dev,
                     float* out,
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                     int d_head, int d_state, int k, float eps);
+
+// The fp16 storage mode: the two projections are half, the fragile vectors
+// (conv1d, dt_bias, A_log, D, the gated norm) stay fp32.
+void mamba2_forward_half(Device dev,
+                    const float* x,
+                    const u16* w_in,
+                    const float* conv_w,
+                    const float* conv_b,
+                    const float* dt_bias,
+                    const float* a_log,
+                    const float* D,
+                    const float* norm_w,
+                    const u16* w_out,
+                    float* state,
+                    float* out,
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps);
+
+void mamba2_backward(Device dev,
+                     const float* x,
+                     const float* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const float* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps);
 
 void attention_forward(Device dev,
                        const float* q, const float* k, const float* v,

@@ -17,6 +17,21 @@
 
 namespace gai {
 
+namespace {
+
+// The GEMM with the weights in the parameter's own precision: fp32 for the
+// reference path, half for the fp16 weight storage mode (the tensor cores
+// multiply, the accumulator stays fp32).
+inline void linear_param(Device dev, const Tensor& w, const float* x, float* y,
+                         int M, int K, int N) {
+    if (w.dtype() == DType::F16)
+        ops::linear_forward_fp16(dev, x, w.ptr<u16>(), y, M, K, N);
+    else
+        ops::linear_forward(dev, x, w.f32(), y, M, K, N);
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------- MoE aux loss
 // Computes the DeepSeek-style load-balance term for one layer from its saved
 // routing: raw = ne * sum_e(mean_prob_e * frac_e), and uploads frac_e into
@@ -823,6 +838,22 @@ void Model::forward_mamba_layer(Device dev, int l, Activations& act, i64 N) {
         st = Tensor::zeros({static_cast<i64>(state_rows) * d_state}, DType::F32, dev);
     }
 
+    if (L.mamba_in_proj.is_half()) {
+        ops::mamba2_forward_half(dev,
+                                 act.xb.f32(),
+                                 L.mamba_in_proj.w.ptr<u16>(),
+                                 L.mamba_conv_w.w.f32(),
+                                 L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32() : nullptr,
+                                 L.mamba_dt_bias.w.f32(),
+                                 L.mamba_A_log.w.f32(),
+                                 L.mamba_D.w.f32(),
+                                 L.mamba_norm.w.f32(),
+                                 L.mamba_out_proj.w.ptr<u16>(),
+                                 st.f32(),
+                                 act.proj.f32(),
+                                 B, T, d, d_inner, conv_dim, n_heads, d_head, d_state,
+                                 cfg_.mamba_d_conv, cfg_.rms_eps);
+    } else {
     ops::mamba2_forward(dev,
                         act.xb.f32(),
                         L.mamba_in_proj.w.f32(),
@@ -837,13 +868,40 @@ void Model::forward_mamba_layer(Device dev, int l, Activations& act, i64 N) {
                         act.proj.f32(),
                         B, T, d, d_inner, conv_dim, n_heads, d_head, d_state,
                         cfg_.mamba_d_conv, cfg_.rms_eps);
+    }
+}
+
+DType Model::storage_dtype_for(const std::string& name) const {
+    if (!weight_f16_) return DType::F32;
+
+    // The fragile vectors stay fp32. This is the same list the GGUF export
+    // keeps at full precision, and the same reason: the values cancel or
+    // feed an exponential, so a 4-bit (or even a 16-bit) copy moves the
+    // result by a large factor.
+    //   dt_bias : dt = softplus(dt_raw + dt_bias) cancels most of the value
+    //   A_log   : A = -exp(A_log), so a 6% error is a 6% error on the decay
+    //   D       : a direct skip term
+    //   conv1d  : a depthwise convolution over the sequence
+    //   router  : it decides WHICH experts run (a flip changes the output)
+    //   norms   : they multiply the whole stream
+    const bool fragile =
+        name.find("moe_router") != std::string::npos ||
+        name.find("mamba.conv1d") != std::string::npos ||
+        name.find("mamba.dt_bias") != std::string::npos ||
+        name.find("mamba.A_log") != std::string::npos ||
+        name.find("mamba.D") != std::string::npos ||
+        name.find("norm") != std::string::npos ||      // attn_norm, ffn_norm, final_norm, mamba norm
+        name.find("qk_qnorm") != std::string::npos ||
+        name.find("qk_knorm") != std::string::npos ||
+        name.find("bias") != std::string::npos;
+    return fragile ? DType::F32 : DType::F16;
 }
 
 void Model::alloc_param(Parameter& p, const std::string& name, std::vector<i64> shape, bool decay) {
     p.name  = name;
     p.shape = shape;
     p.decay = decay;
-    p.w = Tensor::zeros(shape, DType::F32, device_);
+    p.w = Tensor::zeros(shape, storage_dtype_for(name), device_);
     p.w.set_name(name);
     params_.push_back(&p);
 }
@@ -852,8 +910,18 @@ Model::~Model() {
     enable_fp16_weight_cache(false);
 }
 
-Model::Model(ModelConfig cfg, Device dev) : cfg_(std::move(cfg)), device_(dev) {
+Model::Model(ModelConfig cfg, Device dev, bool fp16_weights) : cfg_(std::move(cfg)), device_(dev) {
     cfg_.validate();
+    // The storage dtype has to be known BEFORE the parameters are allocated.
+    weight_f16_ = fp16_weights;
+    if (weight_f16_ && cfg_.lora_rank > 0) {
+        // Training needs the fp32 masters: the gradients and the optimizer
+        // states are fp32 and a half master would break the update.
+        log_warn("[prec] the fp16 weight storage mode is off: LoRA training needs "
+                 "the fp32 masters");
+        weight_f16_ = false;
+    }
+
     // YaRN is approximate NTK extrapolation (not exact long-ctx training).
     // rope_scale==1 (all shipped configs) is exact; anything above needs a
     // perplexity validation run at the target ctx (e.g. 8k) before trusting it.
@@ -1228,6 +1296,9 @@ void Model::merge_lora() {
 }
 
 void Model::init_weights(u64 seed) {
+    GAI_CHECK(!weight_f16_,
+              "init_weights fills fp32 masters: turn the fp16 weight storage off "
+              "(--weight-f16 0)");
     Rng rng(seed);
     if (cfg_.use_moe && cfg_.moe_aux_free) {
         for (auto& bias : moe_bias_) std::fill(bias.begin(), bias.end(), 0.0f);
@@ -1318,6 +1389,14 @@ void Model::enable_fp16_weight_cache(bool on) {
         for (LayerParams& layer : layers_) layer.wqkv_fp16 = Tensor();
         fp16_weight_cache_ = false;
         fp16_weights_dirty_ = false;
+        return;
+    }
+    if (weight_f16_) {
+        // The masters are ALREADY half: a second copy would double the
+        // memory the mode exists to save, and the registry is keyed by the
+        // fp32 master pointer (there is none here).
+        log_info("[prec] the fp16 weight cache is not needed: the weights are "
+                 "already stored in half precision");
         return;
     }
     if (!fp16_weight_cache_) {
@@ -1791,15 +1870,55 @@ size_t Model::count_fp16_cache_bytes(const ModelConfig& cfg) {
     return static_cast<size_t>((n2 + fused) * sizeof(u16));
 }
 
+// The parameters that stay fp32 in the fp16 weight storage mode. It must
+// mirror Model::storage_dtype_for exactly, otherwise the VRAM guard would
+// promise memory the model does not use (or refuse a model that fits).
+static u64 fragile_param_count(const ModelConfig& cfg) {
+    u64 n = 0;
+    const u64 d = static_cast<u64>(cfg.hidden_size);
+    const u64 hd = static_cast<u64>(cfg.head_dim());
+    const u64 d_inner = static_cast<u64>(cfg.mamba_expand) * d;
+    const u64 conv_dim = d_inner +
+                         2ull * static_cast<u64>(cfg.mamba_n_groups) *
+                         static_cast<u64>(cfg.mamba_d_state);
+    for (int l = 0; l < cfg.num_layers; ++l) {
+        n += 2ull * d;                                   // attn_norm + ffn_norm
+        if (cfg.use_moe)
+            n += static_cast<u64>(cfg.num_experts) * d;  // the router
+        if (cfg.use_qk_norm)
+            n += 2ull * hd;
+        const bool is_mamba = (cfg.arch == ModelConfig::ArchGranite) &&
+                              l < static_cast<int>(cfg.layer_types.size()) &&
+                              cfg.layer_types[static_cast<size_t>(l)] == 0;
+        if (is_mamba) {
+            n += conv_dim * static_cast<u64>(cfg.mamba_d_conv);  // conv1d weight
+            n += conv_dim;                                       // conv1d bias
+            n += 3ull * static_cast<u64>(cfg.mamba_n_heads);     // dt_bias, A_log, D
+            n += d_inner;                                        // the gated norm
+        }
+    }
+    n += d;   // final_norm
+    return n;
+}
+
 Model::MemoryPlan Model::plan_memory(const ModelConfig& cfg, int B, int T,
                                       bool with_grad, int ce_chunks,
-                                      bool fp16_weight_cache) {
+                                      bool fp16_weight_cache,
+                                      bool fp16_weights) {
     MemoryPlan p;
     p.params = count_parameters(cfg);
     p.params_no_embedding = p.params - static_cast<u64>(cfg.vocab_size) * static_cast<u64>(cfg.hidden_size);
     if (!cfg.tie_embeddings)
         p.params_no_embedding -= static_cast<u64>(cfg.vocab_size) * static_cast<u64>(cfg.hidden_size);
-    p.weights = static_cast<size_t>(p.params) * sizeof(float);
+    if (fp16_weights) {
+        // The fp16 weight storage mode: the big matrices are half, the
+        // fragile vectors stay fp32.
+        const u64 fragile = fragile_param_count(cfg);
+        const u64 half = p.params > fragile ? p.params - fragile : 0;
+        p.weights = static_cast<size_t>(half) * 2 + static_cast<size_t>(fragile) * 4;
+    } else {
+        p.weights = static_cast<size_t>(p.params) * sizeof(float);
+    }
     p.grads = with_grad ? static_cast<size_t>(p.params) * sizeof(float) : 0;
     p.fp16_cache = fp16_weight_cache ? count_fp16_cache_bytes(cfg) : 0;
     p.activations = estimate_activation_bytes_for(cfg, fp16_weight_cache, B, T,
@@ -2003,7 +2122,10 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
     }
 
     // ---- embeddings
-    ops::embedding_forward(dev, ids, tok_emb_.w.f32(), act.x.f32(), N, d, V);
+    if (tok_emb_.is_half())
+        ops::embedding_forward_half(dev, ids, tok_emb_.w.ptr<u16>(), act.x.f32(), N, d, V);
+    else
+        ops::embedding_forward(dev, ids, tok_emb_.w.f32(), act.x.f32(), N, d, V);
     if (cfg_.embedding_multiplier != 1.0f) {
         ops::scale_inplace(dev, act.x.f32(), cfg_.embedding_multiplier, N * d);
     }
@@ -2028,9 +2150,7 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
 
         if (granite_mamba) {
             // Mamba-2 sublayer: writes act.proj, shares the residual/FFN tail
-            // with the attention layers. Training = not implemented yet.
-            GAI_CHECK(!train,
-                      "granite mamba layers do not support the backward pass yet (inference only)");
+            // with the attention layers.
             forward_mamba_layer(dev, l, act, N);
         } else {
 
@@ -2049,9 +2169,9 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             qp = act.q.f32();
             kp = act.k.f32();
             vp = act.v.f32();
-            ops::linear_forward(dev, act.xb.f32(), L.wq.w.f32(), qp, static_cast<int>(N), d, qd);
-            ops::linear_forward(dev, act.xb.f32(), L.wk.w.f32(), kp, static_cast<int>(N), d, kvd);
-            ops::linear_forward(dev, act.xb.f32(), L.wv.w.f32(), vp, static_cast<int>(N), d, kvd);
+            linear_param(dev, L.wq.w, act.xb.f32(), qp, static_cast<int>(N), d, qd);
+            linear_param(dev, L.wk.w, act.xb.f32(), kp, static_cast<int>(N), d, kvd);
+            linear_param(dev, L.wv.w, act.xb.f32(), vp, static_cast<int>(N), d, kvd);
         }
 
         lora_forward(L.lora_q, dev, act.xb.f32(), qp, static_cast<int>(N));
@@ -2097,7 +2217,7 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
                                   segment_ids);
         if (train) ops::copy(dev, act.saved_attout[sl].f32(), act.att_out.f32(), N * qd);
 
-        ops::linear_forward(dev, act.att_out.f32(), L.wo.w.f32(), act.proj.f32(), static_cast<int>(N), qd, d);
+        linear_param(dev, L.wo.w, act.att_out.f32(), act.proj.f32(), static_cast<int>(N), qd, d);
         lora_forward(L.lora_o, dev, act.att_out.f32(), act.proj.f32(), static_cast<int>(N));
         }  // else (attention path)
 
@@ -2123,22 +2243,34 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             float* rw    = train ? act.saved_moe_w[sl].f32()     : nullptr;
             const float* bias = (cfg_.moe_aux_free && !moe_bias_.empty())
                 ? moe_bias_ptr(l) : nullptr;
-            ops::moe_forward_bias(dev, act.xb2.f32(), L.router.w.f32(), bias,
-                                  L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
-                                  L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
-                                  L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
-                                  L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
-                                  act.ffn_out.f32(), probs, ridx, rw,
-                                  act.moe_gate.f32(), act.moe_up.f32(), act.moe_act.f32(),
-                                  N, d, E, ne, K, cfg_.shared_width());
+            if (L.moe_gate.is_half()) {
+                ops::moe_forward_bias_half(dev, act.xb2.f32(), L.router.w.f32(), bias,
+                                           L.moe_gate.w.ptr<u16>(), L.moe_up.w.ptr<u16>(),
+                                           L.moe_down.w.ptr<u16>(),
+                                           L.sh_gate.w.defined() ? L.sh_gate.w.ptr<u16>() : nullptr,
+                                           L.sh_up.w.defined()   ? L.sh_up.w.ptr<u16>()   : nullptr,
+                                           L.sh_down.w.defined() ? L.sh_down.w.ptr<u16>() : nullptr,
+                                           act.ffn_out.f32(), probs, ridx, rw,
+                                           act.moe_gate.f32(), act.moe_up.f32(), act.moe_act.f32(),
+                                           N, d, E, ne, K, cfg_.shared_width());
+            } else {
+                ops::moe_forward_bias(dev, act.xb2.f32(), L.router.w.f32(), bias,
+                                      L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
+                                      L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
+                                      L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
+                                      L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
+                                      act.ffn_out.f32(), probs, ridx, rw,
+                                      act.moe_gate.f32(), act.moe_up.f32(), act.moe_act.f32(),
+                                      N, d, E, ne, K, cfg_.shared_width());
+            }
             if (train) {
                 ops::copy(dev, act.saved_gate[sl].f32(), act.moe_gate.f32(), N * K * E);
                 ops::copy(dev, act.saved_up[sl].f32(),   act.moe_up.f32(),   N * K * E);
                 ops::copy(dev, act.saved_act[sl].f32(),  act.moe_act.f32(),  N * K * E);
             }
         } else {
-            ops::linear_forward(dev, act.xb2.f32(), L.w_gate.w.f32(), act.gate.f32(), static_cast<int>(N), d, F);
-            ops::linear_forward(dev, act.xb2.f32(), L.w_up.w.f32(),   act.up.f32(),   static_cast<int>(N), d, F);
+            linear_param(dev, L.w_gate.w, act.xb2.f32(), act.gate.f32(), static_cast<int>(N), d, F);
+            linear_param(dev, L.w_up.w,   act.xb2.f32(), act.up.f32(),   static_cast<int>(N), d, F);
             lora_forward(L.lora_gate, dev, act.xb2.f32(), act.gate.f32(), static_cast<int>(N));
             lora_forward(L.lora_up, dev, act.xb2.f32(), act.up.f32(), static_cast<int>(N));
             ops::swiglu_forward(dev, act.gate.f32(), act.up.f32(), act.act.f32(), N * F);
@@ -2149,7 +2281,7 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
                 ops::copy(dev, act.saved_act[sl].f32(),  act.act.f32(),  N * F);
             }
 
-            ops::linear_forward(dev, act.act.f32(), L.w_down.w.f32(), act.ffn_out.f32(), static_cast<int>(N), F, d);
+            linear_param(dev, L.w_down.w, act.act.f32(), act.ffn_out.f32(), static_cast<int>(N), F, d);
             lora_forward(L.lora_down, dev, act.act.f32(), act.ffn_out.f32(), static_cast<int>(N));
         }
         if (cfg_.residual_multiplier != 1.0f) {
@@ -2178,8 +2310,8 @@ Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
                   "forward: logits buffer too small (chunked training activations "
                   "need forward_backward, not forward)");
     }
-    ops::linear_forward(device_, act.xb.f32(), lm_head().w.f32(), act.logits.f32(),
-                        static_cast<int>(N), d, V);
+    linear_param(device_, lm_head().w, act.xb.f32(), act.logits.f32(),
+                 static_cast<int>(N), d, V);
     if (cfg_.logits_scaling != 1.0f) {
         ops::scale_inplace(device_, act.logits.f32(), 1.0f / cfg_.logits_scaling, N * V);
     }
@@ -2191,22 +2323,11 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                Activations& act, i64* out_ntok, float dout_scale,
                                bool want_aux_stats, const i32* segment_ids,
                                const i32* host_targets) {
+    GAI_CHECK(!weight_f16_,
+              "the training path needs the fp32 masters: turn the fp16 weight "
+              "storage off (--weight-f16 0)");
     GAI_CHECK(act.with_grad, "forward_backward requires gradient activations");
     GAI_CHECK(grad_enabled_, "call enable_grad(true) before forward_backward");
-
-    // Granite hybrid: the mamba sub-layers have no adjoint selective scan
-    // yet, so a training step cannot produce their weight gradients. Fail
-    // loudly here instead of walking into the reverse layer loop, where the
-    // missing mamba parameters would be dereferenced (silent garbage or a
-    // crash deep inside the optimizer).
-    if (cfg_.arch == ModelConfig::ArchGranite) {
-        for (size_t i = 0; i < cfg_.layer_types.size(); ++i) {
-            GAI_CHECK(cfg_.layer_types[i] != 0,
-                      "granite mamba layers do not support the backward pass yet (inference only): "
-                      "layer " + std::to_string(i) + " is a mamba layer. Train a dense/attention-only "
-                      "architecture, or wait for the mamba-2 adjoint kernel.");
-        }
-    }
 
     const int d   = cfg_.hidden_size;
     const int qd  = cfg_.q_dim();
@@ -2270,7 +2391,9 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                             Cr, V, cfg_.z_loss_scale);
         // P0-05 (sums, not means) + P0-2b (fused single pass), per chunk.
         // SCE already emits eff_scale-ready SUM grads, so no ×cn rescale.
-        if (eff_scale != 1.0f) ops::scale_inplace(dev, dlogits_c, eff_scale, Cr * V);
+        float chunk_dscale = eff_scale;
+        if (cfg_.logits_scaling != 1.0f) chunk_dscale /= cfg_.logits_scaling;
+        if (chunk_dscale != 1.0f) ops::scale_inplace(dev, dlogits_c, chunk_dscale, Cr * V);
         ops::linear_backward(dev, hnorm_full + r0 * d, lm_head().w.f32(), dlogits_c,
                              act.dxb.f32() + r0 * d, lm_head().g.f32(), Ci, d, V);
     }
@@ -2374,11 +2497,68 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
         ops::rmsnorm_backward(dev, act.saved_xmid[sl].f32(), L.ffn_norm.w.f32(), act.dxb.f32(),
                               act.saved_rrms2[sl].f32(), act.dx.f32(), L.ffn_norm.g.f32(), N, d);
 
+        const bool is_granite    = (cfg_.arch == ModelConfig::ArchGranite);
+        const int  granite_kind  = (is_granite && sl < cfg_.layer_types.size())
+                                       ? cfg_.layer_types[sl] : 1;
+        const bool granite_mamba = is_granite && L.has_mamba() && granite_kind == 0;
+
+        if (granite_mamba) {
+            // Mamba-2 sublayer backward:
+            const float* dy_mamba = act.dx.f32();
+            if (cfg_.residual_multiplier != 1.0f) {
+                ops::copy(dev, act.dtmp.f32(), act.dx.f32(), N * d);
+                ops::scale_inplace(dev, act.dtmp.f32(), cfg_.residual_multiplier, N * d);
+                dy_mamba = act.dtmp.f32();
+            }
+
+            ops::zero(dev, act.dxb.f32(), N * d);
+            if (!L.mamba_in_proj.frozen) {
+                const int d_inner     = cfg_.mamba_expand * d;
+                const int n_heads     = cfg_.mamba_n_heads;
+                const int d_head      = cfg_.mamba_d_head;
+                const int d_state     = cfg_.mamba_d_state;
+                const int n_groups    = cfg_.mamba_n_groups;
+                const int d_state_tot = n_groups * d_state;
+                const int conv_dim    = d_inner + 2 * d_state_tot;
+                ops::mamba2_backward(dev,
+                                     act.saved_xb[sl].f32(),
+                                     L.mamba_in_proj.w.f32(),
+                                     L.mamba_conv_w.w.f32(),
+                                     L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32() : nullptr,
+                                     L.mamba_dt_bias.w.f32(),
+                                     L.mamba_A_log.w.f32(),
+                                     L.mamba_D.w.f32(),
+                                     L.mamba_norm.w.f32(),
+                                     L.mamba_out_proj.w.f32(),
+                                     dy_mamba,
+                                     act.dxb.f32(),
+                                     L.mamba_in_proj.g.defined() ? L.mamba_in_proj.g.f32() : nullptr,
+                                     L.mamba_conv_w.g.defined() ? L.mamba_conv_w.g.f32() : nullptr,
+                                     L.mamba_conv_b.w.defined() && L.mamba_conv_b.g.defined() ? L.mamba_conv_b.g.f32() : nullptr,
+                                     L.mamba_dt_bias.g.defined() ? L.mamba_dt_bias.g.f32() : nullptr,
+                                     L.mamba_A_log.g.defined() ? L.mamba_A_log.g.f32() : nullptr,
+                                     L.mamba_D.g.defined() ? L.mamba_D.g.f32() : nullptr,
+                                     L.mamba_norm.g.defined() ? L.mamba_norm.g.f32() : nullptr,
+                                     L.mamba_out_proj.g.defined() ? L.mamba_out_proj.g.f32() : nullptr,
+                                     B, T, d, d_inner, conv_dim, n_heads, d_head, d_state,
+                                     cfg_.mamba_d_conv, cfg_.rms_eps);
+            }
+
+            ops::rmsnorm_backward(dev, act.saved_x[sl].f32(), L.attn_norm.w.f32(), act.dxb.f32(),
+                                  act.saved_rrms1[sl].f32(), act.dx.f32(), L.attn_norm.g.f32(), N, d);
+        } else {
+
         // attention: x_mid = x_in + W_o(attn(...))
         ops::zero(dev, act.dattout.f32(), N * qd);
-        ops::linear_backward(dev, act.saved_attout[sl].f32(), L.wo.w.f32(), act.dx.f32(),
+        const float* dy_attn = act.dx.f32();
+        if (cfg_.residual_multiplier != 1.0f) {
+            ops::copy(dev, act.dtmp.f32(), act.dx.f32(), N * d);
+            ops::scale_inplace(dev, act.dtmp.f32(), cfg_.residual_multiplier, N * d);
+            dy_attn = act.dtmp.f32();
+        }
+        ops::linear_backward(dev, act.saved_attout[sl].f32(), L.wo.w.f32(), dy_attn,
                              act.dattout.f32(), L.wo.g.f32(), static_cast<int>(N), qd, d);
-        lora_backward(L.lora_o, dev, act.saved_attout[sl].f32(), act.dx.f32(), act.dattout.f32(), static_cast<int>(N));
+        lora_backward(L.lora_o, dev, act.saved_attout[sl].f32(), dy_attn, act.dattout.f32(), static_cast<int>(N));
 
         ops::zero(dev, act.dq.f32(), N * qd);
         ops::zero(dev, act.dk.f32(), N * kvd);
@@ -2437,9 +2617,13 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
 
         ops::rmsnorm_backward(dev, act.saved_x[sl].f32(), L.attn_norm.w.f32(), act.dxb.f32(),
                               act.saved_rrms1[sl].f32(), act.dx.f32(), L.attn_norm.g.f32(), N, d);
+        }
     }
 
     // ---- embeddings
+    if (cfg_.embedding_multiplier != 1.0f) {
+        ops::scale_inplace(dev, act.dx.f32(), cfg_.embedding_multiplier, N * d);
+    }
     ops::embedding_backward(dev, ids, act.dx.f32(), tok_emb_.g.f32(), N, d, V);
 
     double loss = loss_sum / static_cast<double>(ntok);

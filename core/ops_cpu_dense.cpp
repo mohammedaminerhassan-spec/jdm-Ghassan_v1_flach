@@ -213,6 +213,22 @@ void embedding_forward(const i32* ids, const float* table, float* out,
     }
 }
 
+void embedding_forward_half(const i32* ids, const u16* table, float* out,
+                            i64 ntok, int dim, int vocab) {
+    // The reference half-precision embedding: the row is widened on the fly.
+    // (The GPU version reads the half table directly.)
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i64 t = 0; t < ntok; ++t) {
+        i32 id = ids[t];
+        float* o = out + t * dim;
+        if (id < 0 || id >= vocab) { std::memset(o, 0, sizeof(float) * static_cast<size_t>(dim)); continue; }
+        const u16* row = table + static_cast<size_t>(id) * dim;
+        for (i64 i = 0; i < dim; ++i) o[i] = fp16_to_fp32(row[i]);
+    }
+}
+
 void embedding_backward(const i32* ids, const float* dout, float* dtable,
                         i64 ntok, int dim, int vocab) {
 

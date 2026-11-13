@@ -18,13 +18,14 @@ namespace {
 // The model is allocated on the device before a single weight is read, so
 // a model that does not fit the GPU dies inside cudaMalloc with a cryptic
 // "out of memory". This pre-flight turns that into an actionable message.
-void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_cache_on) {
+void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_cache_on,
+                       bool fp16_weights = false) {
     if (dev != Device::CUDA) return;
     const DeviceInfo& di = device_info();
     if (!di.cuda_available || di.total_mem == 0) return;
 
     const Model::MemoryPlan plan =
-        Model::plan_memory(cfg, 1, ctx > 0 ? ctx : 512, false, 1, fp16_cache_on);
+        Model::plan_memory(cfg, 1, ctx > 0 ? ctx : 512, false, 1, fp16_cache_on, fp16_weights);
     const size_t kv   = Model::kv_cache_bytes(cfg, ctx > 0 ? ctx : cfg.max_seq_len);
     const size_t mam  = Model::mamba_state_bytes(cfg);
     const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, ctx > 0 ? ctx : 512);
@@ -45,14 +46,17 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
 
     if (need > di.total_mem) {
         GAI_FAIL(strfmt("the model does not fit this GPU: it needs %s but the card has %s "
-                        "(%s of fp32 weights + %s of fp16 cache + %s of activations/KV). "
+                        "(%s of %s weights + %s of activations/KV). "
                         "Options: --device cpu (slower, uses the host RAM), a smaller --ctx, "
-                        "--no-fp16-cache (frees the fp16 copy), or the fp16 weight storage "
-                        "mode (not implemented yet: the engine still keeps fp32 masters).",
+                        "--weight-f16 1 (the weights in half precision: %s instead of %s), "
+                        "or --no-fp16-cache (frees the fp16 copy).",
                         human_bytes(need).c_str(), human_bytes(di.total_mem).c_str(),
                         human_bytes(plan.weights).c_str(),
-                        human_bytes(plan.fp16_cache).c_str(),
-                        human_bytes(plan.activations + kv).c_str()));
+                        fp16_weights ? "half-precision" : "fp32",
+                        human_bytes(plan.activations + kv).c_str(),
+                        human_bytes(Model::plan_memory(cfg, 1, ctx > 0 ? ctx : 512, false, 1,
+                                                       false, true).weights).c_str(),
+                        human_bytes(plan.weights).c_str()));
     }
 }
 
@@ -123,6 +127,17 @@ LoadedModel load_model(const Args& args) {
     }
 
     lm.path = path;
+    // The fp16 weight storage mode: the big matrices live in half precision on
+    // the device. It is ON by default on the GPU (it is what makes a 6.94B
+    // model fit on a 16 GB card) and OFF on the CPU (the reference path stays
+    // bit-identical).
+    const bool fp16_weights = args.flag("weight-f16", dev == Device::CUDA);
+    if (args.has("weight-f16"))
+        log_info(strfmt("[prec] fp16 weight storage: %s (explicit --weight-f16)",
+                        fp16_weights ? "on" : "off"));
+    else if (fp16_weights)
+        log_info("[prec] fp16 weight storage: on (the default on the GPU: the weights "
+                 "are half precision, the activations stay fp32)");
     if (is_gguf) {
         if (args.flag("mmap", false))
             log_warn("--mmap has no effect on GGUF files; loading normally");
@@ -155,9 +170,9 @@ LoadedModel load_model(const Args& args) {
 
         Timer t;
         const bool fp16_cache_on = (dev == Device::CUDA) && ops::gemm_fp16_enabled() &&
-                                   !args.flag("no-fp16-cache", false);
-        check_vram_budget(lm.cfg, dev, args.num_int("ctx", 0), fp16_cache_on);
-        lm.model = std::make_unique<Model>(lm.cfg, dev);
+                                   !args.flag("no-fp16-cache", false) && !fp16_weights;
+        check_vram_budget(lm.cfg, dev, args.num_int("ctx", 0), fp16_cache_on, fp16_weights);
+        lm.model = std::make_unique<Model>(lm.cfg, dev, fp16_weights);
         GAI_CHECK(load_model_from_gguf(path, *lm.model),
                   "failed to load weights from: " + path);
         if (fp16_cache_on) {
@@ -202,9 +217,9 @@ LoadedModel load_model(const Args& args) {
 
         Timer t;
         const bool fp16_cache_on = (dev == Device::CUDA) && ops::gemm_fp16_enabled() &&
-                                   !args.flag("no-fp16-cache", false);
-        check_vram_budget(lm.cfg, dev, args.num_int("ctx", 0), fp16_cache_on);
-        lm.model = std::make_unique<Model>(lm.cfg, dev);
+                                   !args.flag("no-fp16-cache", false) && !fp16_weights;
+        check_vram_budget(lm.cfg, dev, args.num_int("ctx", 0), fp16_cache_on, fp16_weights);
+        lm.model = std::make_unique<Model>(lm.cfg, dev, fp16_weights);
         GAI_CHECK(hf.load_model(*lm.model),
                   "failed to load the weights of: " + path);
         if (fp16_cache_on) {

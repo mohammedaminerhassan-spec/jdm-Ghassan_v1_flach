@@ -137,6 +137,28 @@ void Tensor::copy_from(const Tensor& src) {
     device_copy(data_ptr(), device_, src.data_ptr(), src.device(), nbytes());
 }
 
+void Tensor::copy_from_f32(const Tensor& src) {
+    GAI_CHECK(defined() && src.defined(), "copy_from_f32 on undefined tensor");
+    GAI_CHECK(src.dtype() == DType::F32, "copy_from_f32: the source must be fp32");
+    GAI_CHECK(src.numel() == numel_, "copy_from_f32 numel mismatch");
+    GAI_CHECK(!is_external(), "copy_from_f32 into read-only external view (mmap weight?)");
+    if (dtype_ == DType::F32) {
+        device_copy(data_ptr(), device_, src.data_ptr(), src.device(), nbytes());
+        return;
+    }
+    GAI_CHECK(dtype_ == DType::F16, "copy_from_f32: the destination must be fp32 or fp16");
+    // The conversion happens on the host (the checkpoint is read there) and
+    // only the half bytes travel to the device: half the PCIe traffic of the
+    // fp32 path.
+    GAI_CHECK(src.device() == Device::CPU,
+              "copy_from_f32: the source must live on the host");
+    std::vector<u16> half(static_cast<size_t>(numel_));
+    const float* src_f = src.f32();
+    for (i64 i = 0; i < numel_; ++i) half[static_cast<size_t>(i)] = fp32_to_fp16(src_f[i]);
+    device_copy(data_ptr(), device_, half.data(), Device::CPU,
+                half.size() * sizeof(u16));
+}
+
 std::string Tensor::shape_str() const {
     std::ostringstream ss;
     ss << "[";

@@ -411,8 +411,16 @@ void copy(float* dst, const float* src, i64 n) {
     CU_CHECK(cudaMemcpy(dst, src, sizeof(float) * size_t(n), cudaMemcpyDeviceToDevice));
 }
 
-__global__ void k_embed_fwd(const i32* ids, const float* table, float* out,
-                            i64 ntok, int dim, int vocab) {
+// The embedding table in the caller's precision: fp32 for the reference
+// path, half for the fp16 storage mode (the table is the tied lm_head).
+__device__ __forceinline__ float embed_value(float v) { return v; }
+__device__ __forceinline__ float embed_value(u16 v) {
+    return __half2float(*reinterpret_cast<const __half*>(&v));
+}
+
+template <typename T>
+__global__ void k_embed_fwd_t(const i32* ids, const T* table, float* out,
+                             i64 ntok, int dim, int vocab) {
     i64 t = blockIdx.x;
     if (t >= ntok) return;
     i32 id = ids[t];
@@ -421,8 +429,8 @@ __global__ void k_embed_fwd(const i32* ids, const float* table, float* out,
         for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = 0.0f;
         return;
     }
-    const float* src = table + i64(id) * dim;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = src[i];
+    const T* src = table + i64(id) * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = embed_value(src[i]);
 }
 
 __global__ void k_embed_bwd(const i32* ids, const float* dout, float* dtable,
@@ -443,7 +451,18 @@ void embedding_forward(const i32* ids, const float* table, float* out,
     GAI_CHECK(ntok <= 2147483647LL, "embedding_forward: ntok exceeds INT_MAX");
     int block = dim >= 256 ? 256 : ((dim + 31) / 32) * 32;
     if (block < 32) block = 32;
-    k_embed_fwd<<<static_cast<int>(ntok), block>>>(ids, table, out, ntok, dim, vocab);
+    k_embed_fwd_t<float><<<static_cast<int>(ntok), block>>>(ids, table, out, ntok, dim, vocab);
+    CU_CHECK(cudaGetLastError());
+}
+
+void embedding_forward_half(const i32* ids, const u16* table, float* out,
+                            i64 ntok, int dim, int vocab) {
+    if (ntok <= 0) return;
+
+    GAI_CHECK(ntok <= 2147483647LL, "embedding_forward_half: ntok exceeds INT_MAX");
+    int block = dim >= 256 ? 256 : ((dim + 31) / 32) * 32;
+    if (block < 32) block = 32;
+    k_embed_fwd_t<u16><<<static_cast<int>(ntok), block>>>(ids, table, out, ntok, dim, vocab);
     CU_CHECK(cudaGetLastError());
 }
 

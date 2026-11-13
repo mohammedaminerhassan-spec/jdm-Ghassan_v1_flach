@@ -56,3 +56,7 @@ __pycache__/
 .venv/
 
 safetensors/
+plan*.md
+plam*.md
+Qwen2.5-Omni-main/
+

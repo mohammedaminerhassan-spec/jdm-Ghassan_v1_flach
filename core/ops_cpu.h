@@ -52,6 +52,12 @@ void embedding_forward(const i32* ids, const float* table, float* out,
 void embedding_backward(const i32* ids, const float* dout, float* dtable,
                         i64 ntok, int dim, int vocab);
 
+// The fp16 storage mode on the CPU: the weights are half, the reference
+// implementation converts them on the fly (correct, not fast). It exists so
+// the half-precision path can be verified on a machine without a GPU.
+void embedding_forward_half(const i32* ids, const u16* table, float* out,
+                            i64 ntok, int dim, int vocab);
+
 // ---- the norms (ops_cpu_dense.cpp)
 
 void rmsnorm_forward(const float* x, const float* weight, float* out, float* rrms,
@@ -96,6 +102,23 @@ void moe_forward(const float* x, const float* router_w,
 void moe_forward_bias(const float* x, const float* router_w, const float* router_bias,
                       const float* gates, const float* ups, const float* downs,
                       const float* sh_g, const float* sh_u, const float* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH);
+
+// The fp16 storage mode (reference implementation: the weights are
+// converted to fp32 on the fly).
+void moe_forward_half(const float* x, const float* router_w,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH);
+void moe_forward_bias_half(const float* x, const float* router_w, const float* router_bias,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
@@ -148,6 +171,44 @@ void mamba2_forward(const float* x,
                     float* out,
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                     int d_head, int d_state, int k, float eps);
+
+// The fp16 storage mode (reference implementation: the two projections are
+// converted to fp32 on the fly).
+void mamba2_forward_half(const float* x,
+                    const u16* w_in,
+                    const float* conv_w,
+                    const float* conv_b,
+                    const float* dt_bias,
+                    const float* a_log,
+                    const float* D,
+                    const float* norm_w,
+                    const u16* w_out,
+                    float* state,
+                    float* out,
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps);
+
+void mamba2_backward(const float* x,
+                     const float* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const float* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps);
 
 // ---- the attention (ops_cpu_attention.cpp)
 

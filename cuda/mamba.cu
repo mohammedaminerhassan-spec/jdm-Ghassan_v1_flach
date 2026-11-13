@@ -29,6 +29,7 @@
 #include <cuda_runtime.h>
 #include <cfloat>
 #include <cmath>
+#include <type_traits>
 
 namespace gai {
 namespace cuda_ops {
@@ -93,7 +94,7 @@ __global__ void k_mamba_conv1d(const float* __restrict__ in,
                                const float* __restrict__ w,     // [C, k]
                                const float* __restrict__ bias,  // [C] or null
                                float* __restrict__ out,
-                               int B, int T, int C, int k) {
+                               int B, int T, int C, int in_stride, int k) {
     extern __shared__ float sh[];
     const int c = blockIdx.x;
     const int b = blockIdx.y;
@@ -110,7 +111,7 @@ __global__ void k_mamba_conv1d(const float* __restrict__ in,
     const float bc = bias ? bias[c] : 0.0f;
 
     for (int t = 0; t < T; ++t) {
-        const float x = in[((size_t(b) * T + t) * C) + c];
+        const float x = in[((size_t(b) * T + t) * in_stride) + c];
         if (lane == 0) *val = x;
         __syncthreads();
 
@@ -121,7 +122,7 @@ __global__ void k_mamba_conv1d(const float* __restrict__ in,
         }
         out[((size_t(b) * T + t) * C) + c] = acc / (1.0f + expf(-acc));
         __syncthreads();
-        if (lane < k - 1) {
+        if (lane == 0) {
             for (int j = 0; j + 1 < k - 1; ++j) win[j] = win[j + 1];
             if (k - 1 > 0) win[k - 2] = x;
         }
@@ -239,15 +240,28 @@ __global__ void k_mamba_gated_norm(const float* __restrict__ y,
 }
 
 // ---------------------------------------------------------------- public API
-void mamba2_forward(const float* x,          // [B, T, d]
-                    const float* w_in,       // [proj_size, d]
+// The two projections run with the weights in the caller's precision: fp32
+// for the reference path, half for the fp16 storage mode (the tensor cores
+// multiply, the accumulator stays fp32).
+template <typename W>
+static inline void mamba_linear(const float* x, const W* w, float* y, int M, int K, int N) {
+    if constexpr (std::is_same<W, u16>::value) {
+        linear_forward_fp16(x, w, y, M, K, N);
+    } else {
+        linear_forward(x, w, y, M, K, N);
+    }
+}
+
+template <typename W>
+static void mamba2_forward_impl(const float* x,          // [B, T, d]
+                    const W* w_in,       // [proj_size, d]
                     const float* conv_w,     // [conv_dim, k]
                     const float* conv_b,     // [conv_dim] or null
                     const float* dt_bias,    // [n_heads]
                     const float* a_log,      // [n_heads]
                     const float* D,          // [n_heads]
                     const float* norm_w,     // [d_inner]
-                    const float* w_out,      // [d, d_inner]
+                    const W* w_out,      // [d, d_inner]
                     float* state,            // [B, n_heads, d_head, d_state]
                     float* out,              // [B, T, d]
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
@@ -264,7 +278,7 @@ void mamba2_forward(const float* x,          // [B, T, d]
     float* y    = bc   + n_tok * size_t(conv_dim);
 
     // 1) in_proj
-    linear_forward(x, w_in, proj, B * T, d, proj_size);
+    mamba_linear(x, w_in, proj, B * T, d, proj_size);
 
     // 2) causal depthwise conv1d + SiLU over the bc part
     {
@@ -272,7 +286,7 @@ void mamba2_forward(const float* x,          // [B, T, d]
         const int block = 128;
         const size_t sh = sizeof(float) * (k > 1 ? k : 1);
         k_mamba_conv1d<<<grid, block, sh>>>(proj + d_inner, conv_w, conv_b,
-                                           bc, B, T, conv_dim, k);
+                                           bc, B, T, conv_dim, proj_size, k);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
 
@@ -294,7 +308,391 @@ void mamba2_forward(const float* x,          // [B, T, d]
                                              y, B * T, d_inner, proj_size, eps);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
-    linear_forward(y, w_out, out, B * T, d_inner, d);
+    mamba_linear(y, w_out, out, B * T, d_inner, d);
+}
+
+void mamba2_forward(const float* x,          // [B, T, d]
+                    const float* w_in,       // [proj_size, d]
+                    const float* conv_w,     // [conv_dim, k]
+                    const float* conv_b,     // [conv_dim] or null
+                    const float* dt_bias,    // [n_heads]
+                    const float* a_log,      // [n_heads]
+                    const float* D,          // [n_heads]
+                    const float* norm_w,     // [d_inner]
+                    const float* w_out,      // [d, d_inner]
+                    float* state,            // [B, n_heads, d_head, d_state]
+                    float* out,              // [B, T, d]
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps) {
+    mamba2_forward_impl<float>(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                               norm_w, w_out, state, out,
+                               B, T, d, d_inner, conv_dim, n_heads,
+                               d_head, d_state, k, eps);
+}
+
+void mamba2_forward_half(const float* x,          // [B, T, d]
+                    const u16* w_in,       // [proj_size, d]
+                    const float* conv_w,     // [conv_dim, k]
+                    const float* conv_b,     // [conv_dim] or null
+                    const float* dt_bias,    // [n_heads]
+                    const float* a_log,      // [n_heads]
+                    const float* D,          // [n_heads]
+                    const float* norm_w,     // [d_inner]
+                    const u16* w_out,      // [d, d_inner]
+                    float* state,            // [B, n_heads, d_head, d_state]
+                    float* out,              // [B, T, d]
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps) {
+    mamba2_forward_impl<u16>(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                             norm_w, w_out, state, out,
+                             B, T, d, d_inner, conv_dim, n_heads,
+                             d_head, d_state, k, eps);
+}
+
+// ---------------------------------------------------------------- backward kernels
+
+__global__ void k_mamba_gated_norm_bwd(const float* __restrict__ dy_norm,
+                                       const float* __restrict__ y_scan,
+                                       const float* __restrict__ proj,
+                                       const float* __restrict__ norm_w,
+                                       float* __restrict__ dy_scan,
+                                       float* __restrict__ dgate,
+                                       float* __restrict__ dnorm_w,
+                                       int N, int dim, int proj_size, float eps) {
+    extern __shared__ float sh_red[];
+    const int n = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int nthr = blockDim.x;
+
+    const float* dyn = dy_norm + size_t(n) * dim;
+    const float* yr  = y_scan  + size_t(n) * dim;
+    const float* gr  = proj    + size_t(n) * proj_size;
+    float* dys       = dy_scan + size_t(n) * dim;
+    float* dg        = dgate   + size_t(n) * dim;
+
+    float ss = 0.0f;
+    for (int c = lane; c < dim; c += nthr) {
+        float sig = 1.0f / (1.0f + expf(-gr[c]));
+        float v = yr[c] * (gr[c] * sig);
+        ss += v * v;
+    }
+    ss = block_reduce_sum(ss, sh_red, lane, nthr);
+    __shared__ float s_inv;
+    if (lane == 0) s_inv = 1.0f / sqrtf(ss / dim + eps);
+    __syncthreads();
+
+    float sum_pv = 0.0f;
+    for (int c = lane; c < dim; c += nthr) {
+        float sig = 1.0f / (1.0f + expf(-gr[c]));
+        float v = yr[c] * (gr[c] * sig);
+        float p = dyn[c] * norm_w[c];
+        sum_pv += p * v;
+    }
+    sum_pv = block_reduce_sum(sum_pv, sh_red, lane, nthr);
+    __shared__ float s_adj;
+    if (lane == 0) s_adj = sum_pv * (s_inv * s_inv) / float(dim);
+    __syncthreads();
+
+    const float inv = s_inv;
+    const float adj = s_adj;
+    for (int c = lane; c < dim; c += nthr) {
+        float sig = 1.0f / (1.0f + expf(-gr[c]));
+        float g = gr[c] * sig;
+        float v = yr[c] * g;
+        float p = dyn[c] * norm_w[c];
+        float dv = inv * (p - v * adj);
+        float dsilu = sig * (1.0f + gr[c] * (1.0f - sig));
+        dys[c] = dv * g;
+        dg[c] = dv * yr[c] * dsilu;
+        if (dnorm_w) {
+            atomicAdd(&dnorm_w[c], dyn[c] * v * inv);
+        }
+    }
+}
+
+__global__ void k_mamba_scan_bwd(const float* __restrict__ proj,
+                                 const float* __restrict__ bc,
+                                 const float* __restrict__ dy_scan,
+                                 const float* __restrict__ dtw,
+                                 const float* __restrict__ alog,
+                                 const float* __restrict__ Dv,
+                                 float* __restrict__ dbc,
+                                 float* __restrict__ ddt_raw,
+                                 float* __restrict__ dD,
+                                 float* __restrict__ da_log,
+                                 float* __restrict__ ddt_bias,
+                                 int B, int T, int n_heads, int d_head, int d_state,
+                                 int d_inner, int conv_dim, int proj_size) {
+    extern __shared__ float sh_mem[];
+    float* sh_state = sh_mem;
+    float* sh_ds    = sh_mem + d_state;
+    float* sh_red   = sh_mem + 2 * d_state;
+
+    const int row  = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int nthr = blockDim.x;
+
+    const int inner = n_heads * d_head;
+    const int b     = row / inner;
+    const int rem   = row - b * inner;
+    const int h     = rem / d_head;
+    const int i     = rem - h * d_head;
+
+    const float a_val     = -expf(alog[h]);
+    const float dt_bias_v = dtw[h];
+    const float dskip     = Dv[h];
+    const int   x_off     = h * d_head + i;
+    const int   B_off     = d_inner;
+    const int   C_off     = d_inner + d_state;
+
+    for (int j = lane; j < d_state; j += nthr) sh_ds[j] = 0.0f;
+    __syncthreads();
+
+    // Replay forward and backward per token:
+    // To minimize memory, we do backward with sequential state replay
+    for (int t = T - 1; t >= 0; --t) {
+        // Forward recompute from 0 to t for this token's state
+        for (int j = lane; j < d_state; j += nthr) sh_state[j] = 0.0f;
+        __syncthreads();
+        for (int step = 0; step < t; ++step) {
+            const float* prow = proj + (size_t(b) * T + step) * proj_size;
+            const float* brow = bc   + (size_t(b) * T + step) * conv_dim;
+            const float dt_in = prow[proj_size - n_heads + h];
+            const float dt_val = (dt_in + dt_bias_v > 20.0f) ? (dt_in + dt_bias_v)
+                                                            : log1pf(expf(dt_in + dt_bias_v));
+            const float dA = expf(a_val * dt_val);
+            const float xv = brow[x_off];
+            for (int j = lane; j < d_state; j += nthr) {
+                sh_state[j] = dA * sh_state[j] + (dt_val * brow[B_off + j]) * xv;
+            }
+            __syncthreads();
+        }
+
+        const size_t tok_idx = size_t(b) * T + t;
+        const float* prow = proj + tok_idx * proj_size;
+        const float* brow = bc   + tok_idx * conv_dim;
+        float* d_brow     = dbc  + tok_idx * conv_dim;
+        const float dy_val = dy_scan[tok_idx * d_inner + x_off];
+
+        const float dt_in = prow[proj_size - n_heads + h];
+        const float u = dt_in + dt_bias_v;
+        const float dt_val = (u > 20.0f) ? u : log1pf(expf(u));
+        const float s_softplus = (u > 20.0f) ? 1.0f : (1.0f / (1.0f + expf(-u)));
+        const float dA = expf(a_val * dt_val);
+        const float xv = brow[x_off];
+
+        if (dD && lane == 0) atomicAdd(&dD[h], dy_val * xv);
+        float dx_val = dy_val * dskip;
+
+        float local_d_dA = 0.0f;
+        float local_d_dt = 0.0f;
+
+        for (int j = lane; j < d_state; j += nthr) {
+            const float Cj = brow[C_off + j];
+            const float Bj = brow[B_off + j];
+
+            atomicAdd(&d_brow[C_off + j], dy_val * sh_state[j]);
+
+            const float total_ds = dy_val * Cj + sh_ds[j];
+            local_d_dA += total_ds * sh_state[j];
+            local_d_dt += total_ds * Bj * xv;
+
+            atomicAdd(&d_brow[B_off + j], total_ds * (dt_val * xv));
+            dx_val += total_ds * (dt_val * Bj);
+            sh_ds[j] = total_ds * dA;
+        }
+        __syncthreads();
+
+        dx_val = block_reduce_sum(dx_val, sh_red, lane, nthr);
+        if (lane == 0) atomicAdd(&d_brow[x_off], dx_val);
+
+        local_d_dA = block_reduce_sum(local_d_dA, sh_red, lane, nthr);
+        local_d_dt = block_reduce_sum(local_d_dt, sh_red, lane, nthr);
+
+        if (lane == 0) {
+            const float d_adt = local_d_dA * dA;
+            if (da_log) atomicAdd(&da_log[h], d_adt * dt_val * (-expf(alog[h])));
+            float d_dt_total = local_d_dt + d_adt * a_val;
+            float ddt_raw_val = d_dt_total * s_softplus;
+            if (ddt_bias) atomicAdd(&ddt_bias[h], ddt_raw_val);
+            atomicAdd(&ddt_raw[tok_idx * n_heads + h], ddt_raw_val);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void k_mamba_conv1d_bwd(const float* __restrict__ proj,
+                                   const float* __restrict__ conv_w,
+                                   const float* __restrict__ conv_b,
+                                   const float* __restrict__ dbc,
+                                   float* __restrict__ dconv_w,
+                                   float* __restrict__ dconv_b,
+                                   float* __restrict__ dproj_bc,
+                                   int B, int T, int conv_dim, int proj_size, int k) {
+    const int c = blockIdx.x;
+    const int b = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int nthr = blockDim.x;
+
+    const float* wc = conv_w + size_t(c) * k;
+    const float bcv = conv_b ? conv_b[c] : 0.0f;
+
+    for (int t = lane; t < T; t += nthr) {
+        float raw_acc = bcv;
+        for (int j = 0; j < k; ++j) {
+            const int tin = t - (k - 1 - j);
+            if (tin >= 0) {
+                const size_t pidx = (size_t(b) * T + tin) * proj_size + c;
+                raw_acc += wc[j] * proj[pidx];
+            }
+        }
+        const size_t idx = (size_t(b) * T + t) * conv_dim + c;
+        const float sig = 1.0f / (1.0f + expf(-raw_acc));
+        const float dsilu = sig * (1.0f + raw_acc * (1.0f - sig));
+        const float dacc = dbc[idx] * dsilu;
+
+        if (dconv_b) atomicAdd(&dconv_b[c], dacc);
+
+        for (int j = 0; j < k; ++j) {
+            const int tin = t - (k - 1 - j);
+            if (tin >= 0) {
+                const size_t pidx = (size_t(b) * T + tin) * proj_size + c;
+                if (dconv_w) atomicAdd(&dconv_w[size_t(c) * k + j], dacc * proj[pidx]);
+                const size_t out_idx = (size_t(b) * T + tin) * conv_dim + c;
+                atomicAdd(&dproj_bc[out_idx], dacc * wc[j]);
+            }
+        }
+    }
+}
+
+__global__ void k_mamba_assemble_dproj(const float* __restrict__ dgate,
+                                       const float* __restrict__ dproj_bc,
+                                       const float* __restrict__ ddt_raw,
+                                       float* __restrict__ dproj,
+                                       int N, int d_inner, int conv_dim, int n_heads, int proj_size) {
+    const int n = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int nthr = blockDim.x;
+
+    float* dp = dproj + size_t(n) * proj_size;
+    const float* dg = dgate + size_t(n) * d_inner;
+    const float* dbc_p = dproj_bc + size_t(n) * conv_dim;
+    const float* ddt_p = ddt_raw + size_t(n) * n_heads;
+
+    for (int i = lane; i < d_inner; i += nthr) dp[i] = dg[i];
+    for (int i = lane; i < conv_dim; i += nthr) dp[d_inner + i] = dbc_p[i];
+    for (int i = lane; i < n_heads; i += nthr) dp[d_inner + conv_dim + i] = ddt_p[i];
+}
+
+void mamba2_backward(const float* x,
+                     const float* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const float* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps) {
+    if (B <= 0 || T <= 0) return;
+    const int proj_size = d_inner + conv_dim + n_heads;
+    const size_t n_tok = size_t(B) * T;
+
+    // Transient workspace for backward:
+    // proj [N, proj_size] + bc [N, conv_dim] + y_scan [N, d_inner] +
+    // dy_norm [N, d_inner] + dy_scan [N, d_inner] + dgate [N, d_inner] +
+    // dbc [N, conv_dim] + ddt_raw [N, n_heads] + dproj_bc [N, conv_dim] + dproj [N, proj_size]
+    const size_t total_floats = n_tok * (size_t(proj_size) * 2 + size_t(conv_dim) * 3 + size_t(d_inner) * 4 + n_heads) + 256;
+    float* ws = mamba_workspace(total_floats);
+
+    float* proj     = ws;
+    float* bc       = proj     + n_tok * size_t(proj_size);
+    float* y_scan   = bc       + n_tok * size_t(conv_dim);
+    float* dy_norm  = y_scan   + n_tok * size_t(d_inner);
+    float* dy_scan  = dy_norm  + n_tok * size_t(d_inner);
+    float* dgate    = dy_scan  + n_tok * size_t(d_inner);
+    float* dbc      = dgate    + n_tok * size_t(d_inner);
+    float* ddt_raw  = dbc      + n_tok * size_t(conv_dim);
+    float* dproj_bc = ddt_raw  + n_tok * size_t(n_heads);
+    float* dproj    = dproj_bc + n_tok * size_t(conv_dim);
+
+    // Forward recompute
+    linear_forward(x, w_in, proj, B * T, d, proj_size);
+    {
+        dim3 grid(conv_dim, B);
+        const int block = 128;
+        const size_t sh = sizeof(float) * (k > 1 ? k : 1);
+        k_mamba_conv1d<<<grid, block, sh>>>(proj + d_inner, conv_w, conv_b,
+                                            bc, B, T, conv_dim, proj_size, k);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+    {
+        const int rows = B * n_heads * d_head;
+        const int block = 256;
+        const size_t sh = sizeof(float) * d_state;
+        k_mamba_scan<<<rows, block, sh>>>(proj, bc, dt_bias, a_log, D,
+                                          nullptr, y_scan, B, T, n_heads, d_head,
+                                          d_state, d_inner, conv_dim, proj_size);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+
+    // B1) Out projection backward
+    linear_backward(nullptr, w_out, dout, dy_norm, dw_out, B * T, d_inner, d);
+
+    // B2) Gated RMSNorm backward
+    {
+        const int block = 256;
+        const size_t sh = sizeof(float) * 32;
+        k_mamba_gated_norm_bwd<<<B * T, block, sh>>>(dy_norm, y_scan, proj, norm_w,
+                                                     dy_scan, dgate, dnorm_w,
+                                                     B * T, d_inner, proj_size, eps);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+
+    // B3) Scan backward
+    CU_MAMBA_CHECK(cudaMemset(dbc, 0, sizeof(float) * n_tok * conv_dim));
+    CU_MAMBA_CHECK(cudaMemset(ddt_raw, 0, sizeof(float) * n_tok * n_heads));
+    {
+        const int rows = B * n_heads * d_head;
+        const int block = 256;
+        const size_t sh = sizeof(float) * (2 * d_state + 32);
+        k_mamba_scan_bwd<<<rows, block, sh>>>(proj, bc, dy_scan, dt_bias, a_log, D,
+                                              dbc, ddt_raw, dD, da_log, ddt_bias,
+                                              B, T, n_heads, d_head, d_state,
+                                              d_inner, conv_dim, proj_size);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+
+    // B4) Conv1d backward
+    CU_MAMBA_CHECK(cudaMemset(dproj_bc, 0, sizeof(float) * n_tok * conv_dim));
+    {
+        dim3 grid(conv_dim, B);
+        const int block = 128;
+        k_mamba_conv1d_bwd<<<grid, block>>>(proj + d_inner, conv_w, conv_b,
+                                            dbc, dconv_w, dconv_b, dproj_bc,
+                                            B, T, conv_dim, proj_size, k);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+
+    // B5) Assemble dproj and in_proj backward
+    {
+        const int block = 256;
+        k_mamba_assemble_dproj<<<B * T, block>>>(dgate, dproj_bc, ddt_raw, dproj,
+                                                B * T, d_inner, conv_dim, n_heads, proj_size);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+    linear_backward(x, w_in, dproj, dx, dw_in, B * T, d, proj_size);
 }
 
 }  // namespace cuda_ops

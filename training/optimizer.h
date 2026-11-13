@@ -152,6 +152,10 @@ private:
     bool uses_ns(const Parameter* p) const {
         if (!p || p->frozen) return false;
         if (p->shape.size() != 2 || !p->decay) return false;
+        // MoE weights (moe_w1, moe_w2, moe_w3, moe_gate) are stacked experts.
+        // Treating concatenated experts as a single monolithic 2D matrix in Newton-Schulz
+        // destroys inter-expert subspace diversity. Direct them to Lion/AdamW instead.
+        if (p->name.find("moe_") != std::string::npos) return false;
         if (cfg_.min_ns_dim <= 0) return true;
         const i64 r = p->shape[0], c = p->shape[1];
         return (r < c ? r : c) >= static_cast<i64>(cfg_.min_ns_dim);

@@ -37,6 +37,8 @@ void copy(float* dst, const float* src, i64 n);
 
 void embedding_forward(const i32* ids, const float* table, float* out,
                        i64 ntok, int dim, int vocab);
+void embedding_forward_half(const i32* ids, const u16* table, float* out,
+                            i64 ntok, int dim, int vocab);
 void embedding_backward(const i32* ids, const float* dout, float* dtable,
                         i64 ntok, int dim, int vocab);
 
@@ -79,6 +81,22 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
                       float* s_gate, float* s_up, float* s_act,
                       i64 N, int d, int E, int ne, int K, int SH);
 
+// The fp16 storage mode: the expert matrices live in half on the device.
+void moe_forward_half(const float* x, const float* router_w,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH);
+void moe_forward_bias_half(const float* x, const float* router_w, const float* router_bias,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH);
+
 // IBM Granite-4.0: one Mamba-2 layer over a whole sequence.
 //   x      [B, T, d]        the layer input
 //   w_in   [proj, d]        in_proj weight
@@ -105,6 +123,44 @@ void mamba2_forward(const float* x,
 // Releases the cached Mamba-2 scratch buffer (called with the other
 // workspaces at shutdown).
 void mamba_free_workspace();
+
+// The fp16 storage mode: the two projections live in half on the device.
+void mamba2_forward_half(const float* x,
+                    const u16* w_in,
+                    const float* conv_w,
+                    const float* conv_b,
+                    const float* dt_bias,
+                    const float* a_log,
+                    const float* D,
+                    const float* norm_w,
+                    const u16* w_out,
+                    float* state,
+                    float* out,
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps);
+
+void mamba2_backward(const float* x,
+                     const float* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const float* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps);
+
 void moe_backward(const float* x, const float* router_w,
                   const float* gates, const float* ups, const float* downs,
                   const float* sh_g, const float* sh_u, const float* sh_d,

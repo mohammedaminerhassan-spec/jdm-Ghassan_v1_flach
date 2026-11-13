@@ -511,7 +511,7 @@ __global__ void k_attn_group_reduce(const float* __restrict__ big, float* __rest
             const int gh = kvh * group + h;
             a += big[((size_t(b) * H + gh) * T + j) * hd + c];
         }
-        srow[c] = a;
+        srow[c] += a;
     }
 }
 

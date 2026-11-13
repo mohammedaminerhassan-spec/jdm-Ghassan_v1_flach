@@ -83,6 +83,10 @@ public:
     [[nodiscard]] Tensor clone() const;
     void   zero_();
     void   copy_from(const Tensor& src);
+    // Copies fp32 data into this tensor, converting it to half when the
+    // tensor is stored in half precision (the fp16 weight storage mode).
+    // The source must be an fp32 tensor on the host.
+    void   copy_from_f32(const Tensor& src);
 
     std::string shape_str() const;
     std::string describe() const;

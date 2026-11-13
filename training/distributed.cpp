@@ -54,7 +54,7 @@ bool DistributedContext::init(const Config& cfg) {
 
     const char* env_file = std::getenv("GAI_NCCL_ID_FILE");
     std::string id_file = env_file ? env_file
-        : "/tmp/gai_nccl_" + std::to_string(config_.master_port) + ".id";
+        : (std::filesystem::temp_directory_path() / ("gai_nccl_" + std::to_string(config_.master_port) + ".id")).string();
 
     ncclUniqueId nccl_id;
     std::memset(&nccl_id, 0, sizeof(nccl_id));

@@ -12,6 +12,21 @@
 
 namespace gai {
 
+namespace {
+
+// The GEMM with the weights in the parameter's own precision: fp32 for the
+// reference path, half for the fp16 weight storage mode (the tensor cores
+// multiply, the accumulator stays fp32).
+inline void linear_param(Device dev, const Tensor& w, const float* x, float* y,
+                         int M, int K, int N) {
+    if (w.dtype() == DType::F16)
+        ops::linear_forward_fp16(dev, x, w.ptr<u16>(), y, M, K, N);
+    else
+        ops::linear_forward(dev, x, w.f32(), y, M, K, N);
+}
+
+}  // namespace
+
 std::string GenerationStats::summary() const {
     return strfmt("prompt %d tok in %s (%.1f tok/s) | generated %d tok in %s (%.1f tok/s)",
                   prompt_tokens, human_duration(prefill_sec).c_str(), prefill_tps(),
@@ -186,7 +201,11 @@ float* Generator::decode_step_logits(i32 token, int position) {
     Device dev = model_.device();
 
     device_copy(tok_dev_.data_ptr(), dev, &token, Device::CPU, sizeof(i32));
-    ops::embedding_forward(dev, tok_dev_.i32p(), model_.tok_embeddings().w.f32(), x_.f32(), 1, d, V);
+    if (model_.tok_embeddings().is_half())
+        ops::embedding_forward_half(dev, tok_dev_.i32p(), model_.tok_embeddings().w.ptr<u16>(),
+                                    x_.f32(), 1, d, V);
+    else
+        ops::embedding_forward(dev, tok_dev_.i32p(), model_.tok_embeddings().w.f32(), x_.f32(), 1, d, V);
     // Granite scales the embeddings (12x). The decode path must do it too,
     // or the served model differs from the prefill.
     if (c.embedding_multiplier != 1.0f)
@@ -214,20 +233,33 @@ float* Generator::decode_step_logits(i32 token, int position) {
             ops::rmsnorm_forward(dev, x_.f32(), L.ffn_norm.w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
             if (L.has_moe()) {
                 const float* bias = model_.moe_bias_ptr(l);
-                ops::moe_forward_bias(dev, xb_.f32(), L.router.w.f32(), bias,
-                                      L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
-                                      L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
-                                      L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
-                                      L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
-                                      proj_.f32(), nullptr, nullptr, nullptr,
-                                      moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
-                                      1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
-                                      c.shared_width());
+                if (L.moe_gate.is_half()) {
+                    ops::moe_forward_bias_half(dev, xb_.f32(), L.router.w.f32(), bias,
+                                               L.moe_gate.w.ptr<u16>(), L.moe_up.w.ptr<u16>(),
+                                               L.moe_down.w.ptr<u16>(),
+                                               L.sh_gate.w.defined() ? L.sh_gate.w.ptr<u16>() : nullptr,
+                                               L.sh_up.w.defined()   ? L.sh_up.w.ptr<u16>()   : nullptr,
+                                               L.sh_down.w.defined() ? L.sh_down.w.ptr<u16>() : nullptr,
+                                               proj_.f32(), nullptr, nullptr, nullptr,
+                                               moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
+                                               1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
+                                               c.shared_width());
+                } else {
+                    ops::moe_forward_bias(dev, xb_.f32(), L.router.w.f32(), bias,
+                                          L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
+                                          L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
+                                          L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
+                                          L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
+                                          proj_.f32(), nullptr, nullptr, nullptr,
+                                          moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
+                                          1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
+                                          c.shared_width());
+                }
             } else {
-                ops::linear_forward(dev, xb_.f32(), L.w_gate.w.f32(), gate_.f32(), 1, d, F);
-                ops::linear_forward(dev, xb_.f32(), L.w_up.w.f32(),   up_.f32(),   1, d, F);
+                linear_param(dev, L.w_gate.w, xb_.f32(), gate_.f32(), 1, d, F);
+                linear_param(dev, L.w_up.w, xb_.f32(),   up_.f32(),   1, d, F);
                 ops::swiglu_forward(dev, gate_.f32(), up_.f32(), act_.f32(), F);
-                ops::linear_forward(dev, act_.f32(), L.w_down.w.f32(), proj_.f32(), 1, F, d);
+                linear_param(dev, L.w_down.w, act_.f32(), proj_.f32(), 1, F, d);
             }
             if (c.residual_multiplier != 1.0f)
                 ops::scale_inplace(dev, proj_.f32(), c.residual_multiplier, d);
@@ -245,9 +277,9 @@ float* Generator::decode_step_logits(i32 token, int position) {
             kp = qp + qd;
             vp = kp + kvd;
         } else {
-            ops::linear_forward(dev, xb_.f32(), L.wq.w.f32(), qp, 1, d, qd);
-            ops::linear_forward(dev, xb_.f32(), L.wk.w.f32(), kp, 1, d, kvd);
-            ops::linear_forward(dev, xb_.f32(), L.wv.w.f32(), vp, 1, d, kvd);
+            linear_param(dev, L.wq.w, xb_.f32(), qp, 1, d, qd);
+            linear_param(dev, L.wk.w, xb_.f32(), kp, 1, d, kvd);
+            linear_param(dev, L.wv.w, xb_.f32(), vp, 1, d, kvd);
         }
 
         if (L.has_qkv_bias()) {
@@ -279,8 +311,11 @@ float* Generator::decode_step_logits(i32 token, int position) {
                 // bandwidth at long contexts. The K/V activations live on
                 // the device, so stage them through the host before the
                 // fp32 -> fp16 conversion.
-                u16 kh[static_cast<size_t>(kvd)];
-                u16 vh[static_cast<size_t>(kvd)];
+                thread_local std::vector<u16> kh, vh;
+                if (kh.size() < static_cast<size_t>(kvd)) {
+                    kh.resize(static_cast<size_t>(kvd));
+                    vh.resize(static_cast<size_t>(kvd));
+                }
                 const float* kp_src = kp;
                 const float* vp_src = vp;
                 if (dev != Device::CPU) {
@@ -292,13 +327,13 @@ float* Generator::decode_step_logits(i32 token, int position) {
                     vp_src = kv_stage_v_.data();
                 }
                 for (int i = 0; i < kvd; ++i) {
-                    kh[i] = fp32_to_fp16(kp_src[i]);
-                    vh[i] = fp32_to_fp16(vp_src[i]);
+                    kh[static_cast<size_t>(i)] = fp32_to_fp16(kp_src[i]);
+                    vh[static_cast<size_t>(i)] = fp32_to_fp16(vp_src[i]);
                 }
                 u16* kdst = cache_.k_f16(l) + static_cast<size_t>(slot) * kvd;
                 u16* vdst = cache_.v_f16(l) + static_cast<size_t>(slot) * kvd;
-                device_copy(kdst, dev, kh, Device::CPU, sizeof(u16) * static_cast<size_t>(kvd));
-                device_copy(vdst, dev, vh, Device::CPU, sizeof(u16) * static_cast<size_t>(kvd));
+                device_copy(kdst, dev, kh.data(), Device::CPU, sizeof(u16) * static_cast<size_t>(kvd));
+                device_copy(vdst, dev, vh.data(), Device::CPU, sizeof(u16) * static_cast<size_t>(kvd));
             } else {
                 size_t bytes = sizeof(float) * static_cast<size_t>(kvd);
                 char* kdst = reinterpret_cast<char*>(cache_.k(l)) + static_cast<size_t>(slot) * bytes;
@@ -330,7 +365,7 @@ float* Generator::decode_step_logits(i32 token, int position) {
             }
         }
 
-        ops::linear_forward(dev, attn_.f32(), L.wo.w.f32(), proj_.f32(), 1, qd, d);
+        linear_param(dev, L.wo.w, attn_.f32(), proj_.f32(), 1, qd, d);
         if (c.residual_multiplier != 1.0f)
             ops::scale_inplace(dev, proj_.f32(), c.residual_multiplier, d);
         ops::add_inplace(dev, x_.f32(), proj_.f32(), d);
@@ -338,20 +373,33 @@ float* Generator::decode_step_logits(i32 token, int position) {
         ops::rmsnorm_forward(dev, x_.f32(), L.ffn_norm.w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
         if (L.has_moe()) {
             const float* bias = model_.moe_bias_ptr(l);
-            ops::moe_forward_bias(dev, xb_.f32(), L.router.w.f32(), bias,
-                                  L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
-                                  L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
-                                  L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
-                                  L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
-                                  proj_.f32(), nullptr, nullptr, nullptr,
-                                  moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
-                                  1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
-                                  c.shared_width());
+            if (L.moe_gate.is_half()) {
+                ops::moe_forward_bias_half(dev, xb_.f32(), L.router.w.f32(), bias,
+                                           L.moe_gate.w.ptr<u16>(), L.moe_up.w.ptr<u16>(),
+                                           L.moe_down.w.ptr<u16>(),
+                                           L.sh_gate.w.defined() ? L.sh_gate.w.ptr<u16>() : nullptr,
+                                           L.sh_up.w.defined()   ? L.sh_up.w.ptr<u16>()   : nullptr,
+                                           L.sh_down.w.defined() ? L.sh_down.w.ptr<u16>() : nullptr,
+                                           proj_.f32(), nullptr, nullptr, nullptr,
+                                           moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
+                                           1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
+                                           c.shared_width());
+            } else {
+                ops::moe_forward_bias(dev, xb_.f32(), L.router.w.f32(), bias,
+                                      L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
+                                      L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
+                                      L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
+                                      L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
+                                      proj_.f32(), nullptr, nullptr, nullptr,
+                                      moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
+                                      1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
+                                      c.shared_width());
+            }
         } else {
-            ops::linear_forward(dev, xb_.f32(), L.w_gate.w.f32(), gate_.f32(), 1, d, F);
-            ops::linear_forward(dev, xb_.f32(), L.w_up.w.f32(),   up_.f32(),   1, d, F);
+            linear_param(dev, L.w_gate.w, xb_.f32(), gate_.f32(), 1, d, F);
+            linear_param(dev, L.w_up.w, xb_.f32(),   up_.f32(),   1, d, F);
             ops::swiglu_forward(dev, gate_.f32(), up_.f32(), act_.f32(), F);
-            ops::linear_forward(dev, act_.f32(), L.w_down.w.f32(), proj_.f32(), 1, F, d);
+            linear_param(dev, L.w_down.w, act_.f32(), proj_.f32(), 1, F, d);
         }
         if (c.residual_multiplier != 1.0f)
             ops::scale_inplace(dev, proj_.f32(), c.residual_multiplier, d);
@@ -359,7 +407,7 @@ float* Generator::decode_step_logits(i32 token, int position) {
     }
 
     ops::rmsnorm_forward(dev, x_.f32(), model_.final_norm().w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
-    ops::linear_forward(dev, xb_.f32(), model_.lm_head().w.f32(), logits_dev_.f32(), 1, d, V);
+    linear_param(dev, model_.lm_head().w, xb_.f32(), logits_dev_.f32(), 1, d, V);
     if (c.logits_scaling != 1.0f)
         ops::scale_inplace(dev, logits_dev_.f32(), 1.0f / c.logits_scaling, V);
     return logits_dev_.f32();
@@ -403,7 +451,7 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
 
     // ---- 1) in_proj on the device into the persistent scratch
     const size_t proj_n = static_cast<size_t>(proj);
-    ops::linear_forward(dev, x_in, L.mamba_in_proj.w.f32(), mamba_proj_dev_.f32(), 1, d, proj);
+    linear_param(dev, L.mamba_in_proj.w, x_in, mamba_proj_dev_.f32(), 1, d, proj);
     // Stage back to the host; the tiny recurrent update runs on the host for
     // both backends, so the numbers are identical on CPU and CUDA.
     device_copy(mamba_proj_host_.data(), Device::CPU, mamba_proj_dev_.f32(), dev,
@@ -489,7 +537,7 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
     // there and writes the caller's `out` buffer.
     device_copy(mamba_norm_dev_.f32(), dev, normed, Device::CPU,
                 sizeof(float) * static_cast<size_t>(d_inner));
-    ops::linear_forward(dev, mamba_norm_dev_.f32(), L.mamba_out_proj.w.f32(), out, 1, d_inner, d);
+    linear_param(dev, L.mamba_out_proj.w, mamba_norm_dev_.f32(), out, 1, d_inner, d);
 }
 
 float* Generator::decode_step(i32 token, int position) {
@@ -598,9 +646,9 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
             kp = k.f32();
             vp = v.f32();
         } else {
-            ops::linear_forward(dev, xb.f32(), L.wq.w.f32(), qp, P, d, qd);
-            ops::linear_forward(dev, xb.f32(), L.wk.w.f32(), kp, P, d, kvd);
-            ops::linear_forward(dev, xb.f32(), L.wv.w.f32(), vp, P, d, kvd);
+            linear_param(dev, L.wq.w, xb.f32(), qp, P, d, qd);
+            linear_param(dev, L.wk.w, xb.f32(), kp, P, d, kvd);
+            linear_param(dev, L.wv.w, xb.f32(), vp, P, d, kvd);
         }
 
         if (L.has_qkv_bias()) {
@@ -635,7 +683,7 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
         }
         ops::attention_forward_ex(dev, qp, kp, vp, att.f32(), nullptr,
                                   1, P, H, KV, hd, scale, c.sliding_window);
-        ops::linear_forward(dev, att.f32(), L.wo.w.f32(), proj.f32(), P, qd, d);
+        linear_param(dev, L.wo.w, att.f32(), proj.f32(), P, qd, d);
         // Granite scales every branch before the residual add.
         if (c.residual_multiplier != 1.0f)
             ops::scale_inplace(dev, proj.f32(), c.residual_multiplier, (i64)P * d);
@@ -653,10 +701,10 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
                                   P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
                                   c.shared_width());
         } else {
-            ops::linear_forward(dev, xb.f32(), L.w_gate.w.f32(), gtmp.f32(), P, d, c.intermediate_size);
-            ops::linear_forward(dev, xb.f32(), L.w_up.w.f32(), utmp.f32(), P, d, c.intermediate_size);
+            linear_param(dev, L.w_gate.w, xb.f32(), gtmp.f32(), P, d, c.intermediate_size);
+            linear_param(dev, L.w_up.w, xb.f32(), utmp.f32(), P, d, c.intermediate_size);
             ops::swiglu_forward(dev, gtmp.f32(), utmp.f32(), atmp.f32(), (i64)P * c.intermediate_size);
-            ops::linear_forward(dev, atmp.f32(), L.w_down.w.f32(), proj.f32(), P, c.intermediate_size, d);
+            linear_param(dev, L.w_down.w, atmp.f32(), proj.f32(), P, c.intermediate_size, d);
         }
         // Granite scales every branch before the residual add.
         if (c.residual_multiplier != 1.0f)
@@ -667,8 +715,8 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     ops::rmsnorm_forward(dev, x.f32() + (size_t)(P - 1) * d,
                          model_.final_norm().w.f32(), hlast_.f32(),
                          nullptr, 1, d, c.rms_eps);
-    ops::linear_forward(dev, hlast_.f32(), model_.lm_head().w.f32(),
-                        logits_dev_.f32(), 1, d, c.vocab_size);
+    linear_param(dev, model_.lm_head().w, hlast_.f32(),
+                 logits_dev_.f32(), 1, d, c.vocab_size);
     device_copy(logits_host_.data(), Device::CPU,
                 logits_dev_.f32(), dev,
                 sizeof(float) * (size_t)c.vocab_size);

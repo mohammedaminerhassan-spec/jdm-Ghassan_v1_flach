@@ -67,6 +67,9 @@ static void usage() {
     "  --device auto|cpu|cuda  (metal/vulkan fall back to portable CPU)\n"
     "  --gemm-fp16 0|1        CUDA tensor-core GEMMs (default 1; 0 = pure fp32)\n"
     "  --no-fp16-cache        disable persistent FP16 inference weights\n"
+    "  --weight-f16 0|1      store the big weights in half precision on the device\n"
+    "                         (default 1 on the GPU: 12.9 GiB instead of 25.9 GiB for\n"
+    "                         a 6.94B Granite; 0 on the CPU, the reference path)\n"
     "  --ctx <n>              KV cache context size (default: model max_seq_len)\n";
 }
 static std::string ggml_type_str(GGMLType t) {

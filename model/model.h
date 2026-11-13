@@ -150,6 +150,9 @@ struct Parameter {
     bool             frozen = false;
 
     i64 numel() const { return w.numel(); }
+    // True when the weight is stored in half precision (the fp16 weight
+    // storage mode on the GPU).
+    bool is_half() const { return w.defined() && w.dtype() == DType::F16; }
 };
 
 // A LoRA adapter, stored as two real Parameters so the optimizer, the
@@ -301,7 +304,7 @@ struct Activations {
 
 class Model {
 public:
-    explicit Model(ModelConfig cfg, Device dev = Device::CPU);
+    explicit Model(ModelConfig cfg, Device dev = Device::CPU, bool fp16_weights = false);
     ~Model();
 
     const ModelConfig& config() const { return cfg_; }
@@ -320,6 +323,21 @@ public:
     void mark_weights_dirty();
     bool fp16_weight_cache_enabled() const { return fp16_weight_cache_; }
     size_t fp16_weight_cache_bytes() const;
+
+    // The fp16 weight storage mode.
+    //
+    // The big matrices are stored on the device in half precision: 12.9 GiB
+    // for the 6.94B Granite instead of the 25.9 GiB of fp32 masters, which
+    // is what makes the model fit on a 16 GB T4. The activations stay fp32
+    // and every GEMM accumulates in fp32.
+    //
+    // The fragile vectors (the router, dt_bias, A_log, D, conv1d and the
+    // norms) stay fp32: a 4-bit dt_bias moves the Mamba time step by a
+    // factor of exp(1.49).
+    //
+    // The mode is chosen when the model is built (the storage dtype of a
+    // parameter cannot change afterwards).
+    bool fp16_weight_storage_enabled() const { return weight_f16_; }
     void enable_grad(bool on);
     bool grad_enabled() const { return grad_enabled_; }
     void zero_grad();
@@ -367,7 +385,8 @@ public:
     static size_t count_fp16_cache_bytes(const ModelConfig& cfg);
     static MemoryPlan plan_memory(const ModelConfig& cfg, int B, int T,
                                   bool with_grad, int ce_chunks,
-                                  bool fp16_weight_cache);
+                                  bool fp16_weight_cache,
+                                  bool fp16_weights = false);
     static size_t estimate_activation_bytes_for(const ModelConfig& cfg,
                                                 bool fp16_weight_cache_on,
                                                 int B, int T, bool with_grad,
@@ -425,6 +444,8 @@ public:
 
 private:
     void alloc_param(Parameter& p, const std::string& name, std::vector<i64> shape, bool decay);
+    // The storage dtype of a parameter in the fp16 weight storage mode.
+    DType storage_dtype_for(const std::string& name) const;
     void init_lora(LoraAdapter& ad, const std::string& name,
                    int in_d, int out_d, int r, float alpha,
                    Device dev, std::mt19937_64& rng);
@@ -464,6 +485,7 @@ private:
     bool        grad_enabled_ = false;
     bool        fp16_weight_cache_ = false;
     bool        fp16_weights_dirty_ = false;
+    bool        weight_f16_ = false;
     Tensor      rope_inv_freq_;
 
     Parameter                tok_emb_;
