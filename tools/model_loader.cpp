@@ -26,7 +26,14 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
 
     const Model::MemoryPlan plan =
         Model::plan_memory(cfg, 1, ctx > 0 ? ctx : 512, false, 1, fp16_cache_on, fp16_weights);
-    const size_t kv   = Model::kv_cache_bytes(cfg, ctx > 0 ? ctx : cfg.max_seq_len);
+    // Use the requested context if given; otherwise fall back to 4096 (a
+    // realistic inference budget).  Using cfg.max_seq_len (131 072 for
+    // Granite) as the fallback caused the guard to report an absurdly large
+    // KV-cache requirement (~40 GiB) even though inference allocates only a
+    // fraction of that, refusing every CUDA run on a T4 when --ctx was
+    // omitted.
+    const int kv_ctx = ctx > 0 ? ctx : std::min(cfg.max_seq_len, 4096);
+    const size_t kv   = Model::kv_cache_bytes(cfg, kv_ctx);
     const size_t mam  = Model::mamba_state_bytes(cfg);
     const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, ctx > 0 ? ctx : 512);
     const size_t need = plan.weights + plan.fp16_cache + plan.activations +
