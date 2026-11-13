@@ -37,11 +37,24 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     : model_(model), tok_(tok) {
     const ModelConfig& c = model.config();
     Device dev = model.device();
-    max_context_ = max_context > 0 ? std::min(max_context, c.max_seq_len) : c.max_seq_len;
+    // Default context: cap at 4096 when the model's max_seq_len is very large
+    // (e.g. Granite's 131,072) and the caller did not supply an explicit
+    // budget. 131,072-token KV caches need ~20 GiB; a T4 has ~15 GiB total.
+    const int default_ctx = std::min(c.max_seq_len, 4096);
+    max_context_ = max_context > 0 ? std::min(max_context, c.max_seq_len) : default_ctx;
     expected_device_ = dev;
 
     {
-        size_t need = 2ULL * static_cast<size_t>(c.num_layers) *
+        // Count only the layers that actually keep a KV cache.  For Granite
+        // 4.0-H-Tiny that is 4 attention layers, NOT all 40 layers.  Using
+        // c.num_layers inflated the estimate by 10x and triggered a spurious
+        // OOM guard even though the real cache fits comfortably on a T4.
+        int kv_layers = c.num_layers;
+        if (c.arch == ModelConfig::ArchGranite && !c.layer_types.empty()) {
+            kv_layers = 0;
+            for (int lt : c.layer_types) if (lt != 0) ++kv_layers;
+        }
+        size_t need = 2ULL * static_cast<size_t>(kv_layers) *
                       static_cast<size_t>(max_context_) *
                       static_cast<size_t>(c.kv_dim()) * sizeof(float);
         if (dev == Device::CUDA && cuda_available()) {
@@ -54,12 +67,13 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
             if (free_b == 0) free_b = device_info().free_mem;
             if (free_b > 0 && need > free_b) {
                 GAI_FAIL(strfmt("KV cache needs %s but only %s free on device "
-                                "(L=%d ctx=%d kv_dim=%d). Halve max_context or max_seq_len.",
+                                "(kv_layers=%d ctx=%d kv_dim=%d). "
+                                "Pass --ctx <smaller value> to reduce the cache.",
                                 human_bytes(need).c_str(), human_bytes(free_b).c_str(),
-                                c.num_layers, max_context_, c.kv_dim()));
+                                kv_layers, max_context_, c.kv_dim()));
             }
         } else if (need > (1ULL << 30)) {
-            log_warn(strfmt("[gen ] KV cache large (%s); weak PCs should lower max_context",
+            log_warn(strfmt("[gen ] KV cache large (%s); pass --ctx to cap it",
                             human_bytes(need).c_str()));
         }
     }
