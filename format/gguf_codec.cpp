@@ -907,14 +907,20 @@ std::vector<i32> GGUFReader::eos_ids() const {
     // Only push an id when the key is actually present. Falling back to 0
     // would make the generator stop on the very first sampled token (0 is a
     // perfectly ordinary token in most vocabularies).
+    //
+    // UINT32 metadata is stored in 4 bytes (see GGUFWriter::set_u32). The
+    // reader used to require 8 and silently pushed 0 otherwise, so every
+    // exported file reported eos = 0. On Granite id 0 is "!", which made the
+    // generator stop as soon as the model emitted an exclamation mark
+    // ("Hello" instead of "Hello! I am an AI ...").
     auto it = metadata_.find("tokenizer.ggml.eos_token_id");
-    if (it != metadata_.end() && it->second.type == GGUFType::UINT32) {
-        out.push_back(static_cast<i32>(it->second.data.size() >= 8
-                                           ? (static_cast<uint64_t>(it->second.data[0]) |
-                                              (static_cast<uint64_t>(it->second.data[1]) << 8) |
-                                              (static_cast<uint64_t>(it->second.data[2]) << 16) |
-                                              (static_cast<uint64_t>(it->second.data[3]) << 24))
-                                           : 0u));
+    if (it != metadata_.end() && it->second.type == GGUFType::UINT32 &&
+        it->second.data.size() >= 4) {
+        out.push_back(static_cast<i32>(
+            static_cast<uint32_t>(it->second.data[0]) |
+            (static_cast<uint32_t>(it->second.data[1]) << 8) |
+            (static_cast<uint32_t>(it->second.data[2]) << 16) |
+            (static_cast<uint32_t>(it->second.data[3]) << 24)));
     }
     it = metadata_.find("tokenizer.ggml.eot_token_id");
     if (it != metadata_.end() && it->second.type == GGUFType::UINT32 &&
