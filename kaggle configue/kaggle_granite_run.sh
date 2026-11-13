@@ -69,7 +69,7 @@ say "4/8  the real weights"
 say "5/8  the logits of the safetensors model (the reference)"
 # The same ids are used for the GGUF later, so the two runs are comparable.
 IDS=$(./build/bin/ghassan-ai tokenize --model "$MODEL" --text "$PROMPT" \
-      | sed -n 's/.*ids: *//p')
+      | sed -n 's/.*ids *: *//p')
 echo "the ids: $IDS"
 ./build/bin/ghassan-ai logits --model "$MODEL" --device cpu --ids "$IDS" \
     --out /tmp/logits_hf.f32
