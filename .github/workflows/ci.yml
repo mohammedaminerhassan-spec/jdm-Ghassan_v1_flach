@@ -42,6 +42,14 @@ jobs:
         run: |
           ./build/bin/ghassan-ai info --model "granite-documentation/granit filles confiques" --config-only
 
+      - name: The unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: The Granite forward matches the independent reference
+        run: |
+          python3 -m pip install --quiet numpy
+          python3 tests/python/test_granite_forward.py --exe build/bin/ghassan-ai
+
   linux-sanitize:
     name: linux / asan+ubsan
     runs-on: ubuntu-22.04
