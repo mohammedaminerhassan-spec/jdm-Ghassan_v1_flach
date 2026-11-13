@@ -75,6 +75,7 @@ static std::string ggml_type_str(GGMLType t) {
         case GGMLType::F16:  return "F16";
         case GGMLType::Q8_0: return "Q8_0";
         case GGMLType::Q4_0: return "Q4_0";
+        case GGMLType::Q4_1: return "Q4_1";
         default: return strfmt("t%u", static_cast<unsigned>(t));
     }
 }

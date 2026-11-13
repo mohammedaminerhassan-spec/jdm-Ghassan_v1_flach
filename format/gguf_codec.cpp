@@ -314,6 +314,7 @@ static size_t ggml_type_size(GGMLType t) {
         case GGMLType::F32:  return 4;
         case GGMLType::F16:  return 2;
         case GGMLType::Q4_0: return 18;
+    case GGMLType::Q4_1: return 20;
         case GGMLType::Q8_0: return 34;
         default:             GAI_FAIL("ggml_type_size: unsupported GGML type");
     }
@@ -322,6 +323,7 @@ static size_t ggml_type_size(GGMLType t) {
 static size_t ggml_blck_size(GGMLType t) {
     switch (t) {
         case GGMLType::Q4_0: return 32;
+    case GGMLType::Q4_1: return 32;
         case GGMLType::Q8_0: return 32;
         default:             return 1;
     }
@@ -436,6 +438,50 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
                 const int   xi0 = std::max(0, std::min(15, static_cast<int>(f0 * id + 8.5f)));
                 const int   xi1 = std::max(0, std::min(15, static_cast<int>(f1 * id + 8.5f)));
                 block[2 + j] = static_cast<uint8_t>((xi1 << 4) | xi0);
+            }
+        }
+        return out;
+    }
+
+    if (target == GGMLType::Q4_1) {
+
+        // GGML's block_q4_1: f16 d, f16 m, then 16 bytes of nibbles. The low
+        // nibble of byte j holds element j, the high nibble element j+16, and
+        // the value is d*q + m.
+        size_t nblocks = (n + 31) / 32;
+        std::vector<uint8_t> out(nblocks * 20);
+        for (size_t b = 0; b < nblocks; ++b) {
+            size_t start = b * 32;
+            size_t end   = std::min(start + 32, n);
+            uint8_t* block = out.data() + b * 20;
+
+            float mn = src[start], mx = src[start];
+            bool bad = false;
+            for (size_t i = start; i < end; ++i) {
+                const float v = src[i];
+                if (!std::isfinite(v)) { bad = true; break; }
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+            }
+            if (bad) {
+                const uint16_t zero = fp32_to_fp16(0.0f);
+                std::memcpy(block, &zero, 2);
+                std::memcpy(block + 2, &zero, 2);
+                std::memset(block + 4, 0, 16);
+                continue;
+            }
+            const float d   = (mx - mn) / 15.0f;
+            const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+            const uint16_t sh_d = fp32_to_fp16(d);
+            const uint16_t sh_m = fp32_to_fp16(mn);
+            std::memcpy(block, &sh_d, 2);
+            std::memcpy(block + 2, &sh_m, 2);
+            for (int j = 0; j < 16; ++j) {
+                const float f0 = (start + j      < end) ? src[start + j]      : mn;
+                const float f1 = (start + j + 16 < end) ? src[start + j + 16] : mn;
+                const int xi0 = std::max(0, std::min(15, static_cast<int>(std::lround((f0 - mn) * inv))));
+                const int xi1 = std::max(0, std::min(15, static_cast<int>(std::lround((f1 - mn) * inv))));
+                block[4 + j] = static_cast<uint8_t>((xi1 << 4) | xi0);
             }
         }
         return out;
@@ -559,6 +605,21 @@ void GGUFWriter::write() {
                     quant::dequantize_q4_0(payload.data(), back.data(), static_cast<i64>(n));
                 } else if (td.type == GGMLType::Q8_0) {
                     quant::dequantize_q8_0(payload.data(), back.data(), static_cast<i64>(n));
+                } else if (td.type == GGMLType::Q4_1) {
+                    // GGML's block_q4_1: f16 d, f16 m, then the nibbles.
+                    const size_t nb = (n + 31) / 32;
+                    for (size_t b = 0; b < nb; ++b) {
+                        const uint8_t* blk = payload.data() + b * 20;
+                        const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(blk));
+                        const float m = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(blk + 2));
+                        for (int j = 0; j < 16; ++j) {
+                            const uint8_t byte = blk[4 + j];
+                            const size_t i0 = b * 32 + static_cast<size_t>(j);
+                            const size_t i1 = i0 + 16;
+                            if (i0 < n) back[i0] = d * static_cast<float>(byte & 0x0F) + m;
+                            if (i1 < n) back[i1] = d * static_cast<float>(byte >> 4) + m;
+                        }
+                    }
                 }
                 double se = 0.0;
                 double worst = 0.0;
@@ -1247,6 +1308,23 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
                 acc(dst[b*32+i]);
             }
         }
+    } else if (ti->type == GGMLType::Q4_1) {
+        size_t nblocks = (nelems + 31) / 32;
+        for (size_t b = 0; b < nblocks; ++b) {
+            const uint8_t* block = raw.data() + b * 20;
+            const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
+            const float m = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block + 2));
+            for (int j = 0; j < 16; ++j) {
+                if (b*32 + j >= nelems) break;
+                const uint8_t byte = block[4 + j];
+                dst[b*32 + j] = d * static_cast<float>(byte & 0x0F) + m;
+                acc(dst[b*32 + j]);
+                if (b*32 + j + 16 < nelems) {
+                    dst[b*32 + j + 16] = d * static_cast<float>(byte >> 4) + m;
+                    acc(dst[b*32 + j + 16]);
+                }
+            }
+        }
     } else if (ti->type == GGMLType::Q4_0) {
         size_t nblocks = (nelems + 31) / 32;
         for (size_t b = 0; b < nblocks; ++b) {
@@ -1379,7 +1457,8 @@ GGMLType gguf_dtype_for(const std::string& name, const ExportProfileGGUF& profil
     // does not average out the way it does for the routed experts). They
     // get 8 bits when the profile's default is a lossy 4-bit one. This is
     // the same mixed-precision philosophy as llama.cpp's Q4_K_M.
-    if (profile.default_type == GGMLType::Q4_0 && profile.hybrid) {
+    if ((profile.default_type == GGMLType::Q4_0 ||
+         profile.default_type == GGMLType::Q4_1) && profile.hybrid) {
         const bool always_on =
             name.find("mamba.out_proj") != std::string::npos ||
             name.find("moe_sh_") != std::string::npos;   // the shared expert
@@ -1402,6 +1481,18 @@ ExportProfileGGUF gguf_profile_for(const std::string& name) {
         p.norm_type      = GGMLType::F32;
         p.output_type    = GGMLType::Q8_0;
         p.sensitive_type = GGMLType::Q8_0;
+    } else if (name == "q4_1" || name == "int41") {
+        // 5 bits per weight for the routed experts (the bulk), with the
+        // fragile Mamba vectors at F32, the Mamba in_proj at F16 and the
+        // always-on paths at Q8_0. This is the closest to llama.cpp's Q4_K_M
+        // that this engine can write, and it fits the Kaggle disk.
+        p.name           = "q4_1";
+        p.default_type   = GGMLType::Q4_1;
+        p.embedding_type = GGMLType::Q8_0;
+        p.norm_type      = GGMLType::F32;
+        p.output_type    = GGMLType::Q8_0;
+        p.sensitive_type = GGMLType::Q8_0;
+        p.recurrence_type = GGMLType::F16;
     } else if (name == "fp16" || name == "f16" || name == "f16_t" || name == "half") {
         // Compute is fp16 tensor-core on T4; the export is fp16 too, which is
         // bit-consistent with the compute path and needs no lossy quantizer.
@@ -1655,6 +1746,7 @@ void export_model_gguf(const std::string& path, Model& model,
     uint32_t file_type = 1;
     if (profile.default_type == GGMLType::Q8_0) file_type = 7;
     if (profile.default_type == GGMLType::Q4_0) file_type = 2;
+    if (profile.default_type == GGMLType::Q4_1) file_type = 3;
     if (profile.default_type == GGMLType::F16)  file_type = 1;
     w.set_file_type(file_type);
 
@@ -1767,7 +1859,8 @@ void export_model_gguf(const std::string& path, Model& model,
                 const auto* e = sorted[i];
                 log_info(strfmt("[gguf]   %-44s %-5s rel RMSE %7.4f%%  worst element %7.4f%%",
                                 e->name.c_str(),
-                                e->type == GGMLType::Q4_0 ? "Q4_0" : "Q8_0",
+                                e->type == GGMLType::Q4_0 ? "Q4_0"
+                                    : (e->type == GGMLType::Q4_1 ? "Q4_1" : "Q8_0"),
                                 e->rel_rmse * 100.0, e->max_rel * 100.0));
             }
         }

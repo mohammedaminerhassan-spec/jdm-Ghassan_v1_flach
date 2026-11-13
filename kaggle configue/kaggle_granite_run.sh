@@ -37,7 +37,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL/config.json" ]; then
 fi
 
 OUT="${OUT:-/kaggle/working/ghassan-v1-flash.gguf}"
-PROFILE="${PROFILE:-q4_0}"
+PROFILE="${PROFILE:-q4_1}"
 CTX="${CTX:-2048}"
 MAXTOK="${MAXTOK:-48}"
 PROMPT="Please list one IBM Research laboratory located in the United States."

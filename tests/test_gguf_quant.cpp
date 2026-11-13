@@ -108,14 +108,14 @@ struct Rng {
 // layout is checked end to end.
 std::vector<float> roundtrip_through_gguf(const std::string& path,
                                           const std::vector<float>& src,
-                                          bool q4_0) {
+                                          GGMLType type) {
     {
         GGUFWriter w(path);
         w.set_arch("ghassan");
         w.set_model_name("test");
         Tensor t({(i64)src.size()}, DType::F32, Device::CPU);
         std::memcpy(t.f32(), src.data(), src.size() * sizeof(float));
-        w.add_tensor("probe", t, q4_0 ? GGMLType::Q4_0 : GGMLType::F32);
+        w.add_tensor("probe", t, type);
         w.write();
     }
     GGUFReader r;
@@ -127,6 +127,49 @@ std::vector<float> roundtrip_through_gguf(const std::string& path,
     return out;
 }
 
+
+// GGML's block_q4_1 reference: f16 d, f16 m, then 16 bytes of nibbles (the
+// low nibble of byte j holds element j, the high nibble element j+16) and
+// the value is d*q + m.
+std::vector<float> ggml_q4_1_roundtrip(const std::vector<float>& src) {
+    const size_t n = src.size();
+    const size_t nb = (n + 31) / 32;
+    std::vector<uint8_t> bytes(nb * 20, 0);
+    std::vector<float> out(n, 0.0f);
+    for (size_t b = 0; b < nb; ++b) {
+        const size_t start = b * 32;
+        const size_t end   = std::min(start + 32, n);
+        uint8_t* block = bytes.data() + b * 20;
+        float mn = src[start], mx = src[start];
+        for (size_t i = start; i < end; ++i) {
+            mn = std::min(mn, src[i]);
+            mx = std::max(mx, src[i]);
+        }
+        const float d   = (mx - mn) / 15.0f;
+        const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+        const uint16_t sh_d = fp32_to_fp16(d);
+        const uint16_t sh_m = fp32_to_fp16(mn);
+        std::memcpy(block, &sh_d, 2);
+        std::memcpy(block + 2, &sh_m, 2);
+        for (int j = 0; j < 16; ++j) {
+            const float f0 = (start + j      < end) ? src[start + j]      : mn;
+            const float f1 = (start + j + 16 < end) ? src[start + j + 16] : mn;
+            const int xi0 = std::max(0, std::min(15, static_cast<int>(std::lround((f0 - mn) * inv))));
+            const int xi1 = std::max(0, std::min(15, static_cast<int>(std::lround((f1 - mn) * inv))));
+            block[4 + j] = static_cast<uint8_t>((xi1 << 4) | xi0);
+        }
+        const float ds = fp16_to_fp32(sh_d);
+        const float ms = fp16_to_fp32(sh_m);
+        for (int j = 0; j < 16; ++j) {
+            const int xi0 = block[4 + j] & 0x0F;
+            const int xi1 = block[4 + j] >> 4;
+            if (start + j < end)      out[start + j]      = ds * xi0 + ms;
+            if (start + j + 16 < end)  out[start + j + 16] = ds * xi1 + ms;
+        }
+    }
+    return out;
+}
+
 void test_q4_0_writer() {
     printf("the Q4_0 writer (GGML block layout)\n");
     Rng rng;
@@ -135,7 +178,7 @@ void test_q4_0_writer() {
     std::vector<float> gauss(32 * 16);
     for (auto& v : gauss) v = rng.next() * 0.05f;
 
-    const std::vector<float> mine = roundtrip_through_gguf("test_q4_probe.gguf", gauss, true);
+    const std::vector<float> mine = roundtrip_through_gguf("test_q4_probe.gguf", gauss, GGMLType::Q4_0);
     check(mine.size() == gauss.size(), "the GGUF round trip returns the tensor");
 
     const std::vector<float> ref  = ggml_q4_0_roundtrip(gauss, true);   // GGML's rule
@@ -152,7 +195,7 @@ void test_q4_0_writer() {
     // A block whose values are all NEGATIVE: the case that broke Granite.
     std::vector<float> neg(32);
     for (int i = 0; i < 32; ++i) neg[i] = -11.9375f + 0.45f * static_cast<float>(i);
-    const std::vector<float> n_mine = roundtrip_through_gguf("test_q4_neg.gguf", neg, true);
+    const std::vector<float> n_mine = roundtrip_through_gguf("test_q4_neg.gguf", neg, GGMLType::Q4_0);
     const std::vector<float> n_ref  = ggml_q4_0_roundtrip(neg, true);
     const std::vector<float> n_bug  = ggml_q4_0_roundtrip(neg, false);
     const double n_err_mine = max_abs_diff(n_mine, n_ref);
@@ -171,6 +214,29 @@ void test_q4_0_writer() {
            err_vs_src, 11.9375f);
     check(err_vs_src < 0.80,
           "a negative block keeps its error under 0.8 (a quarter of its range)");
+}
+
+
+void test_q4_1_writer() {
+    printf("the Q4_1 writer (GGML block layout, 5 bits)\n");
+    Rng rng;
+    std::vector<float> gauss(32 * 16);
+    for (auto& v : gauss) v = rng.next() * 0.05f;
+
+    const std::vector<float> mine = roundtrip_through_gguf("test_q4_1_probe.gguf", gauss, GGMLType::Q4_1);
+    const std::vector<float> ref  = ggml_q4_1_roundtrip(gauss);
+    const double err = max_abs_diff(mine, ref);
+    printf("        the writer vs GGML's reference: %.8f\n", err);
+    check(err < 1e-6, "the writer reproduces GGML's Q4_1 exactly");
+
+    // Q4_1 keeps more of the tensor than Q4_0 (5 bits + the block's real
+    // min/max instead of 4 bits with a symmetric range).
+    const std::vector<float> q40 = ggml_q4_0_roundtrip(gauss, true);
+    const double err40 = max_abs_diff(q40, gauss);
+    const double err41 = max_abs_diff(mine, gauss);
+    printf("        the error vs the source: Q4_0 %.6f | Q4_1 %.6f\n", err40, err41);
+    check(err41 < err40,
+          "Q4_1 keeps more of the tensor than Q4_0 (the same ballpark of size)");
 }
 
 void test_dtype_policy() {
@@ -228,6 +294,7 @@ int main() {
     printf("== the GGUF codec and the export policy ==\n");
     test_dtype_policy();
     test_q4_0_writer();
+    test_q4_1_writer();
     if (g_failures == 0) {
         printf("\nPASS\n");
         return 0;

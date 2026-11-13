@@ -169,7 +169,7 @@ def main():
     # ---- tensors -------------------------------------------------------
     from collections import Counter
     dtype_count = Counter(t[2] for t in tensors)
-    dtype_names = {0: "F32", 1: "F16", 2: "Q4_0", 8: "Q8_0"}
+    dtype_names = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 8: "Q8_0"}
     total_params = 0
     for _, dims, _, _ in tensors:
         n = 1
@@ -180,7 +180,7 @@ def main():
         len(tensors), total_params,
         ", ".join("%s=%d" % (dtype_names.get(k, str(k)), v) for k, v in sorted(dtype_count.items()))))
     if show_tensors:
-        ggml_type_str = {0: "F32", 1: "F16", 2: "Q4_0", 8: "Q8_0"}
+        ggml_type_str = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 8: "Q8_0"}
         for name_, dims, ttype, _ in sorted(tensors, key=lambda t: t[0]):
             print("  %-40s %-18s %s" % (name_, "x".join(str(d) for d in dims), ggml_type_str.get(ttype, ttype)))
 
