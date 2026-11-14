@@ -27,8 +27,15 @@ print("disk   :", sh("df -h /kaggle/working | tail -1").stdout.strip())
 print("=" * 72)
 
 def clone_fresh():
-    """A clean clone (the shallow one: 10x faster, no history we need)."""
+    """A clean clone (the shallow one: 10x faster, no history we need).
+
+    The old copy is REMOVED first: a notebook that keeps yesterday's source
+    builds yesterday's engine (and the error says nothing about it). Only
+    the source directory is touched: /kaggle/working also holds the
+    datasets, the checkpoints and the exports.
+    """
     if SRC.exists():
+        print("removing the old source ...")
         shutil.rmtree(SRC, ignore_errors=True)
     WORK.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -37,19 +44,10 @@ def clone_fresh():
     return r.returncode == 0
 
 
-if (SRC / "CMakeLists.txt").exists():
-    # The source is already there: bring it up to date. A shallow clone can
-    # refuse to fast-forward (it lacks the history), so a failed pull falls
-    # back to a fresh clone.
-    print("the source is already there -> pulling the latest")
-    r = sh(f"git -C {SRC} pull --ff-only origin {REPO_BRANCH}")
-    if r.returncode != 0:
-        print("the pull failed (a shallow clone cannot fast-forward) -> cloning again")
-        if not clone_fresh():
-            raise SystemExit("the clone failed: check the repository URL and the network")
-else:
-    if not clone_fresh():
-        raise SystemExit("the clone failed: check the repository URL and the network")
+# ALWAYS a fresh clone: the notebook must build the engine that is on
+# GitHub RIGHT NOW, not the one that was there when the session started.
+if not clone_fresh():
+    raise SystemExit("the clone failed: check the repository URL and the network")
 
 if not (SRC / "CMakeLists.txt").exists():
     raise SystemExit("the clone did not bring the engine: " + str(SRC))

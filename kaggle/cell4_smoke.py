@@ -21,6 +21,20 @@ BUILD = WORK / "build"
 HF   = WORK / "hf"
 GAIT = BUILD / "bin" / "gai_train"
 
+def find_tokenizer():
+    """The Granite tokenizer (the vocabulary the model was trained with)."""
+    for cand in (WORK / "hf" / "tokenizer.json",
+                 WORK / "granite" / "tokenizer.json"):
+        if cand.exists():
+            return str(cand)
+    # Anything else that looks like one.
+    for p in pathlib.Path("/kaggle/input").rglob("tokenizer.json"):
+        return str(p)
+    raise SystemExit("no tokenizer.json: run cell 0 or cell 3 first")
+
+TOKENIZER = find_tokenizer()
+print("the tokenizer:", TOKENIZER)
+
 def run(cmd, env=None, tail=4000):
     print("\n$", " ".join(str(c) for c in cmd), flush=True)
     t0 = time.time()
@@ -42,51 +56,36 @@ if rc != 0:
     raise SystemExit("the CPU/CUDA parity failed: the GPU computes something else")
 
 # ---- 3. the Granite verification (the real checkpoint) ---------------------
-# The reference checkpoint (13.9 GB, 3 shards) must be in a Kaggle dataset:
-#   /kaggle/input/granite-4.0-h-tiny/...
-# MODEL points at it; the export and the training use the same one.
-HF = WORK / "hf"
-if not (HF / "config.json").exists():
-    cands = [p for p in pathlib.Path("/kaggle/input").rglob("config.json")
-             if "granite" in str(p).lower()]
-    if cands:
-        import shutil as _sh
-        if HF.exists():
-            _sh.rmtree(HF)
-        HF.mkdir(parents=True)
-        # The config + the tokenizer are enough for the architecture; the
-        # weights stay where they are (13.9 GB: copying them is a waste).
-        _sh.copy(cands[0], HF / "config.json")
-        for extra in ("tokenizer.json", "tokenizer_config.json",
-                      "generation_config.json", "special_tokens_map.json"):
-            src = cands[0].parent / extra
-            if src.exists():
-                _sh.copy(src, HF / extra)
-        print("the Granite config+tokenizer staged in", HF)
+# The Granite weights are where cell 0 put them (/kaggle/working/granite) or
+# in a Kaggle dataset (/kaggle/input/...). The engine must read them.
+GRANITE_CANDS = [WORK / "granite", WORK / "hf"]
+for root in pathlib.Path("/kaggle/input").glob("*"):
+    if root.is_dir():
+        GRANITE_CANDS.append(root)
+        for sub in root.glob("*"):
+            if sub.is_dir():
+                GRANITE_CANDS.append(sub)
 
-if (HF / "config.json").exists():
-    print("\nthe official Granite config (the one in the repository) ...")
-    rc, out = run([str(BUILD / "bin" / "ghassan-ai"), "info",
-                    "--model", str(HF), "--config-only"], tail=6000)
-    if rc != 0:
-        raise SystemExit("the engine cannot read the official Granite config")
+MODEL = ""
+for cand in GRANITE_CANDS:
+    if (cand / "config.json").exists():
+        MODEL = str(cand)
+        break
 
-    # The weights (13.9 GB) live in the Kaggle dataset.
-    MODEL = ""
-    for cand in pathlib.Path("/kaggle/input").rglob("config.json"):
-        if "granite" in str(cand).lower() and cand.parent != HF:
-            MODEL = str(cand.parent)
-            break
-    if MODEL:
-        print("\nthe real weights ...")
-        rc, out = run([str(BUILD / "bin" / "ghassan-ai"), "info", "--model", MODEL],
-                      tail=8000)
-        if rc != 0:
-            raise SystemExit("the engine cannot load the Granite weights")
-    else:
-        print("\n(the weights were not found in /kaggle/input: the config check ran alone)")
+if MODEL:
+    print("\nthe Granite checkpoint:", MODEL)
+    r = subprocess.run([str(BUILD / "bin" / "ghassan-ai"), "info", "--model", MODEL],
+                       capture_output=True, text=True)
+    print(r.stdout[-6000:]); print(r.stderr[-2000:])
+    if r.returncode != 0:
+        raise SystemExit("the engine cannot load the Granite weights")
+    # The parameter count must be the checkpoint's (6,939,037,248).
+    if "6939037248" not in r.stdout.replace(",", ""):
+        print("(note: the parameter count is not the Granite one - this is not "
+              "the Granite checkpoint)")
 else:
-    print("\nno Granite config: skipping the reference check")
+    print("\nno Granite checkpoint found: run cell 0 (the weights) first "
+          "(the Granite verification is skipped)")
 
 # ---- 4. the smoke training -------------------------------------------------
 env = dict(os.environ)
@@ -94,7 +93,7 @@ env.setdefault("CUDA_VISIBLE_DEVICES", "0")   # one GPU for the smoke test
 rc, out = run([
     str(GAIT),
     "--config", str(SRC / "configs" / "ghassan_v1_flash_smoke.yaml"),
-    "--tokenizer", str(HF / "tokenizer.json"),
+    "--tokenizer", TOKENIZER,
     "--data", str(WORK / "artifacts" / "shards"),
     "--checkpoint-dir", str(WORK / "artifacts" / "checkpoints" / "smoke"),
     "--max-steps", "20",
@@ -114,7 +113,7 @@ if rc != 0:
 rc, out_g = run([
     str(GAIT),
     "--config", str(SRC / "configs" / "ghassan_v1_flash_smoke_granite.yaml"),
-    "--tokenizer", str(HF / "tokenizer.json"),
+    "--tokenizer", TOKENIZER,
     "--data", str(WORK / "artifacts" / "shards"),
     "--checkpoint-dir", str(WORK / "artifacts" / "checkpoints" / "smoke_granite"),
     "--max-steps", "20",

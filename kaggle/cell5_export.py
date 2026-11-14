@@ -24,6 +24,25 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "Ghassan v1 Flash")
 REPO_ID = os.environ.get("HF_REPO_OUT", "")     # <-- the target repository
 PUBLIC = os.environ.get("HF_PUBLIC", "0") == "1"
 
+# The tokenizer: the Granite one (the vocabulary of the model). The
+# DIRECTORY is used when there is one (the export copies the tokenizer
+# files: the vocab, the merges, the config...), otherwise the file.
+TOKENIZER = ""
+TOKENIZER_DIR = ""
+for cand in (WORK / "hf", WORK / "granite"):
+    if (cand / "tokenizer.json").exists():
+        TOKENIZER = str(cand / "tokenizer.json")
+        TOKENIZER_DIR = str(cand)
+        break
+if not TOKENIZER:
+    for p in pathlib.Path("/kaggle/input").rglob("tokenizer.json"):
+        TOKENIZER = str(p)
+        TOKENIZER_DIR = str(p.parent)
+        break
+if not TOKENIZER:
+    raise SystemExit("no tokenizer.json: run cell 0 or cell 3 first")
+print("the tokenizer:", TOKENIZER)
+
 ckpt = pathlib.Path(CKPT)
 if not ckpt.exists():
     cands = sorted((WORK / "artifacts" / "checkpoints").rglob("last.ckpt"))
@@ -38,7 +57,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 cmd = [str(BUILD / "bin" / "ghassan-ai"), "export",
        "--checkpoint", str(ckpt),
-       "--tokenizer", str(HF),          # the directory: the tokenizer files
+       "--tokenizer", TOKENIZER_DIR or TOKENIZER,   # the directory: the tokenizer files
        "--out", str(OUT),
        "--format", "safetensors",
        "--dtype", os.environ.get("DTYPE", "f16"),
