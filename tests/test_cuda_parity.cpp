@@ -222,6 +222,7 @@ static void test_granite_hybrid() {
 }
 
 int main() {
+    std::printf("test_cuda_parity: the engine commit %s\n", GAI_GIT_COMMIT);
     test_dense();
     test_moe();
     test_lora();

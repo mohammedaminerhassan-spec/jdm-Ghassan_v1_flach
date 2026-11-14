@@ -18,6 +18,26 @@ endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# The commit that is being built, stamped into every binary.
+#
+# WHY: a notebook that keeps yesterday's source builds yesterday's engine,
+# and the log says nothing about it. The binaries now print the commit
+# they were built from, so a run always names the code it ran.
+find_package(Git QUIET)
+set(GAI_GIT_COMMIT "unknown")
+if(GIT_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                    OUTPUT_VARIABLE GAI_GIT_COMMIT_OUT
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if(GAI_GIT_COMMIT_OUT)
+        set(GAI_GIT_COMMIT "${GAI_GIT_COMMIT_OUT}")
+    endif()
+endif()
+message(STATUS "[ghassan-ai] the commit: ${GAI_GIT_COMMIT}")
+add_compile_definitions(GAI_GIT_COMMIT="${GAI_GIT_COMMIT}")
+
 option(GAI_ENABLE_CUDA   "Build CUDA backend if a toolkit is found" ON)
 option(GAI_ENABLE_OPENMP "Use OpenMP for CPU kernels"               ON)
 option(GAI_BUILD_TESTS   "Build unit / gradient / benchmark tests"  ON)

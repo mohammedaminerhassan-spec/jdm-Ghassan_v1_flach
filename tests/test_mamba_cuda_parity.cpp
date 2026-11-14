@@ -178,16 +178,32 @@ static void run(Device dev, Weights& w, std::vector<float>& out, Grads& gr) {
 static void compare(const char* what, const std::vector<float>& a,
                     const std::vector<float>& b) {
     double worst = 0.0, scale = 0.0;
+    size_t worst_at = 0;
     for (size_t i = 0; i < a.size(); ++i) {
-        worst = std::max(worst, std::fabs(static_cast<double>(a[i]) - b[i]));
+        const double d = std::fabs(static_cast<double>(a[i]) - b[i]);
+        if (d > worst) { worst = d; worst_at = i; }
         scale = std::max(scale, std::fabs(static_cast<double>(a[i])));
     }
     const double tol = 1e-3 * scale + 1e-6;
     if (worst > tol) {
-        char buf[256];
+        // The shape of the failure: a SPIKE (one element is off) or a
+        // SCALE (everything is off by a factor). It tells where to look.
+        double sum_a = 0.0, sum_b = 0.0;
+        size_t n_big = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            sum_a += std::fabs(static_cast<double>(a[i]));
+            sum_b += std::fabs(static_cast<double>(b[i]));
+            if (std::fabs(static_cast<double>(b[i])) > 10.0 * scale + 1e-6) ++n_big;
+        }
+        char buf[320];
         std::snprintf(buf, sizeof(buf),
-                      "%s: CPU vs CUDA differ by %.3e (the reference scale is %.3e)",
-                      what, worst, scale);
+                      "%s: CPU vs CUDA differ by %.3e (the reference scale is %.3e) | "
+                      "the worst is at %zu: the CPU %.6e vs the CUDA %.6e | "
+                      "the sums are %.3e vs %.3e (a factor of %.3f) | %zu of %zu "
+                      "elements are more than 10x the scale",
+                      what, worst, scale, worst_at,
+                      static_cast<double>(a[worst_at]), static_cast<double>(b[worst_at]),
+                      sum_a, sum_b, sum_b / (sum_a + 1e-30), n_big, a.size());
         CHECK(false, buf);
     } else {
         std::printf("  %-12s : ok (the worst difference is %.3e, the scale is %.3e)\n",
@@ -196,6 +212,7 @@ static void compare(const char* what, const std::vector<float>& a,
 }
 
 int main() {
+    std::printf("test_mamba_cuda_parity: the engine commit %s\n", GAI_GIT_COMMIT);
     if (!cuda_available()) {
         std::printf("test_mamba_cuda_parity: no CUDA device -> skipped\n");
         return 0;
