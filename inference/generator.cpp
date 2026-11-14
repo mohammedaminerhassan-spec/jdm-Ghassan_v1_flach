@@ -10,6 +10,10 @@
 #include <algorithm>
 #include <limits>
 
+#ifdef GAI_OPENMP
+#include <omp.h>
+#endif
+
 namespace gai {
 
 namespace {
@@ -478,9 +482,15 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
     const float* dt_r = bc + conv_dim;
 
     // ---- 3) causal depthwise conv1d over the carried window + SiLU
+    // The channels are independent (each one owns its window), so they are
+    // processed in parallel: this loop is 3328 channels x 4 taps per layer,
+    // 36 layers per token - it was a real part of the decode latency.
     const std::vector<float>& conv_w = mamba_host_conv_w_[si];
     const std::vector<float>& conv_b = mamba_host_conv_b_[si];
     float* bc_out = mamba_bc_out_host_.data();
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int ch = 0; ch < conv_dim; ++ch) {
         float acc = conv_b.empty() ? 0.0f : conv_b[static_cast<size_t>(ch)];
         const float* w_ch = conv_w.data() + static_cast<size_t>(ch) * conv_k;
@@ -493,11 +503,17 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
         bc_out[static_cast<size_t>(ch)] = acc / (1.0f + std::exp(-acc));
     }
     // shift the window
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int ch = 0; ch < conv_dim; ++ch)
         for (int j = 0; j + 1 < conv_win; ++j)
             st.conv_host[static_cast<size_t>(ch) * conv_win + j] =
                 st.conv_host[static_cast<size_t>(ch) * conv_win + j + 1];
     if (conv_win > 0)
+#ifdef GAI_OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
         for (int ch = 0; ch < conv_dim; ++ch)
             st.conv_host[static_cast<size_t>(ch) * conv_win + (conv_win - 1)] =
                 bc[static_cast<size_t>(ch)];
@@ -508,10 +524,16 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
     const float* Cm  = Bm + n_groups * d_state;
 
     // ---- 5) recurrent SSM update
+    // The heads are independent (each one owns its state rows), so they are
+    // updated in parallel. The arithmetic PER HEAD is unchanged, so the
+    // numbers stay bit-identical to the serial version (and to the CPU).
     const std::vector<float>& A_log   = mamba_host_a_log_[si];
     const std::vector<float>& dt_bias = mamba_host_dt_bias_[si];
     const std::vector<float>& D       = mamba_host_D_[si];
     float* y = mamba_y_host_.data();
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int h = 0; h < n_heads; ++h) {
         const float a = -std::exp(A_log[h]);
         float dtb = dt_r[h] + dt_bias[h];
