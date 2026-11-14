@@ -30,8 +30,11 @@ if (SRC / "CMakeLists.txt").exists():
     print("the source is already there -> pulling the latest")
     sh(f"git -C {SRC} pull --ff-only origin {REPO_BRANCH}")
 else:
-    if WORK.exists():
-        shutil.rmtree(WORK, ignore_errors=True)
+    # NOTE: only the source directory is removed. /kaggle/working also holds
+    # the datasets the user staged, the checkpoints and the exports: wiping
+    # it would throw away hours of work.
+    if SRC.exists():
+        shutil.rmtree(SRC, ignore_errors=True)
     WORK.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     r = subprocess.run(["git", "clone", "--depth", "1", "-b", REPO_BRANCH, REPO_URL, str(SRC)])
