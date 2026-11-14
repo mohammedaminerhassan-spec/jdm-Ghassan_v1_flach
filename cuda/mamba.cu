@@ -94,6 +94,7 @@ __global__ void k_mamba_conv1d(const float* __restrict__ in,
                                const float* __restrict__ w,     // [C, k]
                                const float* __restrict__ bias,  // [C] or null
                                float* __restrict__ out,
+                               float* __restrict__ raw_out,     // [B,T,C] or null
                                int B, int T, int C, int in_stride, int k) {
     extern __shared__ float sh[];
     const int c = blockIdx.x;
@@ -120,6 +121,7 @@ __global__ void k_mamba_conv1d(const float* __restrict__ in,
             const float v = (j == k - 1) ? *val : win[j];
             acc += wc[j] * v;
         }
+        if (raw_out) raw_out[((size_t(b) * T + t) * C) + c] = acc;
         out[((size_t(b) * T + t) * C) + c] = acc / (1.0f + expf(-acc));
         __syncthreads();
         if (lane == 0) {
@@ -294,7 +296,7 @@ static void mamba2_forward_impl(const float* x,          // [B, T, d]
         const int block = 128;
         const size_t sh = sizeof(float) * (k > 1 ? k : 1);
         k_mamba_conv1d<<<grid, block, sh>>>(proj + d_inner, conv_w, conv_b,
-                                           bc, B, T, conv_dim, proj_size, k);
+                                           bc, nullptr, B, T, conv_dim, proj_size, k);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
 
@@ -615,6 +617,7 @@ __global__ void k_mamba_conv1d_bwd(const float* __restrict__ proj,
                                    const float* __restrict__ conv_w,
                                    const float* __restrict__ conv_b,
                                    const float* __restrict__ dbc,
+                                   const float* __restrict__ conv_raw,  // [B,T,C]
                                    float* __restrict__ dconv_w,
                                    float* __restrict__ dconv_b,
                                    float* __restrict__ dproj_bc,
@@ -625,18 +628,14 @@ __global__ void k_mamba_conv1d_bwd(const float* __restrict__ proj,
     const int nthr = blockDim.x;
 
     const float* wc = conv_w + size_t(c) * k;
-    const float bcv = conv_b ? conv_b[c] : 0.0f;
 
     for (int t = lane; t < T; t += nthr) {
-        float raw_acc = bcv;
-        for (int j = 0; j < k; ++j) {
-            const int tin = t - (k - 1 - j);
-            if (tin >= 0) {
-                const size_t pidx = (size_t(b) * T + tin) * proj_size + c;
-                raw_acc += wc[j] * proj[pidx];
-            }
-        }
+        // The pre-activation of the convolution: it was saved by the
+        // forward recompute (the CPU reference does the same with
+        // conv_raw), so the SiLU derivative is the one of the value the
+        // forward actually used.
         const size_t idx = (size_t(b) * T + t) * conv_dim + c;
+        const float raw_acc = conv_raw[idx];
         const float sig = 1.0f / (1.0f + expf(-raw_acc));
         const float dsilu = sig * (1.0f + raw_acc * (1.0f - sig));
         const float dacc = dbc[idx] * dsilu;
@@ -719,12 +718,13 @@ void mamba2_backward(const float* x,
     if (rows_batch > rows) rows_batch = rows;
     const size_t traj_floats = (size_t)rows_batch * per_row_traj;
 
-    const size_t total_floats = n_tok * (size_t(proj_size) * 2 + size_t(conv_dim) * 3 + size_t(d_inner) * 5 + n_heads) + traj_floats + 256;
+    const size_t total_floats = n_tok * (size_t(proj_size) * 2 + size_t(conv_dim) * 4 + size_t(d_inner) * 5 + n_heads) + traj_floats + 256;
     float* ws = mamba_workspace(total_floats);
 
     float* proj     = ws;
     float* bc       = proj     + n_tok * size_t(proj_size);
-    float* y_scan   = bc       + n_tok * size_t(conv_dim);
+    float* conv_raw = bc       + n_tok * size_t(conv_dim);
+    float* y_scan   = conv_raw + n_tok * size_t(conv_dim);
     float* y_norm   = y_scan   + n_tok * size_t(d_inner);
     float* dy_norm  = y_norm   + n_tok * size_t(d_inner);
     float* dy_scan  = dy_norm  + n_tok * size_t(d_inner);
@@ -742,7 +742,7 @@ void mamba2_backward(const float* x,
         const int block = 128;
         const size_t sh = sizeof(float) * (k > 1 ? k : 1);
         k_mamba_conv1d<<<grid, block, sh>>>(proj + d_inner, conv_w, conv_b,
-                                            bc, B, T, conv_dim, proj_size, k);
+                                            bc, conv_raw, B, T, conv_dim, proj_size, k);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
     {
@@ -822,7 +822,7 @@ void mamba2_backward(const float* x,
         dim3 grid(conv_dim, B);
         const int block = 128;
         k_mamba_conv1d_bwd<<<grid, block>>>(proj + d_inner, conv_w, conv_b,
-                                            dbc, dconv_w, dconv_b, dproj_bc,
+                                            dbc, conv_raw, dconv_w, dconv_b, dproj_bc,
                                             B, T, conv_dim, proj_size, k);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
