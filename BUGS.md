@@ -43,9 +43,27 @@ cmake --build build
 cd build && ctest --output-on-failure
 ```
 
+## Verification after the fixes
+
+| What | How | Result |
+|---|---|---|
+| The CPU gradients | `tests/test_gradient_check.cpp` (finite differences) | ✅ every parameter to < 5% (the MoE parts < 1.5%) |
+| The Mamba-2 layer alone | `tests/test_mamba_backward.cpp` (a linear loss → a clean signal) | ✅ the 9 tensors to < 2.2% (most < 0.2%) |
+| The Mamba-2 in the full model | the same test, Granite shape without the MoE | ✅ < 0.4% |
+| The Granite geometry | `tests/test_granite_compat.cpp` | ✅ the parameter count matches the checkpoint exactly |
+| The export round trip | `tests/test_safetensors_roundtrip.cpp` | ✅ write → read → identical |
+| **The CUDA sources compile** | `scripts/check_cuda_compile.sh` (no GPU, CUDA ≥ 12.5) | ✅ all 5 files (nvcc 12.8) |
+| **The full Linux + CUDA build** | the same build cell 2 does on Kaggle | ✅ 70/70 targets, all the binaries |
+| The CPU ↔ CUDA gradients | `tests/test_cuda_parity.cpp` (needs a GPU) | runs on Kaggle (cell 4) |
+
+> The CUDA sources were a blind spot: nothing on a CPU-only machine compiles
+> them, so a typo there (BUG-22) survived from the first audit until the
+> first Kaggle build. `scripts/check_cuda_compile.sh` + the CI job close the
+> gap, and the WSL nvcc gave the same check locally.
+
 ---
 
-## BUG-01 🔴 — الـ FFN في الـ backward ناقصه عامل `residual_multiplier`
+
 
 **الموقع:** `model/model.cpp` — `Model::forward_backward()`، فرع الـ FFN (الأسطر ~2430–2494)
 
