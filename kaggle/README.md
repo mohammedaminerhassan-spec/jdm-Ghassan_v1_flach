@@ -85,6 +85,15 @@ os.environ["HF_PUBLIC"]   = "0"
 - أول compile بـ nvcc → لو هنا وقع، المشكلة في الـ CUDA.
 - **الخطر الأساسي:** التعديلات على `cuda/kernels.cu` و `cuda/attention.cu`
   (تقطيع الـ GEMM). لو الـ build عدّى،Syntax تمام، والـ runtime بيبقى في الخلية 4.
+- **CUDA ≥ 12.5 مطلوب** (الـ attention بيستعمل `cublasGemmGroupedBatchedEx`).
+  صورة Kaggle الحالية فيها CUDA 12.8 ✓. الخلية بتقولك صراحةً لو النسخة أقدم.
+- **قبل ما تشغّل أي حاجة على Kaggle**، تقدر تعمل نفس الفحص على جهازك من غير
+  GPU (دقيقة واحدة):
+  ```bash
+  bash scripts/check_cuda_compile.sh     # NVCC=/path/to/nvcc لو مش على الـ PATH
+  ```
+  ده بيكشف كل أخطاء الترجمة في ملفات `.cu` (وهي أخطاء الـ CPU tests مش
+  بتوصلها خالص).
 
 ### الخلية 4 (الـ smoke) — الأهم
 تشغّل:

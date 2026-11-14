@@ -70,10 +70,16 @@ else:
     print("notebook) or at a local folder of .parquet files.")
 
 # ---- the shards (the ENGINE tokenizes) -------------------------------------
+# The shard builder needs a recipe (it checks the vocabulary against the
+# model's embedding: the Granite tokenizer has 100352 tokens, so the recipe
+# must have a vocab_size >= that).
+SHARD_CONFIG = os.environ.get("SHARD_CONFIG",
+                              str(SRC / "configs" / "ghassan_v1_flash_smoke.yaml"))
 if DATA.exists() and any(DATA.glob("*.txt")):
     print("\nbuilding the shards with the engine's tokenizer ...")
     r = subprocess.run(
         [str(WORK / "build" / "bin" / "gai_train"),
+         "--config", SHARD_CONFIG,
          "--build-shards", str(DATA),
          "--tokenizer", str(tok_json),
          "--shard-prefix", "train"],
@@ -84,6 +90,7 @@ if DATA.exists() and any(DATA.glob("*.txt")):
     # The validation shards (the same recipe, the val_ prefix).
     r = subprocess.run(
         [str(WORK / "build" / "bin" / "gai_train"),
+         "--config", SHARD_CONFIG,
          "--build-shards", str(DATA),
          "--tokenizer", str(tok_json),
          "--shard-prefix", "val"],

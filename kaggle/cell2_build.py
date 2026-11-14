@@ -33,6 +33,35 @@ env["CMAKE_CUDA_ARCHITECTURES"] = "75"
 # The build is long: give ninja all the cores.
 jobs = max(1, (os.cpu_count() or 2))
 
+# ---- the CUDA version -------------------------------------------------------
+# The attention path uses the grouped GEMM API (cublasGemmGroupedBatchedEx):
+# CUDA >= 12.5. An older toolkit fails with a cryptic "identifier undefined"
+# deep in the attention file, so the version is checked up front.
+nvcc = None
+for cand in ("/usr/local/cuda/bin/nvcc", "/usr/bin/nvcc",
+             "/usr/local/cuda-12.8/bin/nvcc", "/usr/local/cuda-12.6/bin/nvcc",
+             "/usr/local/cuda-12.4/bin/nvcc"):
+    if os.path.exists(cand):
+        nvcc = cand
+        break
+if nvcc:
+    v = subprocess.run([nvcc, "--version"], capture_output=True, text=True).stdout
+    print("nvcc:", " | ".join(l.strip() for l in v.splitlines()[-3:] if l.strip()))
+    rel = [l for l in v.splitlines() if "release" in l]
+    minor = 0
+    if rel:
+        try:
+            parts = rel[0].split("release")[1].strip().split(".")
+            minor = int(parts[0]) * 100 + int(parts[1].split(",")[0])
+        except Exception:
+            minor = 0
+    if minor and minor < 1205:
+        print(f"WARNING: this CUDA is older than 12.5 ({minor//100}.{minor%100}). "
+              "The attention path needs the grouped GEMM API: the build will fail "
+              "in cuda/attention.cu. Use a newer image.")
+else:
+    print("WARNING: nvcc was not found on the PATH.")
+
 t0 = time.time()
 print("=" * 70)
 print("configuring ...", flush=True)
