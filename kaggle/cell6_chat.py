@@ -32,7 +32,10 @@ PROMPT = """Please list one IBM Research laboratory located in the United States
 # it); the plain mode just continues the text.
 MODE = "chat"          # "chat" or "text"
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "96"))
-CTX = int(os.environ.get("CTX", "2048"))
+# The context: the Granite weights are 12.93 GiB and the T4 has 14.56 GiB, so
+# only ~1.6 GiB are left for the activations and the workspaces. A context
+# of 2048 does NOT fit (the plan says 101%); 1024 fits (97%).
+CTX = int(os.environ.get("CTX", "1024"))
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.7"))
 TOP_P = float(os.environ.get("TOP_P", "0.9"))
 SEED = int(os.environ.get("SEED", "42"))
