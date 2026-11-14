@@ -391,6 +391,14 @@ void ModelConfig::validate() const {
                   strfmt("granite: mamba_n_groups must be 1 (the conv output layout is "
                          "[x | B | C] with one B and one C block), got %d",
                          mamba_n_groups));
+        // The scan reads the x channel of the conv output at (h*d_head + i):
+        // the heads must fit inside the x block, or the kernels read past
+        // the end of the buffer (a silent memory error).
+        const int d_inner = mamba_expand * hidden_size;
+        GAI_CHECK(mamba_n_heads * mamba_d_head <= d_inner,
+                  strfmt("granite: mamba_n_heads*mamba_d_head (%d*%d=%d) must fit in the "
+                         "x block of the conv output (d_inner = expand*hidden = %d)",
+                         mamba_n_heads, mamba_d_head, mamba_n_heads * mamba_d_head, d_inner));
     }
     // Attention kernel shared memory limit (T4: 48KB). The flash-style kernel
     // uses shared memory: sQ[hd] + sK[KV_TILE*hd] + sV[KV_TILE*hd] + sS[KV_TILE] + sAcc[hd]

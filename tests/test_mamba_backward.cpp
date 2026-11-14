@@ -265,19 +265,45 @@ static void probe(const char* name, Layer& L, std::vector<float>& p,
 }
 
 int main() {
-    Layer L;
-    L.init(20261114);
-    Grads gr = analytic(L);
+    // Several geometries: a small one, the Granite-4.0 ratios (n_heads *
+    // d_head < d_inner, so only a part of the x channels is used), and one
+    // where n_heads * d_head == d_inner exactly.
+    struct Case {
+        const char* tag;
+        int d, expand, n_heads, d_head, d_state, k, B, T;
+    };
+    const Case cases[] = {
+        {"tiny",      6, 2, 3,  4,  3, 4, 2, 5},
+        {"granite",   8, 2, 2,  8, 16, 4, 2, 7},
+        {"full-x",   16, 2, 4,  8, 16, 4, 1, 9},
+    };
+    for (const Case& c : cases) {
+        Layer L;
+        L.g.B = c.B;
+        L.g.T = c.T;
+        L.g.d = c.d;
+        L.g.expand = c.expand;
+        L.g.n_heads = c.n_heads;
+        L.g.d_head = c.d_head;
+        L.g.d_state = c.d_state;
+        L.g.k = c.k;
+        L.init(20261114 + static_cast<u64>(c.d_state * 31 + c.n_heads));
 
-    const double tol = 0.02;   // the fp32 forward is worth about this
-    probe("in_proj",   L, L.w_in,   gr.dw_in,   3, tol);
-    probe("conv1d.w",  L, L.conv_w, gr.dconv_w, 3, tol);
-    probe("conv1d.b",  L, L.conv_b, gr.dconv_b, 3, tol);
-    probe("dt_bias",   L, L.dt_bias,gr.ddt_bias,2, tol);
-    probe("A_log",     L, L.a_log,  gr.da_log,  2, tol);
-    probe("D",         L, L.D,      gr.dD,      2, tol);
-    probe("norm.w",    L, L.norm_w, gr.dnorm_w, 3, tol);
-    probe("out_proj",  L, L.w_out,  gr.dw_out,  3, tol);
+        std::printf("test_mamba_backward: the case '%s' (d=%d d_inner=%d n_heads=%d "
+                    "d_head=%d d_state=%d k=%d B=%d T=%d)\n",
+                    c.tag, c.d, L.g.d_inner(), c.n_heads, c.d_head, c.d_state, c.k, c.B, c.T);
+        Grads gr = analytic(L);
+
+        const double tol = 0.02;   // the fp32 forward is worth about this
+        probe("in_proj",   L, L.w_in,   gr.dw_in,   3, tol);
+        probe("conv1d.w",  L, L.conv_w, gr.dconv_w, 3, tol);
+        probe("conv1d.b",  L, L.conv_b, gr.dconv_b, 3, tol);
+        probe("dt_bias",   L, L.dt_bias,gr.ddt_bias,2, tol);
+        probe("A_log",     L, L.a_log,  gr.da_log,  2, tol);
+        probe("D",         L, L.D,      gr.dD,      2, tol);
+        probe("norm.w",    L, L.norm_w, gr.dnorm_w, 3, tol);
+        probe("out_proj",  L, L.w_out,  gr.dw_out,  3, tol);
+    }
 
     if (g_failures == 0) {
         std::printf("test_mamba_backward: OK\n");
