@@ -24,13 +24,29 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "Ghassan v1 Flash")
 REPO_ID = os.environ.get("HF_REPO_OUT", "")     # <-- the target repository
 PUBLIC = os.environ.get("HF_PUBLIC", "0") == "1"
 
+# The Granite checkpoint: where it is (the working directory or the
+# read-only /kaggle/input - the dataset does NOT use the 20 GB of
+# /kaggle/working, which matters: the full-precision GGUF is 13 GB and it
+# has to be written somewhere).
+def find_granite():
+    for root in [WORK / "granite", WORK / "hf"]:
+        if (root / "config.json").exists():
+            return root
+    for p in pathlib.Path("/kaggle/input").rglob("config.json"):
+        return p.parent
+    return None
+
+GRANITE = find_granite()
+if GRANITE:
+    print("the Granite checkpoint:", GRANITE)
+
 # The tokenizer: the Granite one (the vocabulary of the model). The
 # DIRECTORY is used when there is one (the export copies the tokenizer
 # files: the vocab, the merges, the config...), otherwise the file.
 TOKENIZER = ""
 TOKENIZER_DIR = ""
-for cand in (WORK / "hf", WORK / "granite"):
-    if (cand / "tokenizer.json").exists():
+for cand in ([GRANITE] if GRANITE else []) + [WORK / "hf", WORK / "granite"]:
+    if cand and (cand / "tokenizer.json").exists():
         TOKENIZER = str(cand / "tokenizer.json")
         TOKENIZER_DIR = str(cand)
         break
@@ -46,32 +62,46 @@ print("the tokenizer:", TOKENIZER)
 ckpt = pathlib.Path(CKPT)
 if not ckpt.exists():
     cands = sorted((WORK / "artifacts" / "checkpoints").rglob("last.ckpt"))
-    if not cands:
-        raise SystemExit("no checkpoint found: run the training first")
-    ckpt = cands[-1]
-    print("using the checkpoint:", ckpt)
+    if cands:
+        ckpt = cands[-1]
+        print("using the checkpoint:", ckpt)
+
+# The disk: the full-precision GGUF is 13 GB.
+try:
+    st = os.statvfs(str(WORK))
+    free = st.f_bavail * st.f_frsize / (1024 ** 3)
+    print(f"the free space on /kaggle/working: {free:.1f} GB")
+except Exception:
+    free = 0.0
 
 if OUT.exists():
     shutil.rmtree(OUT)
 OUT.mkdir(parents=True, exist_ok=True)
 
-cmd = [str(BUILD / "bin" / "ghassan-ai"), "export",
-       "--checkpoint", str(ckpt),
-       "--tokenizer", TOKENIZER_DIR or TOKENIZER,   # the directory: the tokenizer files
-       "--out", str(OUT),
-       "--format", "safetensors",
-       "--dtype", os.environ.get("DTYPE", "f16"),
-       "--model-name", MODEL_NAME]
-print("$", " ".join(cmd))
-r = subprocess.run(cmd, capture_output=True, text=True)
-print(r.stdout[-4000:]); print(r.stderr[-4000:])
-if r.returncode != 0:
-    raise SystemExit("the export failed")
+# The safetensors export: only when there is a TRAINED checkpoint (the
+# training artifact). The Granite checkpoint itself is already in the
+# HuggingFace format.
+if ckpt.exists():
+    cmd = [str(BUILD / "bin" / "ghassan-ai"), "export",
+           "--checkpoint", str(ckpt),
+           "--tokenizer", TOKENIZER_DIR or TOKENIZER,   # the directory: the tokenizer files
+           "--out", str(OUT),
+           "--format", "safetensors",
+           "--dtype", os.environ.get("DTYPE", "f16"),
+           "--model-name", MODEL_NAME]
+    print("\n$", " ".join(cmd))
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    print(r.stdout[-4000:]); print(r.stderr[-4000:])
+    if r.returncode != 0:
+        raise SystemExit("the export failed")
 
-print("\nthe exported repository:")
-for p in sorted(OUT.rglob("*")):
-    if p.is_file():
-        print(f"  {p.relative_to(OUT)}  ({p.stat().st_size/1024/1024:.1f} MB)")
+    print("\nthe exported repository:")
+    for p in sorted(OUT.rglob("*")):
+        if p.is_file():
+            print(f"  {p.relative_to(OUT)}  ({p.stat().st_size/1024/1024:.1f} MB)")
+else:
+    print("\nno trained checkpoint: the safetensors export is skipped "
+          "(the Granite checkpoint is already in the HuggingFace format)")
 
 # The check: the engine must be able to READ BACK what it wrote (the same
 # code path a user hits when they clone the repository).
@@ -106,13 +136,28 @@ else:
 #   the geometry          = Granite, untouched
 GGUF = pathlib.Path(os.environ.get("GGUF_OUT", str(WORK / "ghassan-v1-flash.gguf")))
 
-# Where do the weights come from? The trained checkpoint if there is one,
-# else the Granite checkpoint itself (the model IS Granite until it is
-# trained further).
-gguf_src = str(OUT)                      # the safetensors repository (the default)
-if not (pathlib.Path(gguf_src) / "config.json").exists():
-    gguf_src = str(HF)                   # the Granite checkpoint directory
-    print("\nthe GGUF is exported from the Granite checkpoint:", gguf_src)
+# Where do the weights come from? The trained checkpoint's safetensors (the
+# default), else the Granite checkpoint itself (the model IS Granite until
+# it is trained further).
+gguf_src = ""
+if (OUT / "config.json").exists():
+    gguf_src = str(OUT)
+elif GRANITE:
+    gguf_src = str(GRANITE)
+if not gguf_src:
+    raise SystemExit("no model to export: run cell 0 (the weights) or the training first")
+
+# The disk check: the full-precision GGUF is as big as the model (13 GB for
+# Granite) and /kaggle/working has 20 GB in total.
+need = 13.5
+if free and free < need and os.environ.get("FORCE", "0") != "1":
+    print(f"\nWARNING: the GGUF needs about {need:.0f} GB and there is only "
+          f"{free:.1f} GB free on /kaggle/working.")
+    print("         The Granite weights in /kaggle/working take 13 GB: move them")
+    print("         to a Kaggle DATASET (read-only, it does not count) and point")
+    print("         MODEL_DIR at it, or free the space, or use a quantized")
+    print("         profile (GGUF_PROFILE=q8_0).")
+    print("         (FORCE=1 to try anyway.)")
 
 cmd = [str(BUILD / "bin" / "ghassan-ai"), "quantize",
        "--model", gguf_src,

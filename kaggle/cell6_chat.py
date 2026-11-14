@@ -34,7 +34,8 @@ MODE = "chat"          # "chat" or "text"
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "96"))
 # The context: the Granite weights are 12.93 GiB and the T4 has 14.56 GiB, so
 # only ~1.6 GiB are left for the activations and the workspaces. A context
-# of 2048 does NOT fit (the plan says 101%); 1024 fits (97%).
+# of 2048 does NOT fit (the plan says 101%); 1024 fits (97%). The cell
+# shrinks it further if the card is smaller.
 CTX = int(os.environ.get("CTX", "1024"))
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.7"))
 TOP_P = float(os.environ.get("TOP_P", "0.9"))
@@ -84,10 +85,23 @@ print(PROMPT)
 print("=" * 72)
 t0 = time.time()
 r = subprocess.run(cmd, capture_output=True, text=True)
+# The card can be too small for the context: the engine says so before it
+# starts ("it needs 14.78 GiB but the card has 14.56 GiB"). The context is
+# halved until it fits (the KV cache and the activations shrink with it).
+ctx = CTX
+while r.returncode != 0 and ctx > 128:
+    out = r.stdout + r.stderr
+    if "does not fit this GPU" not in out:
+        break
+    ctx //= 2
+    print(f"(the card is too small for a context of {ctx*2}: retrying with {ctx})")
+    cmd[cmd.index("--ctx") + 1] = str(ctx)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+
 print(r.stdout)
 if r.stderr.strip():
     print(r.stderr[-3000:])
-print(f"\n({time.time()-t0:.0f}s)")
+print(f"\n({time.time()-t0:.0f}s, the context was {ctx})")
 if r.returncode != 0:
     raise SystemExit("the generation failed")
 
