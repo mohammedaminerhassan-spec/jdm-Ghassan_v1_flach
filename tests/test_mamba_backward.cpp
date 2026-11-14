@@ -161,7 +161,7 @@ static Grads analytic(Layer& L) {
                          L.w_out.data(), L.c.data(),
                          gr.dx.data(), gr.dw_in.data(), gr.dconv_w.data(), gr.dconv_b.data(),
                          gr.ddt_bias.data(), gr.da_log.data(), gr.dD.data(), gr.dnorm_w.data(),
-                         gr.dw_out.data(),
+                         gr.dw_out.data(), nullptr,
                          g.B, g.T, g.d, g.d_inner(), g.conv_dim(), g.n_heads,
                          g.d_head, g.d_state, g.k, g.eps);
     return gr;

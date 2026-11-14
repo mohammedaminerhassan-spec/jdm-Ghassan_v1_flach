@@ -693,6 +693,7 @@ void mamba2_backward(const float* x,
                      float* dD,
                      float* dnorm_w,
                      float* dw_out,
+                     float* dbc_out,
                      int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                      int d_head, int d_state, int k, float eps) {
     if (B <= 0 || T <= 0) return;
@@ -834,6 +835,12 @@ void mamba2_backward(const float* x,
         CU_MAMBA_CHECK(cudaGetLastError());
     }
     linear_backward(x, w_in, dproj, dx, dw_in, B * T, d, proj_size);
+
+    // The scan's gradient (the one the conv backward reads). It is optional:
+    // the diagnostic (the CPU<->CUDA parity) asks for it.
+    if (dbc_out)
+        CU_MAMBA_CHECK(cudaMemcpy(dbc_out, dbc, sizeof(float) * n_tok * conv_dim,
+                                  cudaMemcpyDeviceToHost));
 }
 
 }  // namespace cuda_ops

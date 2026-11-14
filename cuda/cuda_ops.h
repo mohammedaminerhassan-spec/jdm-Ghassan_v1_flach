@@ -158,6 +158,7 @@ void mamba2_backward(const float* x,
                      float* dD,
                      float* dnorm_w,
                      float* dw_out,
+                     float* dbc_out,
                      int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                      int d_head, int d_state, int k, float eps);
 

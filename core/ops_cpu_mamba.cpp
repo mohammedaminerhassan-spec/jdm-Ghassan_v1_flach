@@ -242,6 +242,7 @@ void mamba2_backward(const float* x,
                      float* dD,
                      float* dnorm_w,
                      float* dw_out,
+                     float* dbc_out,
                      int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                      int d_head, int d_state, int k, float eps) {
     if (B <= 0 || T <= 0) return;
@@ -621,6 +622,11 @@ void mamba2_backward(const float* x,
     // dx = dproj * w_in (shape [N, d])
     // dw_in += dproj^T * x (shape [proj_size, d])
     linear_backward(x, w_in, dproj.data(), dx, dw_in, N, d, proj_size);
+
+    // The scan's gradient (the one the conv backward reads). It is optional:
+    // the diagnostic (the CPU<->CUDA parity) asks for it.
+    if (dbc_out && !dbc.empty())
+        std::memcpy(dbc_out, dbc.data(), dbc.size() * sizeof(float));
 }
 
 }  // namespace cpu

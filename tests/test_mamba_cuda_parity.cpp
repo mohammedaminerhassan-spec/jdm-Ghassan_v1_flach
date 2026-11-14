@@ -90,6 +90,7 @@ struct Weights {
 
 struct Grads {
     std::vector<float> dx, dw_in, dconv_w, dconv_b, ddt_bias, da_log, dD, dnorm_w, dw_out;
+    std::vector<float> dbc;   // the scan's gradient (the conv backward reads it)
 };
 
 // The forward + the backward of the layer on one device.
@@ -140,6 +141,9 @@ static void run(Device dev, Weights& w, std::vector<float>& out, Grads& gr) {
     Tensor tdD({static_cast<i64>(g.n_heads)}, DType::F32, dev);
     Tensor tdnorm_w({static_cast<i64>(g.d_inner())}, DType::F32, dev);
     Tensor tdw_out({static_cast<i64>(g.d) * g.d_inner()}, DType::F32, dev);
+    // The scan's gradient: the conv backward reads it, so comparing it
+    // tells whether the scan backward or the conv backward is the wrong one.
+    Tensor tdbc({static_cast<i64>(g.B) * g.T * g.conv_dim()}, DType::F32, dev);
     // The CUDA kernels ACCUMULATE into the gradient buffers (beta = 1 and
     // the atomicAdds), so they have to start at zero - exactly like the
     // model's zero_grad() does before the backward.
@@ -152,6 +156,7 @@ static void run(Device dev, Weights& w, std::vector<float>& out, Grads& gr) {
     ops::zero(dev, tdD.f32(), tdD.numel());
     ops::zero(dev, tdnorm_w.f32(), tdnorm_w.numel());
     ops::zero(dev, tdw_out.f32(), tdw_out.numel());
+    ops::zero(dev, tdbc.f32(), tdbc.numel());
 
     ops::mamba2_backward(dev, tx.f32(), tw_in.f32(), tconv_w.f32(), tconv_b.f32(),
                          tdt_bias.f32(), ta_log.f32(), tD.f32(), tnorm_w.f32(),
@@ -159,13 +164,15 @@ static void run(Device dev, Weights& w, std::vector<float>& out, Grads& gr) {
                          tdx.f32(), tdw_in.f32(), tdconv_w.f32(), tdconv_b.f32(),
                          tddt_bias.f32(), tda_log.f32(), tdD.f32(), tdnorm_w.f32(),
                          tdw_out.f32(),
+                         tdbc.f32(),
                          g.B, g.T, g.d, g.d_inner(), g.conv_dim(), g.n_heads,
                          g.d_head, g.d_state, g.k, g.eps);
 
     struct { std::vector<float>* v; const Tensor* t; } pairs[] = {
         {&gr.dx, &tdx}, {&gr.dw_in, &tdw_in}, {&gr.dconv_w, &tdconv_w},
         {&gr.dconv_b, &tdconv_b}, {&gr.ddt_bias, &tddt_bias}, {&gr.da_log, &tda_log},
-        {&gr.dD, &tdD}, {&gr.dnorm_w, &tdnorm_w}, {&gr.dw_out, &tdw_out}};
+        {&gr.dD, &tdD}, {&gr.dnorm_w, &tdnorm_w}, {&gr.dw_out, &tdw_out},
+        {&gr.dbc, &tdbc}};
     for (auto& p : pairs) {
         Tensor h = p.t->to(Device::CPU);
         p.v->resize(static_cast<size_t>(h.numel()));
@@ -237,6 +244,7 @@ int main() {
     compare("d(D)", gc.dD, gg.dD);
     compare("d(norm.w)", gc.dnorm_w, gg.dnorm_w);
     compare("d(out_proj)", gc.dw_out, gg.dw_out);
+    compare("dbc", gc.dbc, gg.dbc);
 
     if (g_failures == 0) {
         std::printf("test_mamba_cuda_parity: OK\n");

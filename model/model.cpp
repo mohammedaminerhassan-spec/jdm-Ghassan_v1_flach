@@ -2596,6 +2596,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                      L.mamba_D.g.defined() ? L.mamba_D.g.f32() : nullptr,
                                      L.mamba_norm.g.defined() ? L.mamba_norm.g.f32() : nullptr,
                                      L.mamba_out_proj.g.defined() ? L.mamba_out_proj.g.f32() : nullptr,
+                                     nullptr,   // dbc_out (the diagnostic only)
                                      B, T, d, d_inner, conv_dim, n_heads, d_head, d_state,
                                      cfg_.mamba_d_conv, cfg_.rms_eps);
             }

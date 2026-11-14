@@ -489,13 +489,14 @@ void mamba2_backward(Device dev,
                      float* dD,
                      float* dnorm_w,
                      float* dw_out,
+                     float* dbc_out,
                      int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                      int d_head, int d_state, int k, float eps) {
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
         cuda_ops::mamba2_backward(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
                                   norm_w, w_out, dout, dx, dw_in, dconv_w, dconv_b,
-                                  ddt_bias, da_log, dD, dnorm_w, dw_out,
+                                  ddt_bias, da_log, dD, dnorm_w, dw_out, dbc_out,
                                   B, T, d, d_inner, conv_dim, n_heads,
                                   d_head, d_state, k, eps);
         return;
@@ -504,7 +505,7 @@ void mamba2_backward(Device dev,
     (void)dev;
     cpu::mamba2_backward(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
                          dout, dx, dw_in, dconv_w, dconv_b, ddt_bias, da_log, dD,
-                         dnorm_w, dw_out, B, T, d, d_inner, conv_dim, n_heads,
+                         dnorm_w, dw_out, dbc_out, B, T, d, d_inner, conv_dim, n_heads,
                          d_head, d_state, k, eps);
 }
 
