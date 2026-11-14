@@ -140,6 +140,18 @@ static void run(Device dev, Weights& w, std::vector<float>& out, Grads& gr) {
     Tensor tdD({static_cast<i64>(g.n_heads)}, DType::F32, dev);
     Tensor tdnorm_w({static_cast<i64>(g.d_inner())}, DType::F32, dev);
     Tensor tdw_out({static_cast<i64>(g.d) * g.d_inner()}, DType::F32, dev);
+    // The CUDA kernels ACCUMULATE into the gradient buffers (beta = 1 and
+    // the atomicAdds), so they have to start at zero - exactly like the
+    // model's zero_grad() does before the backward.
+    ops::zero(dev, tdx.f32(), tdx.numel());
+    ops::zero(dev, tdw_in.f32(), tdw_in.numel());
+    ops::zero(dev, tdconv_w.f32(), tdconv_w.numel());
+    ops::zero(dev, tdconv_b.f32(), tdconv_b.numel());
+    ops::zero(dev, tddt_bias.f32(), tddt_bias.numel());
+    ops::zero(dev, tda_log.f32(), tda_log.numel());
+    ops::zero(dev, tdD.f32(), tdD.numel());
+    ops::zero(dev, tdnorm_w.f32(), tdnorm_w.numel());
+    ops::zero(dev, tdw_out.f32(), tdw_out.numel());
 
     ops::mamba2_backward(dev, tx.f32(), tw_in.f32(), tconv_w.f32(), tconv_b.f32(),
                          tdt_bias.f32(), ta_log.f32(), tD.f32(), tnorm_w.f32(),
