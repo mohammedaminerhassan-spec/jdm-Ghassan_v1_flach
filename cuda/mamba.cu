@@ -572,7 +572,12 @@ __global__ void k_mamba_scan_bwd(const float* __restrict__ proj,
         const float* s_prev = mytraj + (size_t)t * d_state;
 
         if (dD && lane == 0) atomicAdd(&dD[h], dy_val * xv);
-        float dx_val = dy_val * dskip;
+        // The skip term (D * x) belongs to the row ONCE. Every thread
+        // starts with its own copy of it, and the block reduction below
+        // sums the threads: the term was counted 256 times (the block
+        // size) instead of once, which made the whole x-channel
+        // gradient 256x too big.
+        float dx_val = (lane == 0) ? dy_val * dskip : 0.0f;
 
         float local_d_dA = 0.0f;
         float local_d_dt = 0.0f;

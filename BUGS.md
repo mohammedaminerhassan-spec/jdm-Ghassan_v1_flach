@@ -26,6 +26,8 @@
 | BUG-20 | **جديد**: `mamba_n_groups > 1` كان بيتبني بموديل غلط (layout الـ B/C) | متوسطة | `model/model.cpp` | اتصلّح (حارس) |
 | BUG-21 | **جديد**: الـ Mamba backward على الـ GPU بيمرّر `nullptr` لتدرّج الـ out projection | حرجة | `cuda/mamba.cu` | اتصلّح |
 | BUG-22 | **جديد**: خطأ ترجمة في `cuda/attention.cu` (`ldbB` بدل `ldaB`) — الـ build على Kaggle كان هيقع | حرجة | `cuda/attention.cu` | اتصلّح |
+| BUG-23 | **جديد**: مسار الـ state في الـ Mamba backward: كل batch كان بيقرا مسار الـ batch التاني | حرجة | `cuda/mamba.cu` | اتصلّح |
+| BUG-24 | **جديد**: تدرّج الـ x channels في الـ Mamba كان بيتحسب 256 مرة (مرة لكل thread) | حرجة | `cuda/mamba.cu` | اتصلّح |
 
 **الاختبارات الجديدة** (الـ `CMakeLists.txt` كان بيبني `tests/test_*.cpp` من زمان والمجلد كان فاضي):
 
@@ -971,7 +973,45 @@ act_ = model_.make_activations(cfg_.batch_size, cfg_.seq_len, true, cfg_.ce_chun
 
 **الإصلاح:** حارس صريح في الـ validation.
 
-## BUG-23 🔴 — مسار الحالة في الـ Mamba backward: كل batch كان بيقرا مسار الـ batch التاني
+## BUG-24 🔴 — الـ Mamba: تدرّج الـ x channels كان بيتحسب 256 مرة (مرة لكل thread)
+
+**الموقع:** `cuda/mamba.cu` — `k_mamba_scan_bwd()`
+
+**السبب:**
+
+```cpp
+float dx_val = dy_val * dskip;        // ❌ كل thread بياخد copy
+...
+for (int j = lane; j < d_state; j += nthr)
+    dx_val += total_ds * (dt_val * Bj);   // الجزء المتغيّر ✓
+...
+dx_val = block_reduce_sum(dx_val, sh_red, lane, nthr);   // بيجمع الـ threads
+```
+
+الـ reduction بيجمع قيم الـ threads ✓ — فالجزء الثابت (`dy_val * dskip`)
+اتحسب **256 مرة** (عدد الـ threads في الـ block) بدل **مرة واحدة** لكل صف.
+
+**الأثر:** تدرّج الـ x channels من الـ conv output كان **256× كبير** على الـ
+GPU (والـ CPU صح: بيحسبه مرة واحدة لكل صف). النتيجة:
+- تدرّجات الـ `conv1d` و `in_proj` و `dx` **غلط** على الـ GPU.
+- الـ forward صحيح (الـ bug في الـ backward بس) → الموديل بيشتغل وبيجاوب
+  صح، بس **التدريب** هيبني موديل غلط بصمت.
+
+**القياس:** الـ CPU↔CUDA parity قاس الـ factor = **256.3** (الرقم بيلف على
+عدد الـ threads ✓) والـ channels الـ B والـ C (اللي terms بتاعها per-j ✓)
+كانوا **صح** ✓ — ده اللي فرّق بين وبين الـ x channels ✓.
+
+**الإصلاح:** الجزء الثابت يدخل مرة واحدة (الـ thread 0 بس):
+
+```cpp
+float dx_val = (lane == 0) ? dy_val * dskip : 0.0f;
+```
+
+> درس: أي block reduction بجمع قيم الـ threads، لازم **كل** الـ threads
+> تساهم بالفس 값 — أو واحدة بس. الـ per-thread constant جوّه reduction = times
+> عدد الـ threads.
+
+
 
 **الموقع:** `cuda/mamba.cu` — `mamba2_backward()`
 
