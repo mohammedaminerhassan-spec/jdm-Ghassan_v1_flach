@@ -48,8 +48,33 @@ static size_t  g_attn_exp_cap = 0;
 static float*  g_attn_dsb = nullptr; // dS/dP [B*H*T*T]
 static size_t  g_attn_dsb_cap = 0;
 
-static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems) {
-    if (mir_elems > g_attn_mir_cap) {
+// The device-side POINTER ARRAYS of the batched GEMM.
+//
+// The cuBLAS batched kernels read the arrays of matrix pointers ON THE
+// DEVICE. Passing a host array (a std::vector on the host) makes the
+// kernel dereference a host address: the access faults and the error
+// surfaces at the next synchronization point ("an illegal memory access
+// was encountered") - far away from the call that caused it.
+//
+// The arrays are cached (one per role: A, B, C) and reused by every
+// chunk: the chunk offsets change, but the arrays themselves are the same
+// size.
+static void** g_attn_ptr[3] = {nullptr, nullptr, nullptr};
+static size_t g_attn_ptr_cap[3] = {0, 0, 0};
+
+static void** attn_ptr_buf(int slot, size_t n) {
+    if (n > g_attn_ptr_cap[slot]) {
+        if (g_attn_ptr[slot]) CU_CHECK2(cudaFree(g_attn_ptr[slot]));
+        g_attn_ptr[slot] = nullptr;
+        g_attn_ptr_cap[slot] = 0;
+        const size_t want = n + 64;
+        CU_CHECK2(cudaMalloc(&g_attn_ptr[slot], want * sizeof(void*)));
+        g_attn_ptr_cap[slot] = want;
+    }
+    return g_attn_ptr[slot];
+}
+
+static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems) {    if (mir_elems > g_attn_mir_cap) {
         if (g_attn_mir) CU_CHECK2(cudaFree(g_attn_mir));
         g_attn_mir = nullptr;
         g_attn_mir_cap = 0;
@@ -133,11 +158,9 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
     const bool use_fp16 = !force_fp32 && fp16_gemm_enabled() && mnk >= ops::gemm_fp16_mnk_threshold();
     cublasHandle_t h = reinterpret_cast<cublasHandle_t>(::gai::cuda::cublas_handle());
     // Mirror gemm()'s transpose swap: col-major C^T[N*M] = B^T * A^T.
-    cublasOperation_t topA[1] = { tb ? CUBLAS_OP_T : CUBLAS_OP_N };
-    cublasOperation_t topB[1] = { ta ? CUBLAS_OP_T : CUBLAS_OP_N };
-    int ldaArr[1] = { ldaB }, ldbArr[1] = { ldaA }, ldcArr[1] = { ldaC };
-    const void* alp[1] = { &alpha };
-    int gs[1] = { nB };
+    const cublasOperation_t topA = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t topB = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const int ldaArr = ldaB, ldbArr = ldaA, ldcArr = ldaC;
     cublasStatus_t s = CUBLAS_STATUS_SUCCESS;
 
     // The chunk plan: cuBLAS needs the leading dimension of each operand to
@@ -185,12 +208,10 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
         // The k-chunks accumulate into the same C: the first one applies
         // beta, the rest add.
         const float beta_k = (k0 == 0) ? beta : 1.0f;
-        const void* bet[1] = { &beta_k };
         for (int n0 = 0; n0 < M; n0 += n_chunk) {
             const int nc = std::min(n_chunk, M - n0);
             for (int m0 = 0; m0 < N; m0 += m_chunk) {
                 const int mc = std::min(m_chunk, N - m0);
-                int marr[1] = { mc }, narr[1] = { nc }, karr[1] = { kc };
                 // The chunk offsets: every operand advances with its own
                 // stride (the element size differs between the fp16 mirror
                 // and the raw fp32 buffers).
@@ -217,11 +238,32 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
                     // the rows and the N dimension is the columns.
                     Cc[i] = (char*)Ch[i] + ((size_t)n0 * ldaC + (size_t)m0) * sizeof(float);
                 }
-                s = cublasGemmGroupedBatchedEx(h, topA, topB, marr, narr, karr, alp,
-                                               Ac.data(), use_fp16 ? CUDA_R_16F : CUDA_R_32F, ldaArr,
-                                               Bc.data(), use_fp16 ? CUDA_R_16F : CUDA_R_32F, ldbArr, bet,
-                                               Cc.data(), CUDA_R_32F, ldcArr,
-                                               1, gs, CUBLAS_COMPUTE_32F);
+                // The pointer arrays go to the device: cuBLAS reads them
+                // there (a host array is an illegal access on the GPU).
+                void** dAc = attn_ptr_buf(0, (size_t)nB);
+                void** dBc = attn_ptr_buf(1, (size_t)nB);
+                void** dCc = attn_ptr_buf(2, (size_t)nB);
+                CU_CHECK2(cudaMemcpyAsync(dAc, Ac.data(), (size_t)nB * sizeof(void*),
+                                          cudaMemcpyHostToDevice, 0));
+                CU_CHECK2(cudaMemcpyAsync(dBc, Bc.data(), (size_t)nB * sizeof(void*),
+                                          cudaMemcpyHostToDevice, 0));
+                CU_CHECK2(cudaMemcpyAsync(dCc, Cc.data(), (size_t)nB * sizeof(void*),
+                                          cudaMemcpyHostToDevice, 0));
+                // The classic batched GEMM (not the grouped one): it needs
+                // the same dimensions for every problem (the attention has
+                // them: one (b,h) per problem) and it runs on EVERY
+                // architecture (the grouped API is a Hopper-era one).
+                s = cublasGemmBatchedEx(h, topA, topB, mc, nc, kc,
+                                        &alpha,
+                                        (const void* const*)dAc,
+                                        use_fp16 ? CUDA_R_16F : CUDA_R_32F, ldaArr,
+                                        (const void* const*)dBc,
+                                        use_fp16 ? CUDA_R_16F : CUDA_R_32F, ldbArr,
+                                        &beta_k,
+                                        dCc, CUDA_R_32F, ldcArr,
+                                        nB,
+                                        CUBLAS_COMPUTE_32F,
+                                        CUBLAS_GEMM_DEFAULT);
                 if (s != CUBLAS_STATUS_SUCCESS)
                     GAI_FAIL(strfmt("attn grouped GEMM failed: status=%d ta=%d tb=%d M=%d N=%d K=%d "
                                     "ldaA=%d ldaB=%d ldaC=%d nB=%d fp16=%d alpha=%g beta=%g "

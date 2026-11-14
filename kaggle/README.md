@@ -85,8 +85,8 @@ os.environ["HF_PUBLIC"]   = "0"
 - أول compile بـ nvcc → لو هنا وقع، المشكلة في الـ CUDA.
 - **الخطر الأساسي:** التعديلات على `cuda/kernels.cu` و `cuda/attention.cu`
   (تقطيع الـ GEMM). لو الـ build عدّى،Syntax تمام، والـ runtime بيبقى في الخلية 4.
-- **CUDA ≥ 12.5 مطلوب** (الـ attention بيستعمل `cublasGemmGroupedBatchedEx`).
-  صورة Kaggle الحالية فيها CUDA 12.8 ✓. الخلية بتقولك صراحةً لو النسخة أقدم.
+- **CUDA 11 أو أحدث** (الـ attention بيستعمل `cublasGemmBatchedEx` — العادي،
+  مش grouped API بتاع Hopper). صورة Kaggle الحالية CUDA 13.0 ✓.
 - **قبل ما تشغّل أي حاجة على Kaggle**، تقدر تعمل نفس الفحص على جهازك من غير
   GPU (دقيقة واحدة):
   ```bash

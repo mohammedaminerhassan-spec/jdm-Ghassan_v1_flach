@@ -9,7 +9,9 @@
 #
 #   bash scripts/check_cuda_compile.sh
 #
-# It needs CUDA >= 12.5 (the grouped GEMM API: cublasGemmGroupedBatchedEx).
+# It needs a CUDA toolkit (11.0 or newer; it was verified with 12.0 and
+# 12.8). The attention path uses the classic batched GEMM API, so there is
+# no Hopper-only requirement.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -102,16 +102,25 @@ static void run_case(const ModelConfig& cfg, const std::string& tag, int B, int 
         std::printf("test_cuda_parity: no CUDA device -> skipped\n");
         return;
     }
+    // The name goes out BEFORE the work: when a kernel faults, the abort
+    // message points at the memcpy that synced, and the name tells which
+    // case was running.
+    std::printf("test_cuda_parity: the case '%s' (B=%d T=%d)\n", tag.c_str(), B, T);
+    std::fflush(stdout);
     const std::vector<i32> ids = make_batch(cfg.vocab_size, B, T, 4242);
     const u64 seed = 777;
 
     Model cpu(cfg, Device::CPU);
     cpu.init_weights(seed);
     gradients_on(cpu, ids, B, T);
+    std::printf("test_cuda_parity: the case '%s' -> the CPU is done\n", tag.c_str());
+    std::fflush(stdout);
 
     Model gpu(cfg, Device::CUDA);
     gpu.init_weights(seed);
     gradients_on(gpu, ids, B, T);
+    std::printf("test_cuda_parity: the case '%s' -> the GPU is done\n", tag.c_str());
+    std::fflush(stdout);
 
     compare(cpu, gpu, tag);
 }
