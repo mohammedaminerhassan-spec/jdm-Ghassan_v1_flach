@@ -778,13 +778,28 @@ void mamba2_backward(const float* x,
     }
 
     // B3) Scan backward
+    //
+    // The trajectory buffer holds ONE batch of rows at a time (the whole
+    // trajectory of Granite would be 1.6 GB), so the rows are processed in
+    // batches and the trajectory of a batch is RECORDED AGAIN right before
+    // its backward: the first pass (above) only kept the scan output (the
+    // y_scan), and by the time the backward loop runs, the buffer holds
+    // the LAST batch's trajectory. Reading it for another batch gives the
+    // gradients of the wrong rows (the CPU<->GPU parity check catches it).
     CU_MAMBA_CHECK(cudaMemset(dbc, 0, sizeof(float) * n_tok * conv_dim));
     CU_MAMBA_CHECK(cudaMemset(ddt_raw, 0, sizeof(float) * n_tok * n_heads));
     {
         const int block = 256;
         const size_t sh = sizeof(float) * (d_state + 32);
+        const size_t sh_traj = sizeof(float) * d_state;
         for (int r0 = 0; r0 < rows; r0 += rows_batch) {
             const int nb = (rows - r0 < rows_batch) ? (rows - r0) : rows_batch;
+            // The trajectory of THIS batch (the buffer is reused).
+            k_mamba_scan_traj<<<nb, block, sh_traj>>>(proj, bc, dt_bias, a_log, D,
+                                                      traj, y_scan, B, T, n_heads, d_head,
+                                                      d_state, d_inner, conv_dim, proj_size,
+                                                      r0);
+            CU_MAMBA_CHECK(cudaGetLastError());
             k_mamba_scan_bwd<<<nb, block, sh>>>(proj, bc, dy_scan, dt_bias, a_log, D,
                                                 traj, dbc, ddt_raw, dD, da_log, ddt_bias,
                                                 B, T, n_heads, d_head, d_state,

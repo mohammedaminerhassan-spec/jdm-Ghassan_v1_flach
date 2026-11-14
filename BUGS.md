@@ -971,7 +971,37 @@ act_ = model_.make_activations(cfg_.batch_size, cfg_.seq_len, true, cfg_.ce_chun
 
 **الإصلاح:** حارس صريح في الـ validation.
 
-## BUG-22 🔴 — خطأ ترجمة في `cuda/attention.cu`: الـ build على الـ GPU كان هيقع
+## BUG-23 🔴 — مسار الحالة في الـ Mamba backward: كل batch كان بيقرا مسار الـ batch التاني
+
+**الموقع:** `cuda/mamba.cu` — `mamba2_backward()`
+
+**السبب:** مسار الحالة (trajectory) بيتسجّل في buffer **واحد** بيتعاد
+استعماله لكل batch من الصفوف (مسار Granite كامل = 1.6 GB، فمقدرناش نخزّنه
+كله). بس الـ backward كان بيحصل في **حلقة تانية** بعد الحلقة اللي سجّلت
+المسار:
+
+```cpp
+for (r0...) k_mamba_scan_traj(...);    // كل batch بيكتب فوق اللي قبله
+...                                     // الـ gated norm والـ out projection
+for (r0...) k_mamba_scan_bwd(...);     // بيقرا مسار الـ batch التاني!
+```
+
+يعني صفوف الـ batch الأول كانت بتاخد تدرّجات صفوف الـ batch الأخير.
+
+**الأثر:** تدرّجات الـ Mamba-2 على الـ GPU **غلط** (خطأ في الحجم: الـ conv1d
+اتفرق بـ 20× عن الـ CPU). ده اللي كشفه `test_cuda_parity` في حالة Granite
+(الـ dense والـ MoE والـ LoRA عدّوا).
+
+**الإصلاح:** المسار بيتسجّل **تاني** جوّه نفس حلقة الـ backward (قبل الـ scan
+backward بتاع الـ batch) ✓ — فالتكلفة O(T) زائدEDE بسيطة، والذاكرة تفضل
+محدودة ✓.
+
+> الدرس: أي buffer بيتعاد استعماله في حلقة، لازم يت recompute في نفس الحلقة
+> اللي بيقرأه.
+
+---
+
+
 
 **الموقع:** `cuda/attention.cu` — `attn_sbgemm()` (سطر 151)
 
