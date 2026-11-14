@@ -88,41 +88,54 @@ else:
           "(the Granite verification is skipped)")
 
 # ---- 4. the smoke training -------------------------------------------------
-env = dict(os.environ)
-env.setdefault("CUDA_VISIBLE_DEVICES", "0")   # one GPU for the smoke test
-rc, out = run([
-    str(GAIT),
-    "--config", str(SRC / "configs" / "ghassan_v1_flash_smoke.yaml"),
-    "--tokenizer", TOKENIZER,
-    "--data", str(WORK / "artifacts" / "shards"),
-    "--checkpoint-dir", str(WORK / "artifacts" / "checkpoints" / "smoke"),
-    "--max-steps", "20",
-    "--log-every", "1",
-    "--resume", "none",
-], env=env, tail=12000)
-if rc != 0:
-    raise SystemExit("the smoke training failed")
+SHARDS = WORK / "artifacts" / "shards"
+HAVE_DATA = SHARDS.exists() and any(SHARDS.glob("*.gbin"))
 
-# ---- 5. the Granite-shaped smoke training ----------------------------------
-# The dense smoke test above never touches the Mamba-2 block. This one runs
-# the whole Granite-4.0 shape (the Mamba-2 hybrid + the MoE with a shared
-# expert + the multipliers) on the GPU: forward, backward, optimizer and
-# checkpoint. The Mamba-2 backward is the part of the engine that had never
-# run on a GPU (it crashed on a null pointer and used the wrong recurrent
-# state), so it has to be exercised here, not only in the parity test.
-rc, out_g = run([
-    str(GAIT),
-    "--config", str(SRC / "configs" / "ghassan_v1_flash_smoke_granite.yaml"),
-    "--tokenizer", TOKENIZER,
-    "--data", str(WORK / "artifacts" / "shards"),
-    "--checkpoint-dir", str(WORK / "artifacts" / "checkpoints" / "smoke_granite"),
-    "--max-steps", "20",
-    "--warmup", "5",
-    "--log-every", "1",
-    "--resume", "none",
-], env=env, tail=12000)
-if rc != 0:
-    raise SystemExit("the Granite-shaped smoke training failed (the Mamba-2 path)")
+if not HAVE_DATA:
+    print("\n(no shards: the dataset was not prepared, so the smoke TRAINING is "
+          "skipped - the tests above are the ones that matter here. Point "
+          "DATA_INPUT at a Kaggle dataset and re-run cell 3 to train.)")
+    losses = []
+    out = ""
+    out_g = ""
+else:
+    # ---- 4. the smoke training ---------------------------------------------
+    env = dict(os.environ)
+    env.setdefault("CUDA_VISIBLE_DEVICES", "0")   # one GPU for the smoke test
+    rc, out = run([
+        str(GAIT),
+        "--config", str(SRC / "configs" / "ghassan_v1_flash_smoke.yaml"),
+        "--tokenizer", TOKENIZER,
+        "--data", str(SHARDS),
+        "--checkpoint-dir", str(WORK / "artifacts" / "checkpoints" / "smoke"),
+        "--max-steps", "20",
+        "--log-every", "1",
+        "--resume", "none",
+    ], env=env, tail=12000)
+    if rc != 0:
+        raise SystemExit("the smoke training failed")
+
+    # ---- 5. the Granite-shaped smoke training ------------------------------
+    # The dense smoke test above never touches the Mamba-2 block. This one
+    # runs the whole Granite-4.0 shape (the Mamba-2 hybrid + the MoE with a
+    # shared expert + the multipliers) on the GPU: forward, backward, optimizer
+    # and checkpoint. The Mamba-2 backward is the part of the engine that had
+    # never run on a GPU (it crashed on a null pointer and used the wrong
+    # recurrent state), so it has to be exercised here, not only in the parity
+    # test.
+    rc, out_g = run([
+        str(GAIT),
+        "--config", str(SRC / "configs" / "ghassan_v1_flash_smoke_granite.yaml"),
+        "--tokenizer", TOKENIZER,
+        "--data", str(SHARDS),
+        "--checkpoint-dir", str(WORK / "artifacts" / "checkpoints" / "smoke_granite"),
+        "--max-steps", "20",
+        "--warmup", "5",
+        "--log-every", "1",
+        "--resume", "none",
+    ], env=env, tail=12000)
+    if rc != 0:
+        raise SystemExit("the Granite-shaped smoke training failed (the Mamba-2 path)")
 
 # ---- 6. did the loss go down? ----------------------------------------------
 losses = [float(m) for m in re.findall(r"loss\s+([0-9]+\.[0-9]+)", out)]
