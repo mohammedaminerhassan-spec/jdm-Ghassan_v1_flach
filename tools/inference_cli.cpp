@@ -4,6 +4,7 @@
 #include "core/ops.h"
 #include "format/gguf_codec.h"
 #include "format/hf_checkpoint.h"
+#include "format/hf_writer.h"
 #include "inference/chat.h"
 #include "evaluation/perplexity.h"
 #include "quantization/quantize.h"
@@ -43,6 +44,10 @@ static void usage() {
     "  ghassan-ai tokenizer-info --tokenizer <hf-dir|tokenizer.json>\n"
     "  ghassan-ai export     --checkpoint last.ckpt --tokenizer <hf-dir|tokenizer.json> --out model.gguf\n"
     "                          [--model-name \"Ghassan v1 Flash\"] [--profile q8_k|q4_0|fp16]\n"
+    "  ghassan-ai export     --checkpoint last.ckpt --tokenizer <hf-dir> --out <dir>\n"
+    "                          --format safetensors [--dtype f16|f32|bf16]\n"
+    "                          # a HuggingFace repository: model.safetensors + config.json\n"
+    "                          # + the tokenizer files (the weights AND the vocab)\n"
     "  ghassan-ai perplexity --model <model.gguf|hf-dir> (--text \"held out\" | --shards dir --prefix val_)\n"
     "  ghassan-ai devices\n"
     "  ghassan-ai logits     --model <model.gguf|hf-dir> --prompt \"hi\" [--out logits.f32]\n"
@@ -514,6 +519,29 @@ static int cmd_export(const Args& args) {
     std::vector<i32> eos_ids;
     GAI_CHECK(load_tokenizer_auto(tok_path, tok, eos_ids),
               "cannot load tokenizer: " + tok_path);
+
+    // ---- the HuggingFace safetensors export ----
+    //
+    // The engine could read a HuggingFace checkpoint but could only write a
+    // GGUF, so a model trained here could not be published. This writes the
+    // safetensors (plus the config.json) of a real HF repository.
+    const std::string format = args.str("format", "gguf");
+    if (format == "safetensors" || format == "hf") {
+        const std::string name = args.str("model-name", "Ghassan v1 Flash");
+        const std::string desc = args.str("description", name);
+        const std::string dt = args.str("dtype", "f16");
+        SafeDType sd = SafeDType::F16;
+        if (dt == "f32" || dt == "float32") sd = SafeDType::F32;
+        else if (dt == "bf16" || dt == "bfloat16") sd = SafeDType::BF16;
+        GAI_CHECK(export_model_safetensors(out, model, tok, name, desc, sd),
+                  "the safetensors export failed");
+        // The tokenizer files are a property of the vocabulary, not of the
+        // weights: they are copied verbatim (re-serialising them would lose
+        // the merges and the added tokens).
+        copy_tokenizer_files(tok_path, out);
+        return 0;
+    }
+    GAI_CHECK(format == "gguf", "unknown --format '" + format + "' (gguf|safetensors)");
 
     std::map<std::string, std::string> meta = {
         {"steps", std::to_string(loaded.step)},

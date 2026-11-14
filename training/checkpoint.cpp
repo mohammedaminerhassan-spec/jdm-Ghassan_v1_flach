@@ -372,13 +372,22 @@ static void write_optimizer_snapshot(std::ostream& f, const OptimizerStateSnapsh
         case OptimizerSnapshotKind::Muon:
             f.write(reinterpret_cast<const char*>(&count), sizeof(count));
             f.write(reinterpret_cast<const char*>(&step), sizeof(step));
-            f.write(reinterpret_cast<const char*>(&fmt), sizeof(fmt));
+            // fmt=2 appends min_ns_dim. It MUST be written here: the gate
+            // decides which matrices take the Newton-Schulz path and which
+            // take the cheap branches, so an exact resume that cannot see it
+            // would silently continue with a different update rule.
+            {
+                const u8 fmt_muon = 2;
+                f.write(reinterpret_cast<const char*>(&fmt_muon), sizeof(fmt_muon));
+            }
             wr(f, opt.muon.lr); wr(f, opt.muon.vec_lr_ratio); wr(f, opt.muon.beta1);
             wr(f, opt.muon.beta2); wr(f, opt.muon.eps); wr(f, opt.muon.weight_decay);
             wr(f, opt.muon.grad_clip);
             {
                 i32 ns = opt.muon.ns_steps;
                 wr(f, ns);
+                i32 min_ns = opt.muon.min_ns_dim;
+                wr(f, min_ns);
             }
             for (size_t i = 0; i < count; ++i) {
                 u8 mask = 0;

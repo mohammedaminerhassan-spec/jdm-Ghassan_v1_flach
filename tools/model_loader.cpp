@@ -110,6 +110,51 @@ bool load_tokenizer_auto(const std::string& path, Tokenizer& out,
     return true;
 }
 
+bool copy_tokenizer_files(const std::string& src, const std::string& dst_dir) {
+    std::error_code ec;
+    fs::create_directories(dst_dir, ec);
+    if (!fs::exists(src, ec)) {
+        log_warn("[hf ] cannot copy the tokenizer files: " + src + " does not exist");
+        return false;
+    }
+    int copied = 0;
+    if (fs::is_directory(src, ec)) {
+        // The files a HuggingFace repository needs to load the tokenizer.
+        static const char* kFiles[] = {
+            "tokenizer.json", "tokenizer_config.json", "generation_config.json",
+            "special_tokens_map.json", "chat_template.jinja", "vocab.json", "merges.txt",
+        };
+        for (const char* f : kFiles) {
+            const fs::path from = fs::path(src) / f;
+            if (!fs::exists(from, ec) || ec) continue;
+            const fs::path to = fs::path(dst_dir) / f;
+            fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                log_warn("[hf ] cannot copy " + from.string() + ": " + ec.message());
+                ec.clear();
+                continue;
+            }
+            ++copied;
+        }
+    } else {
+        // A bare tokenizer.json.
+        const fs::path to = fs::path(dst_dir) / "tokenizer.json";
+        fs::copy_file(src, to, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            log_warn("[hf ] cannot copy " + src + ": " + ec.message());
+            return false;
+        }
+        ++copied;
+    }
+    if (copied == 0) {
+        log_warn("[hf ] no tokenizer file was copied (the repository will need "
+                 "its own tokenizer files)");
+        return false;
+    }
+    log_info(strfmt("[hf ] copied %d tokenizer file(s) into %s", copied, dst_dir.c_str()));
+    return true;
+}
+
 LoadedModel load_model(const Args& args) {
     LoadedModel lm;
     std::string path = args.str("model");

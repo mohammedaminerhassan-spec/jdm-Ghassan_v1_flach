@@ -1,4 +1,4 @@
-#include "training/trainer.h"
+﻿#include "training/trainer.h"
 #include "core/ops.h"
 #include "core/device.h"
 #include "core/common.h"
@@ -710,11 +710,11 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         double probs_mb = (double)cfg_.batch_size * model_.config().num_heads *
                           cfg_.seq_len * cfg_.seq_len * 4.0 / (1024.0 * 1024.0);
         if (probs_mb > 800.0)
-            GAI_FAIL(strfmt("OOM guard: attention T² buffer %.0fMB (B=%d H=%d T=%d) will OOM T4 16GB. "
+            GAI_FAIL(strfmt("OOM guard: attention TÂ² buffer %.0fMB (B=%d H=%d T=%d) will OOM T4 16GB. "
                             "Halve seq_len (512 for 1B) or batch_size before training.",
                             probs_mb, cfg_.batch_size, model_.config().num_heads, cfg_.seq_len));
         if (probs_mb > 400.0)
-            log_warn(strfmt("[mem ] attention T² buffer %.0fMB (B=%d H=%d T=%d): halve seq_len for 1B/T4",
+            log_warn(strfmt("[mem ] attention TÂ² buffer %.0fMB (B=%d H=%d T=%d): halve seq_len for 1B/T4",
                             probs_mb, cfg_.batch_size, model_.config().num_heads, cfg_.seq_len));
     }
 
@@ -856,7 +856,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
             }
         } else {
             log_warn("[disk] could not stat free space for " + cfg_.checkpoint_dir +
-                     " — cannot pre-flight the checkpoint budget");
+                     " â€” cannot pre-flight the checkpoint budget");
         }
 
         if (cfg_.output_budget_mb > 0) {
@@ -1173,7 +1173,7 @@ void Trainer::log_scaler_summary() const {
     if (ratio > 0.02)
         log_warn(strfmt("[scaler] %.2f%% of steps were skipped for non-finite grads: "
                         "fp16 gradients are unstable at loss_scale_init=%.0f. Lower "
-                        "training.loss_scale_init (or disable gemm_fp16) — the run is "
+                        "training.loss_scale_init (or disable gemm_fp16) â€” the run is "
                         "burning GPU time on rejected steps.",
                         ratio * 100.0, cfg_.loss_scale_init));
 }
@@ -1439,7 +1439,7 @@ void Trainer::run() {
     }
     if (state_.sched_total > 0 && state_.sched_total > total_steps_) {
         log_warn(strfmt("[sched] continuation: checkpoint planned %lld steps, this session "
-                        "budgeted %lld — KEEPING the original %lld-step plan so the LR curve "
+                        "budgeted %lld â€” KEEPING the original %lld-step plan so the LR curve "
                         "of the steps already run stays valid. This session simply stops "
                         "early; resume again to continue.",
                         (long long)state_.sched_total, (long long)total_steps_,
@@ -1472,7 +1472,7 @@ void Trainer::run() {
     // have failed, but total_steps_ can also change via epochs/data size).
     if (state_.sched_total > 0 && state_.sched_total != total_steps_) {
         const std::string why = strfmt("[sched] RESUME MISMATCH: checkpoint planned total %lld but now %lld "
-                        "(max_steps/epochs/data changed) — past LR curve reshaped; "
+                        "(max_steps/epochs/data changed) â€” past LR curve reshaped; "
                         "keep the original schedule to stay bit-consistent",
                         (long long)state_.sched_total, (long long)total_steps_);
         if (cfg_.resume_exact()) GAI_FAIL("exact resume refused: " + why);
@@ -1509,27 +1509,50 @@ void Trainer::run() {
                         static_cast<long long>(state_.step),
                         static_cast<long long>(total_steps_)));
 
-    if (cfg_.is_sft()) {
-        run_sft();
-    } else {
-        run_pretrain();
-    }
+    // One loop for both stages (the stage only changes the banner and the
+    // wording of the messages; the data and the masks are stage-aware
+    // already).
+    run_stage();
 }
 
-void Trainer::run_pretrain() {
-    log_info("---------------- pretraining ----------------");
-    log_info(strfmt("  steps %lld (%s) | micro-batch %d x %d tok | accum %d | %s tok/step",
-                    static_cast<long long>(total_steps_),
-                    cfg_.max_steps > 0 ? "steps mode" : "epochs mode",
-                    cfg_.batch_size, cfg_.seq_len,
-                    cfg_.grad_accum, human_count(static_cast<u64>(cfg_.tokens_per_step())).c_str()));
-    log_info(strfmt("  opt %s | sched %s | peak lr %.2e | warmup %lld | %s to %.0f%% | wd %.2f | clip %.1f",
-                    cfg_.optimizer.c_str(), cfg_.scheduler.c_str(),
-                    sched_.peak(), static_cast<long long>(cfg_.warmup_steps),
-                    cfg_.scheduler.c_str(),
-                    cfg_.min_lr_ratio * 100.0, cfg_.weight_decay, cfg_.grad_clip));
+// The training loop.
+//
+// The pretrain and the SFT stages run the SAME loop: the data, the masks
+// and the schedule are already stage-aware (in the loader and in the
+// config), so the two stages only differ in their banner and in the wording
+// of the messages. They used to be two copies of the same 90 lines, which
+// is how a fix in one of them could silently miss the other.
+void Trainer::run_stage() {
+    const bool sft = cfg_.is_sft();
+    const char* tag = sft ? "[sft]" : "[train]";
 
-    log_info(strfmt("  precision : %s", cfg_.precision_name().c_str()));
+    if (sft) {
+        log_info("---------------- SFT (instruction tuning) ----------------");
+        log_info(strfmt("  stage: %s | steps: %lld (%s)", cfg_.stage.c_str(),
+                        static_cast<long long>(total_steps_),
+                        cfg_.max_steps > 0 ? "steps mode" : "epochs mode"));
+        log_info(strfmt("  opt %s | sched %s | micro-batch %d x %d tok | accum %d | %s tok/step | lr %.2e",
+                        cfg_.optimizer.c_str(), cfg_.scheduler.c_str(),
+                        cfg_.batch_size, cfg_.seq_len, cfg_.grad_accum,
+                        human_count(static_cast<u64>(cfg_.tokens_per_step())).c_str(), sched_.peak()));
+        log_info(strfmt("  pretrained: %s | freeze_embeddings: %s",
+                        cfg_.pretrained_checkpoint.empty() ? "none (fresh)" : cfg_.pretrained_checkpoint.c_str(),
+                        cfg_.freeze_embeddings ? "yes" : "no"));
+        log_info(strfmt("  precision : %s (T4 FP16 tensor cores)", cfg_.precision_name().c_str()));
+    } else {
+        log_info("---------------- pretraining ----------------");
+        log_info(strfmt("  steps %lld (%s) | micro-batch %d x %d tok | accum %d | %s tok/step",
+                        static_cast<long long>(total_steps_),
+                        cfg_.max_steps > 0 ? "steps mode" : "epochs mode",
+                        cfg_.batch_size, cfg_.seq_len,
+                        cfg_.grad_accum, human_count(static_cast<u64>(cfg_.tokens_per_step())).c_str()));
+        log_info(strfmt("  opt %s | sched %s | peak lr %.2e | warmup %lld | %s to %.0f%% | wd %.2f | clip %.1f",
+                        cfg_.optimizer.c_str(), cfg_.scheduler.c_str(),
+                        sched_.peak(), static_cast<long long>(cfg_.warmup_steps),
+                        cfg_.scheduler.c_str(),
+                        cfg_.min_lr_ratio * 100.0, cfg_.weight_decay, cfg_.grad_clip));
+        log_info(strfmt("  precision : %s", cfg_.precision_name().c_str()));
+    }
 
     Batch batch;
     Timer step_timer;
@@ -1593,7 +1616,7 @@ void Trainer::run_pretrain() {
         } else {
             static int warned_empty = 0;
             if (warned_empty++ < 3)
-                log_warn("[train] all-masked step (ntok=0): optimizer skipped (aux-only grads)");
+                log_warn(strfmt("%s all-masked step (ntok=0): optimizer skipped (aux-only grads)", tag));
             gnorm = 0.0;
             for (Parameter* p : model_.parameters()) {
                 if (p->g.defined()) p->g.zero_();
@@ -1669,155 +1692,8 @@ void Trainer::run_pretrain() {
 
     wait_for_save();
     stop_ckpt_writer();
-    log_info(strfmt("---------------- pretrain done: %lld steps, %s tokens, %s --------------------",
-                    static_cast<long long>(state_.step),
-                    human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
-                    human_duration(wall_.seconds()).c_str()));
-    log_scaler_summary();
-}
-
-void Trainer::run_sft() {
-
-    log_info("---------------- SFT (instruction tuning) ----------------");
-    log_info(strfmt("  stage: %s | steps: %lld (%s)", cfg_.stage.c_str(),
-                    static_cast<long long>(total_steps_),
-                    cfg_.max_steps > 0 ? "steps mode" : "epochs mode"));
-    log_info(strfmt("  opt %s | sched %s | micro-batch %d x %d tok | accum %d | %s tok/step | lr %.2e",
-                    cfg_.optimizer.c_str(), cfg_.scheduler.c_str(),
-                    cfg_.batch_size, cfg_.seq_len, cfg_.grad_accum,
-                    human_count(static_cast<u64>(cfg_.tokens_per_step())).c_str(), sched_.peak()));
-    log_info(strfmt("  pretrained: %s | freeze_embeddings: %s",
-                    cfg_.pretrained_checkpoint.empty() ? "none (fresh)" : cfg_.pretrained_checkpoint.c_str(),
-                    cfg_.freeze_embeddings ? "yes" : "no"));
-    log_info(strfmt("  precision : %s (T4 FP16 tensor cores)", cfg_.precision_name().c_str()));
-
-    Batch batch;
-    Timer step_timer;
-
-    start_prefetch();
-    start_ckpt_writer();
-
-    while (state_.step < total_steps_) {
-        step_timer.reset();
-        model_.zero_grad();
-        const float dscale = scaler_for_step();
-        {
-            int rank = 0;
-#ifdef GAI_CUDA
-            if (dist_ && dist_->world_size() > 1) rank = dist_->global_rank();
-#endif
-            u64 ctx = cfg_.seed ^ (static_cast<u64>(state_.step) * 0x9E3779B97F4A7C15ULL)
-                                ^ (static_cast<u64>(rank) * 0xBF58476D1CE4E5B9ULL);
-            ops::set_moe_jitter_seed(ctx);
-        }
-
-        double loss_num = 0.0;
-        i64    ntok_step = 0;
-        int    micro_done = 0;
-
-        for (int micro = 0; micro < cfg_.grad_accum; ++micro) {
-            ops::phase_start(model_.device(), ops::TrainPhase::Load);
-            const bool have_batch_sft = next_train_batch(batch);
-            ops::phase_stop(model_.device(), ops::TrainPhase::Load);
-            if (!have_batch_sft) {
-                GAI_FAIL("dataloader has no shards mid-run in " + cfg_.data_dir);
-            }
-
-            i64 ntok = 0;
-            double l = forward_backward_micro(batch, dscale, &ntok);
-            loss_num += l * static_cast<double>(ntok);
-            ntok_step += ntok;
-            ++micro_done;
-        }
-        if (micro_done == 0) break;
-
-        double loss = ntok_step > 0 ? loss_num / static_cast<double>(ntok_step) : 0.0;
-        ema_loss_ = (state_.step == 0 && ema_loss_ == 0.0) ? loss : 0.98 * ema_loss_ + 0.02 * loss;
-
-        float lr = sched_.lr_at(state_.step);
-
-        sync_gradients();
-        i64 ntok_global = sync_ntok_sum(ntok_step);
-
-        double gnorm = 0.0;
-        bool opt_applied = false;
-        if (ntok_global > 0) {
-            float grad_scale = 1.0f / (static_cast<float>(ntok_global) * dscale);
-            gnorm = opt_step(lr, grad_scale);
-            opt_applied = std::isfinite(gnorm);
-            if (opt_applied) model_.mark_weights_dirty();
-            else ++skipped_steps_;
-        } else {
-            static int warned_empty_sft = 0;
-            if (warned_empty_sft++ < 3)
-                log_warn("[sft] all-masked step (ntok=0): optimizer skipped (aux-only grads)");
-            gnorm = 0.0;
-            for (Parameter* p : model_.parameters()) {
-                if (p->g.defined()) p->g.zero_();
-            }
-        }
-        scaler_update(gnorm);
-
-        sync_moe_bias(opt_applied);
-
-        ++state_.step;
-        state_.tokens_seen += ntok_global;
-        state_.last_loss = loss;
-
-        double dt = step_timer.seconds();
-        bool main = is_main_rank();
-        if (main && cfg_.log_every > 0 && state_.step % cfg_.log_every == 0) {
-            log_step(loss, lr, gnorm, dt, ntok_global);
-
-            check_ckpt_health();
-        }
-
-        if (have_val_ && cfg_.eval_every > 0 && state_.step % cfg_.eval_every == 0) {
-            bool is_best = false;
-            if (main) {
-                double vl = evaluate(cfg_.eval_batches);
-                std::string bal = model_.moe_balance_report();
-                if (!bal.empty()) log_info("  >> " + bal);
-                model_.moe_balance_reset();
-
-                log_info(strfmt("  >> val loss %.4f  (ppl %.2f)  [best %s]",
-                                vl, std::exp(std::min(20.0, vl)),
-                                state_.best_val < 1e29 ? strfmt("%.4f", state_.best_val).c_str()
-                                                       : "-"));
-                is_best = (vl < state_.best_val);
-                if (is_best) state_.best_val = vl;
-            } else {
-                model_.moe_balance_reset();
-            }
-            is_best = sync_eval_best(main, is_best);
-            if (is_best) save("best.ckpt");
-        }
-
-        if (cfg_.save_every > 0 && state_.step % cfg_.save_every == 0) {
-            save("last.ckpt");
-        }
-        check_ckpt_health();
-        check_stop_requested();
-
-        if (main) snapshot_cache_.reset();
-        if (stopped_by_signal_) break;
-    }
-
-    stop_prefetch();
-    if (stopped_by_signal_) {
-        log_warn(strfmt("[stop] %s received at step %lld/%lld: saving last.ckpt and exiting "
-                        "cleanly (--resume auto continues from here)",
-                        signals::stop_reason(), static_cast<long long>(state_.step),
-                        static_cast<long long>(total_steps_)));
-        save("last.ckpt");
-    } else if (!(cfg_.save_every > 0 && state_.step % cfg_.save_every == 0)) {
-
-        save("last.ckpt");
-    }
-
-    wait_for_save();
-    stop_ckpt_writer();
-    log_info(strfmt("---------------- SFT done: %lld steps, %s tokens, %s --------------------",
+    log_info(strfmt("---------------- %s done: %lld steps, %s tokens, %s --------------------",
+                    sft ? "SFT" : "pretrain",
                     static_cast<long long>(state_.step),
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
                     human_duration(wall_.seconds()).c_str()));

@@ -523,6 +523,12 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
         cfg_.moe_top_k     = static_cast<int>(num("num_experts_per_tok", 8));
         cfg_.moe_expert_dim= static_cast<int>(num("moe_intermediate_size",
                                                    cfg_.intermediate_size));
+        // The shared expert has its OWN width, which can differ from the
+        // routed one (the shared MLP of a Mixtral/Qwen3-MoE). It used to be
+        // dropped here, so the shared expert was rebuilt with the routed
+        // width and the load failed on the first layer.
+        cfg_.shared_expert_intermediate_size =
+            static_cast<int>(num("shared_expert_intermediate_size", 0));
         cfg_.moe_shared    = j.has("shared_expert_intermediate_size");
     }
 
@@ -684,6 +690,14 @@ bool HFCheckpoint::open(const std::string& dir, bool weights_required) {
             weight_files_.push_back((fs::path(dir_) / f).string());
         }
     } else {
+        // A dry run (--config-only / the memory estimate / --config-from)
+        // only needs the architecture: the weights are not required and
+        // their absence must not be an error.
+        if (!weights_required) {
+            log_info("[hf] no weight file in " + dir_ +
+                     " (the architecture only: the weights are not needed)");
+            return true;
+        }
         log_error("[hf] no model.safetensors (nor an index) in " + dir_);
         return false;
     }
@@ -920,6 +934,34 @@ bool HFCheckpoint::load_model(Model& model) const {
                     p->w.copy_from_f32(stage);
                     continue;
                 }
+            }
+
+            // The shared expert is NOT a routed expert: it has its own
+            // tensors (mlp.shared_expert.*) and its own width (SH, which
+            // can differ from E). It used to fall into the per-expert branch
+            // below, which read the wrong tensors and then failed the size
+            // check - so a checkpoint with a shared expert could not be
+            // loaded at all.
+            if (leaf == "moe_sh_gate" || leaf == "moe_sh_up" || leaf == "moe_sh_down") {
+                const std::string hn = base + ".mlp.shared_expert." +
+                    (leaf == "moe_sh_gate" ? "gate_proj.weight"
+                     : leaf == "moe_sh_up" ? "up_proj.weight"
+                                           : "down_proj.weight");
+                Tensor t = read_tensor(hn);
+                if (!t.defined()) {
+                    log_error("[hf] missing shared expert tensor: " + hn);
+                    return false;
+                }
+                if (t.numel() != p->numel()) {
+                    log_error(strfmt("[hf] shared expert size mismatch %s (%s): "
+                                     "file=%lld model=%lld",
+                                     internal.c_str(), hn.c_str(),
+                                     static_cast<long long>(t.numel()),
+                                     static_cast<long long>(p->numel())));
+                    return false;
+                }
+                p->w.copy_from_f32(t);
+                continue;
             }
 
             // Non-granite (Qwen3-MoE / Mixtral): per-expert tensors.

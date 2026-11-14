@@ -8,6 +8,7 @@
 #endif
 
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <cstring>
@@ -1063,6 +1064,11 @@ Parameter* Model::find_parameter(const std::string& name) {
     return nullptr;
 }
 
+const Parameter* Model::find_parameter(const std::string& name) const {
+    for (const Parameter* p : params_) if (p->name == name) return p;
+    return nullptr;
+}
+
 i64 Model::num_parameters() const {
     i64 n = 0;
     for (const Parameter* p : params_) n += p->numel();
@@ -1260,26 +1266,22 @@ void Model::merge_lora() {
         const int out_d = j.ad->out_dim;
         const float sc = j.ad->scale();
 
-        std::vector<float> Bc(static_cast<size_t>(out_d) * r);
-        std::vector<float> Ac(static_cast<size_t>(r) * in_d);
-        device_copy(Bc.data(), Device::CPU, j.ad->B.w.f32(), device_, Bc.size() * sizeof(float));
-        device_copy(Ac.data(), Device::CPU, j.ad->A.w.f32(), device_, Ac.size() * sizeof(float));
-
         // W[out, in] += sc * sum_r B[out, r] * A[r, in]
-        std::vector<float> Wc(static_cast<size_t>(out_d) * in_d);
-        device_copy(Wc.data(), Device::CPU, j.base->w.f32(), device_, Wc.size() * sizeof(float));
-        for (int o = 0; o < out_d; ++o) {
-            const float* brow = &Bc[static_cast<size_t>(o) * r];
-            float* wrow = &Wc[static_cast<size_t>(o) * in_d];
-            for (int rr = 0; rr < r; ++rr) {
-                const float b = brow[rr];
-                if (b == 0.0f) continue;
-                const float f = sc * b;
-                const float* arow = &Ac[static_cast<size_t>(rr) * in_d];
-                for (int i = 0; i < in_d; ++i) wrow[i] += f * arow[i];
-            }
-        }
-        device_copy(j.base->w.f32(), device_, Wc.data(), Device::CPU, Wc.size() * sizeof(float));
+        //
+        // The merge runs as a DEVICE GEMM. The host loop it replaces was
+        // O(out*in*r) single-threaded float arithmetic - minutes for a 1B
+        // model, and a full host copy of the weights (27 GB for a 6.9B one)
+        // that OOMs the machine. The GPU does the same arithmetic in one
+        // pass, with no copy at all.
+        Parameter& base = *j.base;
+        GAI_CHECK(base.w.dtype() == DType::F32,
+                  "merge_lora: the base weights must be fp32 (the LoRA mode keeps "
+                  "the fp32 masters; the half storage mode is disabled when an "
+                  "adapter is present): " + base.name);
+        ops::gemm(device_, false, false, out_d, in_d, r, sc,
+                  j.ad->B.w.f32(), r,
+                  j.ad->A.w.f32(), in_d,
+                  1.0f, base.w.f32(), in_d);
     }
 
     // The adapters are now baked into the base weights: neutralize them so a
@@ -2429,6 +2431,21 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
 
         // ffn: x_out = x_mid + FFN(x_mid)
         // dx currently holds dL/dx_out, which flows into both the residual and the ffn path.
+        //
+        // The forward scales the FFN output by the residual multiplier BEFORE
+        // the residual add (x_out = x_mid + m*FFN(x_mid)), so
+        //     dL/d(FFN out) = m * dL/dx_out.
+        // The attention and the mamba branches apply that factor; the FFN
+        // branch used to skip it, which made the FFN gradient m-times too
+        // large on the hybrid (Granite) models - a silent, model-shape
+        // dependent training bug. The factor is applied here, once, to the
+        // gradient that enters the FFN.
+        const float* dy_ffn = act.dx.f32();
+        if (cfg_.residual_multiplier != 1.0f) {
+            ops::copy(dev, act.dtmp.f32(), act.dx.f32(), N * d);
+            ops::scale_inplace(dev, act.dtmp.f32(), cfg_.residual_multiplier, N * d);
+            dy_ffn = act.dtmp.f32();
+        }
         if (L.has_moe()) {
             const int E  = cfg_.moe_expert_dim;
             const int ne = cfg_.num_experts;
@@ -2465,7 +2482,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                               act.saved_gate[sl].f32(), act.saved_up[sl].f32(),
                               act.saved_act[sl].f32(),
                               aux_frac, aux_scale_grad,
-                              act.dx.f32(), act.dxb.f32(),
+                              dy_ffn, act.dxb.f32(),
                               L.router.g.f32(), L.moe_gate.g.f32(),
                               L.moe_up.g.f32(), L.moe_down.g.f32(),
                               L.sh_gate.g.defined() ? L.sh_gate.g.f32() : nullptr,
@@ -2475,9 +2492,9 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                               N, d, E, ne, K, cfg_.shared_width());
         } else {
             ops::zero(dev, act.dact.f32(), N * F);
-            ops::linear_backward(dev, act.saved_act[sl].f32(), L.w_down.w.f32(), act.dx.f32(),
+            ops::linear_backward(dev, act.saved_act[sl].f32(), L.w_down.w.f32(), dy_ffn,
                                  act.dact.f32(), L.w_down.g.f32(), static_cast<int>(N), F, d);
-            lora_backward(L.lora_down, dev, act.saved_act[sl].f32(), act.dx.f32(), act.dact.f32(), static_cast<int>(N));
+            lora_backward(L.lora_down, dev, act.saved_act[sl].f32(), dy_ffn, act.dact.f32(), static_cast<int>(N));
 
             ops::zero(dev, act.dgate.f32(), N * F);
             ops::zero(dev, act.dup.f32(),   N * F);

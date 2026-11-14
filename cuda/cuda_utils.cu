@@ -174,7 +174,6 @@ void shutdown() {
     cuda_ops::free_workspace();
     cuda_ops::free_sampling_workspace();
     cuda_ops::moe_free_workspace();
-    cuda_ops::attn_free_dots();
     cuda_ops::phase_shutdown();
 
     if (g_initialized) {
@@ -211,6 +210,18 @@ void phase_pool() {
 
 void phase_start(int ph) {
     phase_pool();
+    // A start without a matching stop would reuse the slot and lose the
+    // previous phase's timing (the ring would slide by one and every
+    // subsequent measurement would be off by one phase). Close the pending
+    // slot before opening a new one.
+    {
+        PhaseSlot& pending = g_slots[g_head];
+        if (pending.used && pending.ph >= 0) {
+            if (cudaEventRecord(pending.e, 0) != cudaSuccess)
+                GAI_FAIL("phase_start: cudaEventRecord failed");
+            g_head = (g_head + 1) % kPhaseRing;
+        }
+    }
     PhaseSlot& sl = g_slots[g_head];
     sl.ph = ph;
     sl.used = true;
@@ -227,6 +238,7 @@ void phase_stop(int ph) {
 }
 void phase_reset() {
     for (auto& sl : g_slots) { sl.used = false; sl.ph = -1; }
+    g_head = 0;
 }
 void phase_shutdown() {
     for (auto& sl : g_slots) {

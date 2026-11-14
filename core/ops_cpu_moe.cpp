@@ -354,17 +354,25 @@ void moe_backward(const float* x, const float* router_w,
         std::fill(sc.dp.begin(), sc.dp.begin() + ne, 0.0f);
 
         if (sh_g && sh_u && sh_d && dsh_g && dsh_u && dsh_d) {
-            linear_forward(xt, sh_g, sc.g.data(), 1, d, E);
-            linear_forward(xt, sh_u, sc.u.data(), 1, d, E);
-            swiglu_forward(sc.g.data(), sc.u.data(), sc.a.data(), E);
-            std::fill(sc.da.begin(), sc.da.begin() + E, 0.0f);
-            linear_backward(sc.a.data(), sh_d, dt, sc.da.data(), dsh_d, 1, E, d);
-            std::fill(sc.dg.begin(), sc.dg.begin() + E, 0.0f);
-            std::fill(sc.du.begin(), sc.du.begin() + E, 0.0f);
-            swiglu_backward(sc.g.data(), sc.u.data(), sc.da.data(),
-                            sc.dg.data(), sc.du.data(), E);
-            linear_backward(xt, sh_g, sc.dg.data(), sc.dx.data(), dsh_g, 1, d, E);
-            linear_backward(xt, sh_u, sc.du.data(), sc.dx.data(), dsh_u, 1, d, E);
+            // The shared expert has its OWN width (SH), not the routed
+            // expert width (E). Granite-4.0 uses shared=1024 with routed=512,
+            // so using E here silently dropped the upper half of the shared
+            // MLP and, worse, passed the wrong leading dimension to the GEMM
+            // (sh_d is [d, SH], not [d, E]) - the shared expert's gradient
+            // buffer was written with a wrong layout.
+            // The SH-sized scratch (sg/su/sa/dsg/dsu/dsa) exists exactly for
+            // this block; the E-sized one belongs to the routed experts.
+            linear_forward(xt, sh_g, sc.sg.data(), 1, d, SH);
+            linear_forward(xt, sh_u, sc.su.data(), 1, d, SH);
+            swiglu_forward(sc.sg.data(), sc.su.data(), sc.sa.data(), SH);
+            std::fill(sc.dsa.begin(), sc.dsa.begin() + SH, 0.0f);
+            linear_backward(sc.sa.data(), sh_d, dt, sc.dsa.data(), dsh_d, 1, SH, d);
+            std::fill(sc.dsg.begin(), sc.dsg.begin() + SH, 0.0f);
+            std::fill(sc.dsu.begin(), sc.dsu.begin() + SH, 0.0f);
+            swiglu_backward(sc.sg.data(), sc.su.data(), sc.dsa.data(),
+                            sc.dsg.data(), sc.dsu.data(), SH);
+            linear_backward(xt, sh_g, sc.dsg.data(), sc.dx.data(), dsh_g, 1, d, SH);
+            linear_backward(xt, sh_u, sc.dsu.data(), sc.dx.data(), dsh_u, 1, d, SH);
         }
 
         float g_expert[8] = {0.0f};

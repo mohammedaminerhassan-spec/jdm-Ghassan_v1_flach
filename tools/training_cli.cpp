@@ -1,9 +1,11 @@
 #include "tools/cli_common.h"
 #include "tools/model_loader.h"
 #include "training/trainer.h"
+#include "training/shard_builder.h"
 #include "core/device.h"
 #include "format/gguf_codec.h"
 #include "format/hf_checkpoint.h"
+#include "format/hf_writer.h"
 #include "tokenizer/tokenizer.h"
 #include "training/jsonl_loader.h"
 
@@ -46,6 +48,9 @@ static void usage() {
     "  --batch-size --seq-len --grad-accum --max-steps --lr --warmup --seed\n"
     "  --optimizer adamw|lion|muon --scheduler cosine|wsd --ckpt-segments <n>\n"
     "  --ce-chunks <n>        chunked CE row-blocks, 0/1=off (default 4)\n"
+    "  --build-shards <dir>   tokenize the .txt documents of <dir> (one per line)\n"
+    "                        into the .gbin shards the loader reads, with the\n"
+    "                        engine's own tokenizer. --shard-prefix train --shard-tokens N\n"
     "  --strict-config        unknown/dead config keys fail instead of warning\n"
     "  --dry-run              arithmetic-only memory/schedule estimate (allocates nothing)\n"
     "  --max-vram-mb <n>      pre-flight gate: fail if the predicted peak exceeds n MiB\n"
@@ -59,7 +64,10 @@ static void usage() {
     "  --device auto|cpu|cuda   --threads <n>\n"
     "  --export <path> --export-profile q8_k|q4_0 --tokenizer <hf-dir|tokenizer.json>\n"
     "      # GGUF-only export (self-contained). --compat native (ghassan-ai) |\n"
-    "      # llama (dense Ollama) | llama_moe (MoE Ollama, needs moe_shared=false)\n";
+    "      # llama (dense Ollama) | llama_moe (MoE Ollama, needs moe_shared=false)\n"
+    "  --export <dir> --export-format safetensors --tokenizer <hf-dir>\n"
+    "      # a HuggingFace repository (model.safetensors + config.json + the\n"
+    "      # tokenizer files): what you upload to the Hub.\n";
 }
 
 int main(int argc, char** argv) {
@@ -109,6 +117,28 @@ int main(int argc, char** argv) {
                                 mcfg.use_moe ? ", MoE" : "",
                                 mcfg.lora_rank > 0
                                     ? strfmt(", LoRA r=%d", mcfg.lora_rank).c_str() : ""));
+            }
+        }
+
+        // --config-from <hf-dir>: take the ARCHITECTURE from a HuggingFace
+        // config.json, WITHOUT its weights. It is how the same architecture
+        // is trained from scratch (the Granite-4.0-H geometry with a fresh
+        // set of weights): the vocabulary, the layer kinds, the Mamba-2
+        // dimensions and the multipliers all come from the reference
+        // config, so the model is the same FUNCTION with new weights.
+        if (!hf) {
+            const std::string cfrom = args.str("config-from");
+            if (!cfrom.empty() && fs::is_directory(cfrom)) {
+                HFCheckpoint arch;
+                GAI_CHECK(arch.open(cfrom, /*weights_required=*/false),
+                          "cannot read the architecture from " + cfrom);
+                mcfg = arch.config();
+                mcfg.take_adapter_settings_from(recipe_mcfg);
+                log_info(strfmt("[mod ] the architecture comes from %s (%d layers, d=%d, "
+                                "H=%d/%d, V=%d%s)",
+                                cfrom.c_str(), mcfg.num_layers, mcfg.hidden_size,
+                                mcfg.num_heads, mcfg.num_kv_heads, mcfg.vocab_size,
+                                mcfg.use_moe ? ", MoE" : ""));
             }
         }
 
@@ -313,6 +343,32 @@ print_device_report();
             dev = best_device();
         }
 
+        // ---- the shard builder (a mode, not a training step) ----
+        //
+        // It turns the raw text (one document per line, written by
+        // tools/py/prepare_dataset.py) into the .gbin shards the loader
+        // reads. The tokenization is done with the ENGINE's tokenizer: a
+        // Python tokenizer would disagree with the hand-written
+        // pre-tokenizer on the digit grouping, and the model would be
+        // trained on token ids it never saw.
+        if (args.flag("build-shards", false)) {
+            GAI_CHECK(!tok_path.empty(),
+                      "--build-shards needs a tokenizer (--tokenizer <hf-dir|tokenizer.json>)");
+            Tokenizer bt;
+            std::vector<i32> b_ids;
+            GAI_CHECK(load_tokenizer_auto(tok_path, bt, b_ids),
+                      "cannot load tokenizer: " + tok_path);
+            const std::string dir = args.str("build-shards");
+            const std::string prefix = args.str("shard-prefix", "train");
+            const u64 per = static_cast<u64>(args.num("shard-tokens", 0));
+            const ShardBuilder::Stats st = ShardBuilder::build_directory(
+                dir, bt, prefix, tcfg.seq_len, per);
+            GAI_CHECK(st.shards > 0,
+                      "no shard was written in " + dir + " (it must hold .txt files, "
+                      "one document per line)");
+            return 0;
+        }
+
 #ifdef GAI_CUDA
         if (dev == Device::CUDA) {
             int want = 0;
@@ -485,7 +541,7 @@ print_device_report();
             }
             if (my_rank != 0) {
                 log_info("[export] rank " + std::to_string(my_rank) +
-                         ": skipping GGUF export (rank 0 owns the artifact)");
+                         ": skipping the export (rank 0 owns the artifact)");
             } else {
                 std::string prof = args.str("export-profile", "q8_k");
 
@@ -498,12 +554,30 @@ print_device_report();
                 }
                 const Tokenizer& effective_tok = have_hf_tok ? hf_tok : etok;
                 GAI_CHECK(have_hf_tok || !tok_path.empty(),
-                          "GGUF export needs a tokenizer: pass --tokenizer <hf-dir|tokenizer.json>");
-                export_model_gguf(args.str("export"), model, effective_tok,
-                                  gguf_profile_for(prof),
-                                  {{"stage", cfg.get_str("training.stage", "pretrain")},
-                                   {"steps", std::to_string(trainer.state().step)}},
-                                  args.str("compat", "native"));
+                          "the export needs a tokenizer: pass --tokenizer <hf-dir|tokenizer.json>");
+
+                // The export format: gguf (the llama.cpp artifact) or
+                // safetensors (the HuggingFace repository).
+                const std::string fmt = args.str("export-format", "gguf");
+                if (fmt == "safetensors" || fmt == "hf") {
+                    const std::string name = args.str("model-name", "Ghassan v1 Flash");
+                    const std::string dt = args.str("export-dtype", "f16");
+                    SafeDType sd = SafeDType::F16;
+                    if (dt == "f32" || dt == "float32") sd = SafeDType::F32;
+                    else if (dt == "bf16" || dt == "bfloat16") sd = SafeDType::BF16;
+                    GAI_CHECK(export_model_safetensors(args.str("export"), model, effective_tok,
+                                                        name, name, sd),
+                              "the safetensors export failed");
+                    copy_tokenizer_files(tok_path, args.str("export"));
+                } else {
+                    GAI_CHECK(fmt == "gguf", "unknown --export-format '" + fmt +
+                                           "' (gguf|safetensors)");
+                    export_model_gguf(args.str("export"), model, effective_tok,
+                                      gguf_profile_for(prof),
+                                      {{"stage", cfg.get_str("training.stage", "pretrain")},
+                                       {"steps", std::to_string(trainer.state().step)}},
+                                      args.str("compat", "native"));
+                }
             }
         }
 

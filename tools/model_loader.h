@@ -44,4 +44,13 @@ GenerationConfig make_gen_config(const Args& a);
 bool load_tokenizer_auto(const std::string& path, Tokenizer& out,
                          std::vector<i32>& eos_out);
 
+// Copies the tokenizer files of a source (a HuggingFace directory or a bare
+// tokenizer.json) into a destination directory.
+//
+// The vocabulary is a property of the tokenizer, not of the weights: the
+// files are copied verbatim, because re-serialising them would lose the
+// merges, the added tokens and the special-token ids. It is what turns the
+// safetensors export into a complete HuggingFace repository.
+bool copy_tokenizer_files(const std::string& src, const std::string& dst_dir);
+
 }  // namespace gai

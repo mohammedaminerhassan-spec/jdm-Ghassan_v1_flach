@@ -211,17 +211,9 @@ void mamba2_backward(const float* x,
                      int d_head, int d_state, int k, float eps);
 
 // ---- the attention (ops_cpu_attention.cpp)
-
-void attention_forward(const float* q, const float* k, const float* v,
-                       float* out, float* probs,
-                       int B, int T, int H, int KV, int hd, float scale);
-void attention_backward(const float* q, const float* k, const float* v,
-                        const float* probs, const float* dout,
-                        float* dq, float* dk, float* dv,
-                        int B, int T, int H, int KV, int hd, float scale);
-void attention_decode(const float* q, const float* kcache, const float* vcache,
-                      float* out, int H, int KV, int hd, int cur_len, int max_len,
-                      float scale, float* scratch);
+//
+// Only the "_ex" variants exist: they carry the sliding window and the
+// segment mask, and they are the ones the engine calls.
 
 void attention_forward_ex(const float* q, const float* k, const float* v,
                           float* out, float* probs,
@@ -231,9 +223,6 @@ void attention_backward_ex(const float* q, const float* k, const float* v,
                            const float* probs, const float* dout,
                            float* dq, float* dk, float* dv,
                            int B, int T, int H, int KV, int hd, float scale, int window);
-void attention_decode_ex(const float* q, const float* kcache, const float* vcache,
-                         float* out, int H, int KV, int hd, int cur_len, int max_len,
-                         float scale, float* scratch, int window);
 void attention_decode_ring(const float* q, const float* kcache, const float* vcache,
                            float* out, int H, int KV, int hd, int ring_start,
                            int pinned_prefix, int cur_len, int cache_max,

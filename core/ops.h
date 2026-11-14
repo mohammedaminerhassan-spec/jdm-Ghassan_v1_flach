@@ -254,16 +254,10 @@ void mamba2_backward(Device dev,
                      int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                      int d_head, int d_state, int k, float eps);
 
-void attention_forward(Device dev,
-                       const float* q, const float* k, const float* v,
-                       float* out, float* probs,
-                       int B, int T, int H, int KV, int hd, float scale);
-void attention_backward(Device dev,
-                        const float* q, const float* k, const float* v,
-                        const float* probs, const float* dout,
-                        float* dq, float* dk, float* dv,
-                        int B, int T, int H, int KV, int hd, float scale);
-
+// The attention family. Only the "_ex" variants exist: they carry the
+// sliding window and the segment mask, and they are the ones the engine
+// calls (the plain forward/backward and the plain decode had no caller and
+// were removed with their tiled CUDA/CPU implementations).
 void attention_forward_ex(Device dev,
                           const float* q, const float* k, const float* v,
                           float* out, float* probs,
@@ -275,14 +269,6 @@ void attention_backward_ex(Device dev,
                            float* dq, float* dk, float* dv,
                            int B, int T, int H, int KV, int hd, float scale, int window);
 
-void attention_decode(Device dev,
-                      const float* q, const float* kcache, const float* vcache,
-                      float* out, int H, int KV, int hd, int cur_len, int max_len,
-                      float scale, float* scratch);
-void attention_decode_ex(Device dev,
-                         const float* q, const float* kcache, const float* vcache,
-                         float* out, int H, int KV, int hd, int cur_len, int max_len,
-                         float scale, float* scratch, int window);
 void attention_decode_ring(Device dev,
                            const float* q, const float* kcache, const float* vcache,
                            float* out, int H, int KV, int hd, int ring_start,

@@ -161,8 +161,8 @@ public:
     static size_t ckpt_ram_budget_public() { return ckpt_ram_budget(); }
 
 private:
-    void run_pretrain();
-    void run_sft();
+    // The training loop (both stages; the stage only changes the banner).
+    void run_stage();
 
     i64 planned_total() const;
     void log_step(double loss, float lr, double gnorm, double dt, i64 ntok);

@@ -781,16 +781,19 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
             }
         } else {
 
+            // The positions must be CONTIGUOUS: the first token used to sit
+            // at position 0 while the rest started at base+1, which left a
+            // hole in the RoPE phase (the model saw a position it never
+            // trained on). The base is where the kept window starts in the
+            // original prompt: the truncation dropped `drop` tokens from the
+            // front and the caller dropped `front_drop` more.
             const int base = drop + front_drop;
-            decode_step(work[0], 0);
-            push_history(work[0]);
-            for (size_t i = 1; i < work.size(); ++i) {
-                int pos = base + static_cast<int>(i);
-                decode_step(work[i], pos);
+            for (size_t i = 0; i < work.size(); ++i) {
+                decode_step(work[i], base + static_cast<int>(i));
                 push_history(work[i]);
             }
 
-            absolute_pos_ = static_cast<int64_t>(front_drop) + static_cast<int64_t>(tokens.size());
+            absolute_pos_ = static_cast<int64_t>(base) + static_cast<int64_t>(work.size());
         }
     } else {
         for (size_t i = 0; i < tokens.size(); ++i) {
@@ -835,11 +838,19 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
     };
 
     bool saw_fast = false;
+    // The fast path is decided ONCE, before the first token.
+    //
+    // It reads the logits from the DEVICE (the penalties are applied there
+    // and the top-k is selected there), so it must be used for every step
+    // of the same generation. Deciding it per step made it flip in the
+    // middle of a generation (the penalty window grows with the history when
+    // repetition_window == 0), and the slow path then sampled from a stale
+    // host copy of the logits - the last one the prefill had written.
+    const bool use_fast = use_fast_for(static_cast<int>(history_.size()));
     for (int step = 0; step < limit; ++step) {
 
         const int win_now = sc.repetition_window > 0 ? sc.repetition_window
                                                      : static_cast<int>(history_.size());
-        const bool use_fast = use_fast_for(static_cast<int>(history_.size()));
         if (use_fast) saw_fast = true;
         i32 next = -1;
         if (use_fast) {

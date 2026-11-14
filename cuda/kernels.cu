@@ -10,6 +10,7 @@
 #endif
 #include <cfloat>
 #include <cmath>
+#include <algorithm>
 #include <vector>
 
 namespace gai {
@@ -55,7 +56,6 @@ void reserve_workspaces(size_t gemm_bytes, size_t moe_bytes) {
 }
 
 void free_sampling_workspace();
-void attn_free_dots();
 void attn_free_pool();
 void free_workspace() {
     if (g_ws) cudaFree(g_ws);
@@ -65,7 +65,6 @@ void free_workspace() {
     free_sampling_workspace();
     moe_free_workspace();
     mamba_free_workspace();
-    attn_free_dots();
     attn_free_pool();
 }
 
@@ -119,6 +118,72 @@ __global__ void k_f32_to_bf16_strided(const float* src, __nv_bfloat16* dst,
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// The cuBLAS leading-dimension contract, and how the engine satisfies it.
+//
+// The engine's GEMM is row-major:
+//     C[M,N] = alpha * op(A)[M,K] * op(B)[K,N] + beta * C
+// with A and B row-major (leading dimensions lda / ldb). cuBLAS is
+// column-major, so the engine hands the SAME buffers to cuBLAS with the
+// operands swapped (cublasA = the engine's B, cublasB = the engine's A) and
+// the row-major leading dimensions reused as the column-major ones.
+//
+// cuBLAS then requires:
+//   cublasA (the engine's B, op = trans_b ? OP_T : OP_N):
+//       lda = ldb >= m (= N) when OP_N,  lda = ldb >= k (= K) when OP_T
+//   cublasB (the engine's A, op = trans_a ? OP_T : OP_N):
+//       ldb = lda >= n (= M) when OP_N,  ldb = lda >= k (= K) when OP_T
+//
+// A leading dimension smaller than the dimension cuBLAS indexes into makes
+// cuBLAS return CUBLAS_STATUS_INVALID_VALUE even though the data itself is
+// laid out correctly (the memory is fine: the row stride is what it is).
+//
+// The obvious fix - copying the operands - costs a full transpose per GEMM
+// and a big scratch buffer. The exact and cheap fix is to SPLIT the GEMM
+// along the offending dimension: the chunk size is chosen so that every
+// cuBLAS constraint holds, and the operand pointers advance with their own
+// strides. The split is mathematically exact (the k-chunks accumulate into
+// the same C, the m/n-chunks write disjoint slices of C) and costs nothing
+// in the common case: when the constraints already hold there is a single
+// chunk and the call is unchanged.
+//
+// This matters a lot in practice: the LoRA adapters GEMM against a rank of
+// 8..64 with hundreds of tokens, so EVERY LoRA forward/backward violated
+// the contract (lda = rank < n = tokens) and cuBLAS refused the call.
+// ---------------------------------------------------------------------------
+
+// The chunk plan of one GEMM.
+struct GemmSplit {
+    int m_chunk = 0;   // the engine's N dimension (cuBLAS m)
+    int n_chunk = 0;   // the engine's M dimension (cuBLAS n)
+    int k_chunk = 0;   // the contraction (cuBLAS k)
+};
+
+// The plan for the raw (fp32) path: the leading dimensions are the engine's
+// own lda / ldb.
+static GemmSplit plan_split_raw(bool trans_a, bool trans_b,
+                                int M, int N, int K, int lda, int ldb) {
+    GemmSplit s{N, M, K};
+    // cublasB: the engine's A.
+    if (trans_a) { if (lda < s.k_chunk) s.k_chunk = lda; }   // OP_T: ldb >= k
+    else         { if (lda < s.n_chunk) s.n_chunk = lda; }   // OP_N: ldb >= n
+    // cublasA: the engine's B.
+    if (trans_b) { if (ldb < s.k_chunk) s.k_chunk = ldb; }   // OP_T: lda >= k
+    else         { if (ldb < s.m_chunk) s.m_chunk = ldb; }   // OP_N: lda >= m
+    return s;
+}
+
+// The plan for the packed (fp16) path: both operands are copied into
+// contiguous buffers whose leading dimension is the number of columns of the
+// row-major copy (cA / cB), so only the cublasB constraint can bite.
+static GemmSplit plan_split_packed(bool trans_a, int M, int N, int K,
+                                    int cA) {
+    GemmSplit s{N, M, K};
+    if (trans_a) { if (cA < s.k_chunk) s.k_chunk = cA; }   // OP_T: ldb(=cA) >= k
+    else         { if (cA < s.n_chunk) s.n_chunk = cA; }   // OP_N: ldb(=cA) >= n
+    return s;
+}
+
 static void gemm_fp16(bool trans_a, bool trans_b, int M, int N, int K,
                       float alpha, const float* A, int lda,
                       const float* B, int ldb, float beta, float* C, int ldc) {
@@ -132,19 +197,41 @@ static void gemm_fp16(bool trans_a, bool trans_b, int M, int N, int K,
     CU_CHECK(cudaGetLastError());
 
     cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
+    const cublasOperation_t opA = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t opB = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    cublasStatus_t s = cublasGemmEx(h,
-                                     trans_b ? CUBLAS_OP_T : CUBLAS_OP_N,
-                                     trans_a ? CUBLAS_OP_T : CUBLAS_OP_N,
-                                     N, M, K,
-                                     &alpha,
-                                     Bh, CUDA_R_16F, cB,
-                                     Ah, CUDA_R_16F, cA,
-                                     &beta,
-                                     C, CUDA_R_32F, ldc,
-                                     CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (s != CUBLAS_STATUS_SUCCESS) GAI_FAIL("cublasGemmEx failed");
+    const GemmSplit sp = plan_split_packed(trans_a, M, N, K, cA);
+
+    for (int k0 = 0; k0 < K; k0 += sp.k_chunk) {
+        const int kc = std::min(sp.k_chunk, K - k0);
+        // The contraction dimension: the K rows (trans_a=0) or columns
+        // (trans_a=1) of the packed row-major copy.
+        __half* Ak = Ah + (trans_a ? (size_t)k0 * cA : (size_t)k0);
+        __half* Bk = Bh + (trans_b ? (size_t)k0 : (size_t)k0 * cB);
+        // The k-chunks accumulate into the same C: the first one applies
+        // beta, the rest add.
+        const float beta_k = (k0 == 0) ? beta : 1.0f;
+        for (int n0 = 0; n0 < M; n0 += sp.n_chunk) {
+            const int nc = std::min(sp.n_chunk, M - n0);
+            __half* Ac = Ak + (trans_a ? (size_t)n0 : (size_t)n0 * cA);
+            cublasStatus_t s = cublasGemmEx(h,
+                                           opA, opB,
+                                           N, nc, kc,
+                                           &alpha,
+                                           Bk, CUDA_R_16F, cB,
+                                           Ac, CUDA_R_16F, cA,
+                                           &beta_k,
+                                           C + (size_t)n0 * ldc, CUDA_R_32F, ldc,
+                                           CUBLAS_COMPUTE_32F,
+                                           CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (s != CUBLAS_STATUS_SUCCESS)
+                GAI_FAIL(strfmt("cublasGemmEx fp16 failed (status=%d) | trans_a=%d trans_b=%d "
+                                "M=%d N=%d K=%d lda=%d ldb=%d ldc=%d | chunk m=%d n=%d k=%d",
+                                static_cast<int>(s), trans_a ? 1 : 0, trans_b ? 1 : 0,
+                                M, N, K, lda, ldb, ldc,
+                                sp.m_chunk, sp.n_chunk, sp.k_chunk));
+        }
+    }
 }
 
 #if __CUDACC_VER_MAJOR__ >= 11
@@ -169,18 +256,39 @@ static void gemm_bf16(bool trans_a, bool trans_b, int M, int N, int K,
     k_f32_to_bf16_strided<<<grid_for((i64)nB, 256), 256>>>(B, Bh, rB, cB, ldb);
     CU_CHECK(cudaGetLastError());
     cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
-    cublasStatus_t s = cublasGemmEx(h,
-                                     trans_b ? CUBLAS_OP_T : CUBLAS_OP_N,
-                                     trans_a ? CUBLAS_OP_T : CUBLAS_OP_N,
-                                     N, M, K,
-                                     &alpha,
-                                     Bh, CUDA_R_16BF, cB,
-                                     Ah, CUDA_R_16BF, cA,
-                                     &beta,
-                                     C, CUDA_R_32F, ldc,
-                                     CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (s != CUBLAS_STATUS_SUCCESS) GAI_FAIL("cublasGemmEx BF16 failed");
+    const cublasOperation_t opA = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t opB = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    // The same leading-dimension contract as the fp16 path (see the comment
+    // above): the GEMM is split so that every cuBLAS constraint holds.
+    const GemmSplit sp = plan_split_packed(trans_a, M, N, K, cA);
+
+    for (int k0 = 0; k0 < K; k0 += sp.k_chunk) {
+        const int kc = std::min(sp.k_chunk, K - k0);
+        __nv_bfloat16* Ak = Ah + (trans_a ? (size_t)k0 * cA : (size_t)k0);
+        __nv_bfloat16* Bk = Bh + (trans_b ? (size_t)k0 : (size_t)k0 * cB);
+        const float beta_k = (k0 == 0) ? beta : 1.0f;
+        for (int n0 = 0; n0 < M; n0 += sp.n_chunk) {
+            const int nc = std::min(sp.n_chunk, M - n0);
+            __nv_bfloat16* Ac = Ak + (trans_a ? (size_t)n0 : (size_t)n0 * cA);
+            cublasStatus_t s = cublasGemmEx(h,
+                                           opA, opB,
+                                           N, nc, kc,
+                                           &alpha,
+                                           Bk, CUDA_R_16BF, cB,
+                                           Ac, CUDA_R_16BF, cA,
+                                           &beta_k,
+                                           C + (size_t)n0 * ldc, CUDA_R_32F, ldc,
+                                           CUBLAS_COMPUTE_32F,
+                                           CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (s != CUBLAS_STATUS_SUCCESS)
+                GAI_FAIL(strfmt("cublasGemmEx BF16 failed (status=%d) | trans_a=%d trans_b=%d "
+                                "M=%d N=%d K=%d lda=%d ldb=%d ldc=%d | chunk m=%d n=%d k=%d",
+                                static_cast<int>(s), trans_a ? 1 : 0, trans_b ? 1 : 0,
+                                M, N, K, lda, ldb, ldc,
+                                sp.m_chunk, sp.n_chunk, sp.k_chunk));
+        }
+    }
 }
 #endif
 
@@ -282,21 +390,47 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
     cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
     cublasOperation_t opA = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
-    cublasStatus_t s = cublasSgemm(h, opA, opB, N, M, K,
-                                   &alpha, B, ldb, A, lda, &beta, C, ldc);
-    if (s != CUBLAS_STATUS_SUCCESS) {
 
-        int cur_dev = -1;
-        cudaGetDevice(&cur_dev);
-        GAI_FAIL(strfmt("cublasSgemm failed: status=%d (%s) | M=%d N=%d K=%d "
-                        "lda=%d ldb=%d ldc=%d | handle-device=%d current-device=%d | "
-                        "hint: EXECUTION_FAILED with sane dims points at a wedged GPU "
-                        "(nvidia-smi -r or session restart) or a prior async fault; "
-                        "NOT_INITIALIZED with mismatched devices points at a device slip; "
-                        "INVALID_VALUE points at a host-side shape bug",
-                        static_cast<int>(s), cublas_status_name(s),
-                        M, N, K, lda, ldb, ldc,
-                        cuda::cublas_device(), cur_dev));
+    // The GEMM is split so that every cuBLAS leading-dimension constraint
+    // holds (see the contract above). The common case is a single chunk.
+    const GemmSplit sp = plan_split_raw(trans_a, trans_b, M, N, K, lda, ldb);
+    for (int k0 = 0; k0 < K; k0 += sp.k_chunk) {
+        const int kc = std::min(sp.k_chunk, K - k0);
+        // The contraction dimension: the K rows (trans_a=0) or the K columns
+        // (trans_a=1) of the row-major operand.
+        const float* Ak = A + (trans_a ? (size_t)k0 * lda : (size_t)k0);
+        const float* Bk = B + (trans_b ? (size_t)k0 : (size_t)k0 * ldb);
+        const float beta_k = (k0 == 0) ? beta : 1.0f;
+        for (int n0 = 0; n0 < M; n0 += sp.n_chunk) {
+            const int nc = std::min(sp.n_chunk, M - n0);
+            const float* Ac = Ak + (trans_a ? (size_t)n0 : (size_t)n0 * lda);
+            for (int m0 = 0; m0 < N; m0 += sp.m_chunk) {
+                const int mc = std::min(sp.m_chunk, N - m0);
+                const float* Bc = Bk + (trans_b ? (size_t)m0 * ldb : (size_t)m0);
+                float* Cc = C + (size_t)n0 * ldc + (size_t)m0;
+                cublasStatus_t s = cublasSgemm(h, opA, opB, mc, nc, kc,
+                                               &alpha, Bc, ldb, Ac, lda,
+                                               &beta_k, Cc, ldc);
+                if (s != CUBLAS_STATUS_SUCCESS) {
+
+                    int cur_dev = -1;
+                    cudaGetDevice(&cur_dev);
+                    GAI_FAIL(strfmt("cublasSgemm failed: status=%d (%s) | M=%d N=%d K=%d "
+                                    "lda=%d ldb=%d ldc=%d | trans_a=%d trans_b=%d | "
+                                    "chunk m=%d n=%d k=%d | "
+                                    "handle-device=%d current-device=%d | "
+                                    "hint: EXECUTION_FAILED with sane dims points at a wedged GPU "
+                                    "(nvidia-smi -r or session restart) or a prior async fault; "
+                                    "NOT_INITIALIZED with mismatched devices points at a device slip; "
+                                    "INVALID_VALUE points at a host-side shape bug",
+                                    static_cast<int>(s), cublas_status_name(s),
+                                    M, N, K, lda, ldb, ldc,
+                                    trans_a ? 1 : 0, trans_b ? 1 : 0,
+                                    sp.m_chunk, sp.n_chunk, sp.k_chunk,
+                                    cuda::cublas_device(), cur_dev));
+                }
+            }
+        }
     }
 }
 
@@ -327,17 +461,28 @@ void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, i
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
-    cublasStatus_t status = cublasGemmEx(h,
-                                         CUBLAS_OP_T, CUBLAS_OP_N,
-                                         N, M, K,
-                                         &alpha,
-                                         w, CUDA_R_16F, K,
-                                         xh, CUDA_R_16F, K,
-                                         &beta,
-                                         y, CUDA_R_32F, N,
-                                         CUBLAS_COMPUTE_32F,
-                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (status != CUBLAS_STATUS_SUCCESS) GAI_FAIL("cublasGemmEx fp16 linear failed");
+    // The cublas B-operand (the activations) has ldb = K, so cuBLAS needs
+    // K >= M (the number of rows). When the micro-batch has more rows than
+    // the input width (a long sequence, a wide model with a narrow layer),
+    // the GEMM is split into row blocks of K rows instead of failing with
+    // CUBLAS_STATUS_INVALID_VALUE (see the contract at the top of the file).
+    const int m_chunk = (K < M) ? K : M;
+    for (int m0 = 0; m0 < M; m0 += m_chunk) {
+        const int mc = std::min(m_chunk, M - m0);
+        cublasStatus_t status = cublasGemmEx(h,
+                                             CUBLAS_OP_T, CUBLAS_OP_N,
+                                             N, mc, K,
+                                             &alpha,
+                                             w, CUDA_R_16F, K,
+                                             xh + (size_t)m0 * K, CUDA_R_16F, K,
+                                             &beta,
+                                             y + (size_t)m0 * N, CUDA_R_32F, N,
+                                             CUBLAS_COMPUTE_32F,
+                                             CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (status != CUBLAS_STATUS_SUCCESS)
+            GAI_FAIL(strfmt("cublasGemmEx fp16 linear failed (status=%d) | M=%d N=%d K=%d "
+                            "| chunk m=%d", static_cast<int>(status), M, N, K, m_chunk));
+    }
 }
 
 __global__ void k_split_qkv(const float* qkv, float* q, float* k, float* v,

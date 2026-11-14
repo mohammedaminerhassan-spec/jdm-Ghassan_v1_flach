@@ -1,0 +1,73 @@
+# Ghassan v1 Flash - the SMOKE test.
+#
+# The goal of this recipe is NOT to train anything: it is to validate the
+# whole pipeline on the GPU in a couple of minutes:
+#
+#   * the CUDA build (the first nvcc compile of the engine),
+#   * the GEMM chunking (the cuBLAS leading-dimension fix),
+#   * the attention path (the fp16 / fp32 decision),
+#   * the optimizer, the checkpointing and the resume,
+#   * the safetensors export.
+#
+# It is a small DENSE model (no MoE, no Mamba): the fewer moving parts, the
+# more obvious the failure.
+#
+#   python tools/py/prepare_dataset.py --input <parquet> --output artifacts/shards
+#   gai_train --build-shards artifacts/shards --tokenizer <hf-dir> --shard-prefix train
+#   gai_train --config configs/ghassan_v1_flash_smoke.yaml --tokenizer <hf-dir>
+
+model:
+  vocab_size: 49152
+  hidden_size: 512
+  num_layers: 4
+  num_heads: 8
+  num_kv_heads: 2
+  intermediate_size: 1024
+  max_seq_len: 512
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_word_embeddings: true
+  init_std: 0.02
+  use_moe: false
+  use_qk_norm: false
+  use_qkv_bias: false
+  z_loss_scale: 0.0
+  rope_scale: 1.0
+  rope_type: 1
+  position_embedding: 0
+  lora_rank: 0
+
+tokenizer:
+  path: /kaggle/working/hf/tokenizer.json
+
+training:
+  data_dir: artifacts/shards
+  batch_size: 4
+  seq_len: 256
+  grad_accum: 2
+  max_steps: 20
+  learning_rate: 3.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 5
+  optimizer: lion
+  scheduler: cosine
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.99
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: fp32
+  gemm_fp16: true
+  loss_scale_init: 65536.0
+  loss_scale_window: 2000
+  ce_chunks: 4
+  log_every: 1
+  eval_every: 10
+  eval_batches: 2
+  save_every: 20
+  checkpoint_dir: artifacts/checkpoints/smoke
+  resume: none
+  seed: 42
+  device: auto
+  stage: pretrain
+  resume_mode: exact

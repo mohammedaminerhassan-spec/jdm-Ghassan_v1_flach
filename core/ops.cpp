@@ -508,25 +508,6 @@ void mamba2_backward(Device dev,
                          d_head, d_state, k, eps);
 }
 
-void attention_forward(Device dev, const float* q, const float* k, const float* v,
-                       float* out, float* probs,
-                       int B, int T, int H, int KV, int hd, float scale) {
-    GAI_DISPATCH(dev, attention_forward(q, k, v, out, probs, B, T, H, KV, hd, scale));
-}
-
-void attention_backward(Device dev, const float* q, const float* k, const float* v,
-                        const float* probs, const float* dout,
-                        float* dq, float* dk, float* dv,
-                        int B, int T, int H, int KV, int hd, float scale) {
-    GAI_DISPATCH(dev, attention_backward(q, k, v, probs, dout, dq, dk, dv, B, T, H, KV, hd, scale));
-}
-
-void attention_decode(Device dev, const float* q, const float* kc, const float* vc,
-                       float* out, int H, int KV, int hd, int cur_len, int max_len,
-                       float scale, float* scratch) {
-    GAI_DISPATCH(dev, attention_decode(q, kc, vc, out, H, KV, hd, cur_len, max_len, scale, scratch));
-}
-
 void attention_decode_ring(Device dev,
                            const float* q, const float* kcache, const float* vcache,
                            float* out, int H, int KV, int hd, int ring_start,
@@ -591,19 +572,6 @@ void attention_backward_ex(Device dev,
     }
 #endif
     cpu::attention_backward_ex(q, k, v, probs, dout, dq, dk, dv, B, T, H, KV, hd, scale, window);
-}
-
-void attention_decode_ex(Device dev,
-                         const float* q, const float* kc, const float* vc,
-                         float* out, int H, int KV, int hd, int cur_len, int max_len,
-                         float scale, float* scratch, int window) {
-#ifdef GAI_CUDA
-    if (dev == Device::CUDA) {
-        cuda_ops::attention_decode_ex(q, kc, vc, out, H, KV, hd, cur_len, max_len, scale, scratch, window);
-        return;
-    }
-#endif
-    cpu::attention_decode_ex(q, kc, vc, out, H, KV, hd, cur_len, max_len, scale, scratch, window);
 }
 
 void moe_forward(Device dev,

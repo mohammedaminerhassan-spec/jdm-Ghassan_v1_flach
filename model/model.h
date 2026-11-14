@@ -3,10 +3,10 @@
 #include "core/tensor.h"
 #include "core/config.h"
 #include "core/rng.h"
-#include "training/lora.h"
 #include <vector>
 #include <string>
 #include <memory>
+#include <random>
 
 namespace gai {
 
@@ -313,6 +313,7 @@ public:
     std::vector<Parameter*>&       parameters()       { return params_; }
     const std::vector<Parameter*>& parameters() const { return params_; }
     Parameter* find_parameter(const std::string& name);
+    const Parameter* find_parameter(const std::string& name) const;
     i64  num_parameters() const;
     i64  num_parameters_non_embedding() const;
     ParamReport parameter_report() const;
