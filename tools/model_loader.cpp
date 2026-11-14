@@ -35,21 +35,32 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
     const int kv_ctx = ctx > 0 ? ctx : std::min(cfg.max_seq_len, 4096);
     const size_t kv   = Model::kv_cache_bytes(cfg, kv_ctx);
     const size_t mam  = Model::mamba_state_bytes(cfg);
-    const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, ctx > 0 ? ctx : 512);
-    const size_t need = plan.weights + plan.fp16_cache + plan.activations +
+    // The hybrid (Granite) prefills TOKEN BY TOKEN (the recurrent state
+    // cannot be batched), so its peak activations are per token, not per
+    // sequence. The training-style estimate (B x T x V logits) is 20x too
+    // big here: it refused a context that fits easily (the 12.93 GiB of
+    // the weights leave 1.6 GiB, and the real usage is a few MB).
+    const bool hybrid = (cfg.arch == ModelConfig::ArchGranite);
+    const int act_T = hybrid ? 1 : (ctx > 0 ? ctx : 512);
+    const Model::MemoryPlan plan2 =
+        Model::plan_memory(cfg, 1, act_T, false, 1, fp16_cache_on, fp16_weights);
+    const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, act_T);
+    const size_t need = plan2.weights + plan2.fp16_cache + plan2.activations +
                         kv + mam + wsp.gemm_bytes + wsp.moe_bytes;
+    (void)plan;
 
     log_info(strfmt("[mem ] GPU plan: weights %s | fp16 cache %s | activations %s | "
-                    "kv %s | mamba %s | workspaces %s = %s of %s (%.0f%%)",
-                    human_bytes(plan.weights).c_str(),
-                    human_bytes(plan.fp16_cache).c_str(),
-                    human_bytes(plan.activations).c_str(),
+                    "kv %s | mamba %s | workspaces %s = %s of %s (%.0f%%)%s",
+                    human_bytes(plan2.weights).c_str(),
+                    human_bytes(plan2.fp16_cache).c_str(),
+                    human_bytes(plan2.activations).c_str(),
                     human_bytes(kv).c_str(),
                     human_bytes(mam).c_str(),
                     human_bytes(wsp.gemm_bytes + wsp.moe_bytes).c_str(),
                     human_bytes(need).c_str(),
                     human_bytes(di.total_mem).c_str(),
-                    100.0 * static_cast<double>(need) / static_cast<double>(di.total_mem)));
+                    100.0 * static_cast<double>(need) / static_cast<double>(di.total_mem),
+                    hybrid ? " [the hybrid prefills token by token]" : ""));
 
     if (need > di.total_mem) {
         GAI_FAIL(strfmt("the model does not fit this GPU: it needs %s but the card has %s "
@@ -58,12 +69,12 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
                         "--weight-f16 1 (the weights in half precision: %s instead of %s), "
                         "or --no-fp16-cache (frees the fp16 copy).",
                         human_bytes(need).c_str(), human_bytes(di.total_mem).c_str(),
-                        human_bytes(plan.weights).c_str(),
+                        human_bytes(plan2.weights).c_str(),
                         fp16_weights ? "half-precision" : "fp32",
-                        human_bytes(plan.activations + kv).c_str(),
-                        human_bytes(Model::plan_memory(cfg, 1, ctx > 0 ? ctx : 512, false, 1,
+                        human_bytes(plan2.activations + kv).c_str(),
+                        human_bytes(Model::plan_memory(cfg, 1, act_T, false, 1,
                                                        false, true).weights).c_str(),
-                        human_bytes(plan.weights).c_str()));
+                        human_bytes(plan2.weights).c_str()));
     }
 }
 
