@@ -17,7 +17,7 @@
 #   gai_train --config configs/ghassan_v1_flash_smoke.yaml --tokenizer <hf-dir>
 
 model:
-  vocab_size: 49152
+  vocab_size: 100352
   hidden_size: 512
   num_layers: 4
   num_heads: 8
@@ -26,7 +26,7 @@ model:
   max_seq_len: 512
   rope_theta: 10000.0
   rms_eps: 1.0e-5
-  tie_word_embeddings: true
+  tie_embeddings: true
   init_std: 0.02
   use_moe: false
   use_qk_norm: false

@@ -1580,6 +1580,17 @@ void export_model_gguf(const std::string& path, Model& model,
     }
     w.set_description("Ghassan v1 Flash");
     w.set_general_type("model");
+    // The provenance: the artifact is a "Ghassan v1 Flash", and it says
+    // WHICH model it is built on (e.g. IBM Granite-4.0-H). The Granite
+    // geometry, the multipliers and the layer kinds are exported untouched
+    // below, so a Granite artifact stays a Granite artifact (it can still
+    // be fine-tuned as one); only the NAME is ours.
+    if (!cfg.base_model.empty()) {
+        w.add_custom_metadata("general.base_model.0.name", cfg.base_model);
+        if (!cfg.base_org.empty())
+            w.add_custom_metadata("general.base_model.0.organization", cfg.base_org);
+        w.set_description(strfmt("Ghassan v1 Flash - based on %s", cfg.base_model.c_str()));
+    }
     {
         u64 n = static_cast<u64>(model.num_parameters());
         std::string label = n >= 1000000000ull

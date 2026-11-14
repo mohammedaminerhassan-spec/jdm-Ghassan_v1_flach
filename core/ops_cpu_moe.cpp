@@ -408,6 +408,12 @@ void moe_backward(const float* x, const float* router_w,
         }
 
         float inv_S = sum_p > 1e-8f ? (1.0f / sum_p) : 0.0f;
+        // dL/dp_{e_k} = (g_k - SUM_j g_j*w_j) / S.
+        //
+        // w_j = p_{e_j}/S and S = SUM_j p_{e_j}, so
+        //     dw_j/dp_{e_k} = delta_jk/S - w_j/S
+        // and the sum over j gives (g_k - SUM_j g_j*w_j)/S. (The weighted
+        // sum of the g's IS the right second term here.)
         float bar_g = 0.0f;
         for (int k = 0; k < K; ++k) bar_g += g_expert[k] * twt[k];
         for (int k = 0; k < K; ++k) {

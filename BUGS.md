@@ -19,12 +19,20 @@
 | BUG-10 | `merge_lora` بطيء جدًا (حلقة host بـ O(out*in*r)) | أداء | `model/model.cpp` | اتصلّح (GEMM على الـ device) |
 | BUG-11 | **جديد**: الـ loader ما بيحمّلش الـ shared expert في الموديلات non-Granite | حرجة | `format/hf_checkpoint.cpp` | اتصلّح |
 | BUG-12 | **جديد**: `shared_expert_intermediate_size` كان بيتجاهَل في الـ config | حرجة | `format/hf_checkpoint.cpp` | اتصلّح |
+| BUG-16 | **جديد**: الـ Mamba backward على الـ GPU بيستعمل `s_t` بدل `s_{t+1}` في تدرّج قنوات C | حرجة | `cuda/mamba.cu` | اتصلّح |
+| BUG-17 | **جديد**: الـ Mamba backward على الـ GPU بيفكّ pointer فارغ (state = nullptr) | حرجة | `cuda/mamba.cu` | اتصلّح |
+| BUG-18 | **جديد**: الـ Mamba backward على الـ GPU كان O(T²) (replay لكل توكن) | حرجة (أداء) | `cuda/mamba.cu` | اتصلّح |
+| BUG-19 | **جديد**: الـ Mamba states بتتنقل بين خطوات التدريب (مش بتتصفّر) | حرجة | `model/model.cpp` | اتصلّح |
+| BUG-20 | **جديد**: `mamba_n_groups > 1` كان بيتبني بموديل غلط (layout الـ B/C) | متوسطة | `model/model.cpp` | اتصلّح (حارس) |
 
 **الاختبارات الجديدة** (الـ `CMakeLists.txt` كان بيبني `tests/test_*.cpp` من زمان والمجلد كان فاضي):
 
 | الاختبار | إيه بيعمل |
 |---|---|
 | `tests/test_gradient_check.cpp` | finite-difference على التدرّجات: بيمسك BUG-01 و BUG-02 فورًا |
+| `tests/test_mamba_backward.cpp` | **جديد**: الـ Mamba-2 لوحده (loss خطي → إشارة نظيفة) على كل بارامتر من بارامتراته |
+| `tests/test_cuda_parity.cpp` | **جديد**: نفس التدرّجات على CPU وعلى CUDA |
+| `tests/test_granite_compat.cpp` | **جديد**: هندسة Granite-4.0-H + عدد بارامتراتها بالظبط |
 | `tests/test_safetensors_roundtrip.cpp` | يكتب safetensors -> يقرأها -> يقارن (dense + MoE + Granite) |
 
 ```bash
@@ -708,6 +716,8 @@ ops::gemm(device_, false, false, out_d, in_d, r, sc, B_ptr, r, A_ptr, in_d, 1.0f
 | `training/lora.h` | اتحذف (ميت: مكرر لـ `model::LoraAdapter`). |
 | `core/ops.h`, `core/ops.cpp`, `core/ops_cpu.h`, `core/ops_cpu_attention.cpp`, `cuda/cuda_ops.h` | BUG-07: واجهات الـ attention الميتة اتشالت. |
 | `format/hf_checkpoint.cpp` | BUG-11 + BUG-12: الـ shared expert (العرض + الـ tensors). |
+| `cuda/mamba.cu` | BUG-16 + BUG-17 + BUG-18: كيرنل `k_mamba_scan_traj` جديد بيسجّل مسار الحالة (O(T) بدل O(T²))، والـ backward بيقرأ `s_t` و `s_{t+1}` صح، وحماية من الـ `state = nullptr`. |
+| `model/model.cpp` | BUG-19: تصفير الـ Mamba states في بداية كل forward. BUG-20: حارس `mamba_n_groups == 1`. |
 | `format/hf_writer.{h,cpp}` | **جديد**: الـ safetensors writer (HF export) + `config.json` + الـ sharding. |
 | `tools/model_loader.{h,cpp}` | `copy_tokenizer_files()` (نسخ ملفات الـ tokenizer للـ export). |
 | `tools/inference_cli.cpp` | `ghassan-ai export --format safetensors --out <dir>`. |
@@ -800,3 +810,165 @@ fp32 للـ LoRA بس.
 نفس الـ منطق ✓، لكن **الفرق الصغير في الـ ties** بين الـ routing والـ backward
 ممكن يطلع في الـ routing gradients. `tests/test_cuda_parity.cpp` بيقيس ده
 (يُشغَّل على الـ GPU).
+
+---
+
+# جولة 2026-11-14 — الـ Mamba-2 (فحص عددي معزول)
+
+المهمة: نتأكد إن الـ backward بتاع طبقة الـ Mamba-2 **صحيح رياضيًا** (مفيش
+factor ناقص ولا layout غلط)، لأن الـ training على Granite بيحتاجه.
+
+## الطريقة
+
+`tests/test_gradient_check.cpp` كان بيقيس الـ gradients على الموديل كامل، بس
+الـ cross-entropy على 64 توكن بيت drowning التدرّجات الصغيرة في ضوضاء fp32
+(الـ noise على الـ gradient ≈ `res/(2·h)` ≈ تدرّج الـ `ffn_norm` نفسه). كمان
+اختيار الـ top-k **متقطع**: أي perturbation في طبقة قبل الـ router ممكن يغيّر
+**مين** بيشتغل → الـ finite difference يقيس دالة تانية.
+
+فصلنا الـ Mamba-2 في اختبار مستقل: **`tests/test_mamba_backward.cpp`**
+
+- موديل صغير عشوائي (B=2, T=5, d=6, d_inner=12, n_heads=3, d_head=4, d_state=3).
+- الـ loss **خطي**: `L = Σ out·c` → `dL/dout` معروف بالظبط، والتدرّجات **كبيرة**
+  فتبقى قابلة للقياس عدديًا.
+- الخطوة (h) بتتبعت مع ضوضاء الـ loss: `h = max(1e-5·scale, 1000·res/|g|)`،
+  و(lineari) بتتبعت مع **Richardson extrapolation** `(4·D(h/2) − D(h))/3` اللي
+  بيلغي خطأ الـ O(h²).
+- المقارنة بتتم بـ **حدود يقيسها القياس نفسه**: الفرق بين خطوتين هو عدم
+  اليقين → الـ probe اللي القياس فيه مش موثوق بيتبعت كـ "غير قابل للقياس" مش
+  كـ فشل.
+
+**النتيجة: كل بارامترات الـ Mamba-2 الـ 9 بتطابق العددي بنسبة < 2.2%**
+(وMost منهم < 0.2%) — أي الـ backward على الـ CPU **صحيح**.
+
+## BUG-16 🔴 — الـ Mamba backward على الـ GPU: تدرّج قنوات C بيستعمل `s_t` بدل `s_{t+1}`
+
+**الموقع:** `cuda/mamba.cu` — `k_mamba_scan_bwd`
+
+**السبب:** في الـ forward:
+
+```
+y_t = C_t · s_{t+1} + D · x_t          (s_{t+1} = الحالة بعد التحديث)
+```
+
+فـ `∂L/∂C_t[j] = dy_t · s_{t+1}[j]`. لكن الـ kernel كان بيكتب:
+
+```cpp
+// cuda/mamba.cu (القديم)
+atomicAdd(&d_brow[C_off + j], dy_val * sh_state[j]);   // ❌ sh_state = s_t
+```
+
+لأن الـ kernel كان بيعيد تشغيل الـ prefix (replay) عشان يوصل لحالة التوكن
+الحالية، والـ replay بيقف عند `s_t` (مش `s_{t+1}`).
+
+**الأثر:** تدرّج قنوات B و C (ومن وراهم كل الـ conv و in_proj) **غلط** على الـ
+GPU — بينما الـ CPU صح. يعني: **التدريب على الـ T4 بيبني موديل مختلف عن اللي
+بيتبني على الـ PC**، والـ loss بينزل ظاهريًا (لأن التدرّج لسه "اتجاه صح"
+تقريبًا) بس الموديل بيتعلّم حاجة غلط.
+
+**الإصلاح:** الـ kernel دلوقتي بيقرأ `s_t` و `s_{t+1}` من **مسار الحالة**
+(per-token) — انظر BUG-18.
+
+## BUG-17 🔴 — الـ Mamba backward على الـ GPU: تفكيك pointer فارغ
+
+**الموقع:** `cuda/mamba.cu` — `mamba2_backward()`
+
+```cpp
+k_mamba_scan<<<rows, block, sh>>>(proj, bc, dt_bias, a_log, D,
+                                  nullptr,   // ❌ state = nullptr
+                                  y_scan, ...);
+```
+
+والـ kernel كان بيعمل:
+
+```cpp
+sh_state[j] = state[base * d_state + j];      // ❌ deref of nullptr
+```
+
+**الأثر:** أول backward على موديل Granite بـ GPU = **illegal memory access**
+(الكيرنل بيموت). يعني: **الـ Mamba backward على الـ GPU ما اشتغلش ولا مرة**.
+
+**الإصلاح:** الـ backward بقى يستعمل كيرنل `k_mamba_scan_traj` الجديد (اللي
+مش بيلمس الـ state أصلاً)، و `k_mamba_scan` بقى يتحقق من `state != nullptr`.
+
+## BUG-18 🔴 (أداء) — الـ Mamba backward على الـ GPU كان O(T²)
+
+**الموقع:** `cuda/mamba.cu` — `k_mamba_scan_bwd` (الحلقة الداخلية)
+
+```cpp
+for (int t = T - 1; t >= 0; --t) {
+    for (int step = 0; step < t; ++step) {   // ❌ replay من الصفر لكل توكن
+        ... sh_state[j] = dA * sh_state[j] + ...;
+    }
+```
+
+**السبب:** الـ backward محتاج حالتين لكل توكن: `s_t` (لتدرّج الـ decay) و
+`s_{t+1}` (لتدرّج قنوات C). الـ kernel كان بيعيد حساب الـ prefix كل مرة.
+
+**الأثر:** عدد تحديثات الحالة = `rows · T²/2 · d_state`. لـ Granite
+(B=1, T=1024, n_heads=48, d_head=64, d_state=128): `3072 · 524288 · 128`
+= **2×10¹⁴** عملية → **ساعات** لكل طبقة لكل خطوة. يعني التدريب على Granite
+**مستحيل** حتى لو صلّحنا الصح.
+
+**الإصلاح:** كيرنل جديد `k_mamba_scan_traj` بيسجّل **مسار الحالة**
+(`traj[row][t][j]`) مرة واحدة، والـ backward بيقرأ منه. الوقت بقى O(T).
+عشان ما نضخّمش الـ VRAM، الصفوف بتت处理的 على دفعات والـ buffer محدود بـ 32 MB
+(الـ GPU فيه 13.9 GB من الموديل).
+
+## BUG-19 🔴 — الـ Mamba states بتتنقل بين خطوات التدريب
+
+**الموقع:** `model/model.cpp` — `Model::forward_body()`
+
+**السبب:** الـ states عايشة في الـ activations (`act.mamba_states`)، والـ trainer
+بيعمل الـ activations **مرة واحدة** وبيعيد استخدامها لكل الخطوات:
+
+```cpp
+// training/trainer.cpp:707
+act_ = model_.make_activations(cfg_.batch_size, cfg_.seq_len, true, cfg_.ce_chunks);
+```
+
+و`forward_mamba_layer` بيقرأ الـ state ويكتب فيه (للـ prefill/decode) بدون ما
+يصفّره.
+
+**الأثر:** أول توكن في الـ batch رقم 5 بيبدأ من **الحالة اللي خلّفها آخر توكن
+في الـ batch رقم 4** → الـ forward مش forward الـ batch، والـ backward (اللي
+بيفترض حالة أول = صفر) مش مطابق للـ forward. **التدريب بيبني موديل غلط**،
+بصمت.
+
+(الـ eval عنده نفس المشكلة: `eval_act_` بيتعاد استخدامه.)
+
+**الإصلاح:** تصفير الـ states في بداية كل `forward_body` (كل تسلسل يبدأ من
+صفر). مسار الـ inference مش متأثر: الـ generator شايل states خاصة بيه وبينادي
+الـ decode توكن بوكن.
+
+## BUG-20 🟡 — `mamba_n_groups > 1` كان مبني بموديل غلط
+
+**الموقع:** `model/model.cpp` — `ModelConfig::validate()`
+
+الـ kernels بتقسم خرج الـ conv لـ `[x | B | C]` ببلوك واحد لكل B و C (`d_state`
+عنصر لكل واحد)، فالـ layout بيفترض `n_groups == 1` (ده حال Granite-4.0).
+قيمة أكبر كانت هتبني موديل غلط من غير أي error.
+
+**الإصلاح:** حارس صريح في الـ validation.
+
+---
+
+## ملاحظة: ليه الـ FD على الموديل الكامل كان "بيفشل" في الـ Mamba
+
+القياس على الموديل الكامل بيقول إن `conv1d.weight` و `dt_bias` و `D` غلط
+بنسب 17–54% — وده **noise مش bug**:
+
+- الـ loss = cross-entropy على 16 توكن ≈ 4.0 → دقّتها في fp32 ≈ 5×10⁻⁷.
+- الخطوة h = 10⁻² → الـ noise على الـ gradient ≈ `5×10⁻⁷/(2×10⁻²)` = 2.5×10⁻⁵.
+- تدرّج `dt_bias` نفسه ≈ 1.4×10⁻⁴ → الـ noise = 18% من الإشارة.
+- وتدرّج `ffn_norm` ≈ 1×10⁻⁵ → الـ noise = **250%** من الإشارة (من غير معنى أصلاً).
+
+عشان كده الـ test الجديد:
+1. بيختار الخطوة من **دقة الـ loss** مش من رقم ثابت،
+2. بيقارن خطوتين (h و h/2) وبيعتبر القياس غير موثوق لما يختلفوا,
+3. والاختبار المعزول (`test_mamba_backward`) بيتحقق من الطبقة لوحدها بـ loss
+   خطي → الإشارة نقية.
+
+نتيجة الاختبار المعزول: **كل الـ 9 بارامترات بتطابق العددي** (< 2.2%).
+ونتيجة اختبار الموديل الكامل (بلا MoE عشان الـ routing يكون ناعم): **كل
+بارامترات الـ Mamba بتطابق بأقل من 0.4%**.

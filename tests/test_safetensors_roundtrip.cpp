@@ -160,7 +160,10 @@ static void test_granite() {
     cfg.num_layers = 4;
     cfg.num_heads = 4;
     cfg.num_kv_heads = 2;
-    cfg.intermediate_size = 8;          // the Granite expert width
+    cfg.intermediate_size = 20;         // NOT the expert width: the Granite
+                                     // "intermediate_size" is the ROUTED
+                                     // expert width, so the two must differ
+                                     // or the round trip cannot see a mix-up
     cfg.max_seq_len = 64;
     cfg.arch = ModelConfig::ArchGranite;
     cfg.layer_types = {0, 1, 0, 1};        // mamba, attention, mamba, attention

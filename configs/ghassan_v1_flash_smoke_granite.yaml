@@ -1,0 +1,93 @@
+# Ghassan v1 Flash - the GRANITE-SHAPED smoke test.
+#
+# The same pipeline as ghassan_v1_flash_smoke.yaml, but with the shape of
+# IBM Granite-4.0-H: the Mamba-2 hybrid (the layers alternate between the
+# Mamba-2 block and the attention), NoPE, the multipliers and the MoE with
+# a shared expert of its own width.
+#
+# Why: the dense smoke test never touches the Mamba-2 backward, and the
+# Mamba-2 backward is the part of the engine that had never run on a GPU
+# (it crashed on a null pointer, used the wrong recurrent state in the C
+# gradient, and was O(T^2)). This recipe runs the WHOLE training path with
+# the Mamba-2 block: forward, backward, the optimizer and the checkpoint.
+#
+# The model is TINY (a few million parameters) so it fits on a T4 with
+# room to spare, but every code path of the hybrid is the real one.
+#
+#   gai_train --config configs/ghassan_v1_flash_smoke_granite.yaml \
+#             --tokenizer <hf-dir> --data <shards>
+
+model:
+  vocab_size: 100352
+  hidden_size: 512
+  num_layers: 4
+  num_heads: 8
+  num_kv_heads: 2
+  intermediate_size: 1024
+  max_seq_len: 512
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  position_embedding: 1          # NoPE (Granite has no positional embedding)
+
+  # ---- the Granite multipliers (the same code path as the checkpoint) ----
+  arch: 1                       # 1 = the Granite hybrid
+  layer_types: "mamba,mamba,mamba,attention"
+  embedding_multiplier: 12.0
+  residual_multiplier: 0.22
+  attention_multiplier: 0.0078125
+  logits_scaling: 6.0
+
+  # ---- the Mamba-2 block (the geometry of Granite-4.0-H) ----
+  mamba_expand: 2               # d_inner = 2 * hidden_size
+  mamba_n_heads: 8
+  mamba_d_head: 128             # n_heads * d_head = d_inner
+  mamba_d_state: 64
+  mamba_n_groups: 1
+  mamba_d_conv: 4
+  mamba_conv_bias: true
+
+  # ---- the MoE (the routed experts + the shared expert of its own width) --
+  use_moe: true
+  num_experts: 8
+  moe_top_k: 2
+  moe_expert_dim: 256
+  moe_shared: true
+  shared_expert_intermediate_size: 512
+  moe_aux_scale: 0.01
+  moe_aux_free: false
+
+tokenizer:
+  path: /kaggle/working/hf/tokenizer.json
+
+training:
+  data_dir: artifacts/shards
+  batch_size: 2
+  seq_len: 256
+  grad_accum: 1
+  max_steps: 20
+  learning_rate: 3.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 5
+  optimizer: lion
+  scheduler: cosine
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.99
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: fp32
+  gemm_fp16: true
+  loss_scale_init: 65536.0
+  loss_scale_window: 2000
+  ce_chunks: 4
+  log_every: 1
+  eval_every: 10
+  eval_batches: 2
+  save_every: 20
+  checkpoint_dir: artifacts/checkpoints/smoke_granite
+  resume: none
+  seed: 42
+  device: auto
+  stage: pretrain
+  resume_mode: exact

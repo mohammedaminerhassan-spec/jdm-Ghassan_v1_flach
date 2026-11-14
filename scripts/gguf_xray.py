@@ -116,8 +116,11 @@ def main():
     if "Ghassan v1 Flash" not in str(desc):
         problems.append("general.description is %r, expected 'Ghassan v1 Flash'" % desc)
     n_params = metadata.get("general.parameter_count")
+    base_model = metadata.get("general.base_model.0.name", "")
+    base_org = metadata.get("general.base_model.0.organization", "")
     print("name           : %s" % name)
     print("description    : %s" % desc)
+    print("base model     : %s%s" % (base_model, (" (%s)" % base_org) if base_org else ""))
     print("parameters     : %s" % n_params)
     print("quantization   : %s" % metadata.get("ghassan.quantization.profile", "?"))
     print("vocab          : %s" % metadata.get("ghassan.vocab_size"))
@@ -141,10 +144,19 @@ def main():
     # The file's metadata VALUES are scanned per-key. The tokenizer vocabulary
     # and the merges are ordinary word lists ('granite' is a plain English
     # word) and are exempt - but every key WE control must be clean.
+    #
+    # EXCEPTION: the provenance keys (general.base_model.*) and the
+    # description. The artifact is a "Ghassan v1 Flash" that is BUILT ON a
+    # Granite model, and it has to say so: the name is the brand, the base
+    # model is the fact. The Granite GEOMETRY (the multipliers, the mamba
+    # dims, the layer kinds) is exported untouched on purpose - a Granite
+    # artifact stays a Granite artifact so it can be fine-tuned as one.
     needle = "granite"
     vocab_hits = []
+    provenance_keys = ("general.base_model.0.name", "general.base_model.0.organization",
+                       "general.description")
     for key, val in metadata.items():
-        if needle in key.lower():
+        if needle in key.lower() and not key.startswith("general.base_model."):
             problems.append("metadata key %r contains the upstream brand" % key)
             continue
         vals = val if isinstance(val, list) else [val]
@@ -153,6 +165,8 @@ def main():
                 continue
             if key in ("tokenizer.ggml.tokens", "tokenizer.ggml.merges"):
                 vocab_hits.append(v)
+            elif key in provenance_keys:
+                print("provenance     : %s = %r" % (key, v))
             else:
                 problems.append("metadata key %r carries the upstream brand: %r"
                                 % (key, v if len(v) < 200 else v[:200] + "..."))

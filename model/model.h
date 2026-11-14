@@ -83,6 +83,17 @@ struct ModelConfig {
     // multipliers.
     enum Arch : u8 { ArchQwen = 0, ArchGranite = 1 } arch = ArchQwen;
 
+    // The identity of the UPSTREAM model this checkpoint came from (the
+    // HuggingFace repo id or the model_type). It is not part of the
+    // architecture (it does not change a single weight), it is the
+    // provenance: the exported artifact says "Ghassan v1 Flash" as its
+    // name, and the base model it is built on (e.g. IBM Granite-4.0-H)
+    // as its base_model metadata. A Granite artifact must stay a Granite
+    // artifact: the geometry, the multipliers and the layer kinds are
+    // exported untouched.
+    std::string base_model;
+    std::string base_org;
+
     // Per-layer kind for ArchGranite: 0 = mamba, 1 = attention. Empty when
     // the architecture is a plain transformer.
     std::vector<int> layer_types;

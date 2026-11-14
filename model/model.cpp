@@ -383,6 +383,14 @@ void ModelConfig::validate() const {
         }
         GAI_CHECK(n_mamba > 0, "granite layer_types declares no mamba layers");
         GAI_CHECK(n_attn > 0, "granite layer_types declares no attention layers");
+        // The Mamba-2 kernels split the conv output as [x | B | C] with the
+        // B and C blocks of d_state elements each, so the number of groups
+        // must be 1 (Granite-4.0 is). A larger value would need a different
+        // layout in the conv output, not just a bigger buffer.
+        GAI_CHECK(mamba_n_groups == 1,
+                  strfmt("granite: mamba_n_groups must be 1 (the conv output layout is "
+                         "[x | B | C] with one B and one C block), got %d",
+                         mamba_n_groups));
     }
     // Attention kernel shared memory limit (T4: 48KB). The flash-style kernel
     // uses shared memory: sQ[hd] + sK[KV_TILE*hd] + sV[KV_TILE*hd] + sS[KV_TILE] + sAcc[hd]
@@ -441,6 +449,16 @@ ModelConfig ModelConfig::from_config(const Config& c, const std::string& p) {
     m.moe_top_k         = get_int_checked("moe_top_k", m.moe_top_k);
     m.moe_expert_dim    = get_int_checked("moe_expert_dim", m.moe_expert_dim);
     m.moe_shared        = c.get_bool(key("moe_shared"), m.moe_shared);
+    // The shared expert's OWN width. Granite-4 gives it 1024 while the
+    // routed experts use 512, so a recipe that does not set this builds a
+    // model whose shared expert does NOT match the Granite checkpoint
+    // (the loader would then refuse the weights: a size mismatch).
+    m.shared_expert_intermediate_size =
+        get_int_checked0("shared_expert_intermediate_size",
+                         m.shared_expert_intermediate_size);
+    // A shared expert width means a shared expert (the HF loader keys on
+    // the presence of the key, not on a separate flag).
+    if (m.shared_expert_intermediate_size > 0) m.moe_shared = true;
     m.moe_aux_scale     = c.get_f32(key("moe_aux_scale"), m.moe_aux_scale);
     m.moe_jitter        = c.get_f32(key("moe_jitter"), m.moe_jitter);
     m.moe_allow_dense   = c.get_bool(key("moe_allow_dense"), m.moe_allow_dense);
@@ -2033,6 +2051,19 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
                             : (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale_local(cfg_);
     const bool  train = act.with_grad;
     Device dev = device_;
+    // The Mamba-2 recurrent states start at ZERO for every sequence.
+    //
+    // The states live in the activations, and the activations are REUSED
+    // across the training steps (the trainer allocates them once and keeps
+    // them for the whole run). Without this reset the state left by the
+    // last token of the previous batch would start the next one: the
+    // forward would not be the forward of the batch any more, and the
+    // backward (which assumes a zero initial state) would not match it.
+    // The inference path does not use these states: the generator carries
+    // its own, token by token (the prefill of a hybrid model is a decode).
+    for (Tensor& st : act.mamba_states) {
+        if (st.defined() && st.numel() > 0) ops::zero(dev, st.f32(), st.numel());
+    }
     if (fp16_weight_cache_ && fp16_weights_dirty_) {
         for (Parameter* p : params_) {
             if (!p->fp16_cache.defined()) continue;

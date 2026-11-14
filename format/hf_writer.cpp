@@ -376,7 +376,24 @@ std::string hf_config_json(const ModelConfig& cfg, const std::string& model_name
     j.set("num_hidden_layers", Json::integer(cfg.num_layers));
     j.set("num_attention_heads", Json::integer(cfg.num_heads));
     j.set("num_key_value_heads", Json::integer(cfg.num_kv_heads));
-    j.set("intermediate_size", Json::integer(cfg.intermediate_size));
+    // The "intermediate_size" of a checkpoint is the width of the expert the
+    // loader reads it as:
+    //   * Granite: the ROUTED expert width (the shared one has its own
+    //     key, "shared_intermediate_size"),
+    //   * a Qwen-style MoE: the SHARED expert width (the routed one is
+    //     "moe_intermediate_size"),
+    //   * a dense model: the FFN width.
+    // Writing the dense FFN width here broke the round trip: the reloaded
+    // model expected 8 experts of 1024 and found 8 experts of 256.
+    int inter = cfg.intermediate_size;
+    if (cfg.arch == ModelConfig::ArchGranite) {
+        inter = cfg.moe_expert_dim;
+    } else if (cfg.use_moe) {
+        inter = cfg.shared_expert_intermediate_size > 0
+                    ? cfg.shared_expert_intermediate_size
+                    : cfg.moe_expert_dim;
+    }
+    j.set("intermediate_size", Json::integer(inter));
     j.set("vocab_size", Json::integer(cfg.vocab_size));
     j.set("max_position_embeddings", Json::integer(cfg.max_seq_len));
     j.set("rms_norm_eps", Json::number(cfg.rms_eps));
@@ -411,7 +428,12 @@ std::string hf_config_json(const ModelConfig& cfg, const std::string& model_name
     if (cfg.arch == ModelConfig::ArchGranite) {
         j.set("num_local_experts", Json::integer(cfg.num_experts));
         j.set("num_experts_per_tok", Json::integer(cfg.moe_top_k));
-        j.set("shared_intermediate_size", Json::integer(cfg.shared_expert_intermediate_size));
+        // The EFFECTIVE shared expert width (shared_width() falls back to the
+        // routed width when it is not set). Writing the raw field would
+        // write a zero here and the reloaded model would lose its shared
+        // expert (the loader keys "the shared expert exists" on the
+        // PRESENCE of this key).
+        j.set("shared_intermediate_size", Json::integer(cfg.shared_width()));
         j.set("embedding_multiplier", Json::number(cfg.embedding_multiplier));
         j.set("residual_multiplier", Json::number(cfg.residual_multiplier));
         j.set("attention_multiplier", Json::number(cfg.attention_multiplier));

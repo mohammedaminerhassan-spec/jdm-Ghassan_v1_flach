@@ -172,10 +172,51 @@ static void test_lora() {
     run_case(cfg, "lora", 2, 64);
 }
 
+// The IBM Granite-4.0 hybrid: the Mamba-2 block, the NoPE attention and
+// the MoE with a shared expert of its own width.
+//
+// This is the case the audit's BUG-16/17/18 were about: the CUDA Mamba-2
+// backward used s_t where the forward used s_{t+1} (so the C channels got
+// the wrong gradient), it dereferenced a null state pointer (an illegal
+// memory access on the first backward) and it replayed the whole prefix
+// for every token (O(T^2)).
+static void test_granite_hybrid() {
+    ModelConfig cfg;
+    cfg.vocab_size = 128;
+    cfg.hidden_size = 64;
+    cfg.num_layers = 2;
+    cfg.num_heads = 4;
+    cfg.num_kv_heads = 2;
+    cfg.intermediate_size = 96;
+    cfg.max_seq_len = 64;
+    cfg.tie_embeddings = true;
+    cfg.arch = ModelConfig::ArchGranite;
+    cfg.layer_types = {0, 1};          // mamba, then attention
+    cfg.use_moe = true;
+    cfg.num_experts = 4;
+    cfg.moe_top_k = 2;
+    cfg.moe_expert_dim = 32;
+    cfg.moe_shared = true;
+    cfg.shared_expert_intermediate_size = 48;
+    cfg.position_embedding = 1;        // NoPE
+    cfg.embedding_multiplier = 4.0f;
+    cfg.residual_multiplier = 0.5f;
+    cfg.attention_multiplier = 0.0f;   // 0 => 1/sqrt(head_dim)
+    cfg.logits_scaling = 2.0f;
+    cfg.mamba_n_heads = 4;
+    cfg.mamba_d_head = 8;
+    cfg.mamba_d_state = 16;
+    cfg.mamba_n_groups = 1;
+    cfg.mamba_d_conv = 4;
+    cfg.mamba_expand = 2;
+    run_case(cfg, "granite", 2, 16);
+}
+
 int main() {
     test_dense();
     test_moe();
     test_lora();
+    test_granite_hybrid();
     if (g_failures == 0) {
         std::printf("test_cuda_parity: OK\n");
         return 0;

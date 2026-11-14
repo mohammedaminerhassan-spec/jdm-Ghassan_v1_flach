@@ -538,6 +538,24 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
     // and the layer kind is declared per layer in `layer_types`.
     const std::string model_type =
         j.has("model_type") ? j.at("model_type").as_string("") : "";
+    // The provenance of the checkpoint: the repo it came from ("_name_or_path"
+    // is written by the training scripts) or, failing that, the model family.
+    // It is what the exported artifact declares as its base model, so that a
+    // Granite model stays recognisable as a Granite model after the export
+    // (the name of the artifact is "Ghassan v1 Flash", the base is Granite).
+    {
+        const std::string nop =
+            j.has("_name_or_path") ? j.at("_name_or_path").as_string("") : "";
+        if (!nop.empty()) {
+            cfg_.base_model = nop;
+        } else if (model_type == "granitemoehybrid") {
+            cfg_.base_model = "ibm-granite/granite-4.0-h";
+        } else if (!model_type.empty()) {
+            cfg_.base_model = model_type;
+        }
+        if (cfg_.arch == ModelConfig::ArchGranite || model_type == "granitemoehybrid")
+            cfg_.base_org = "IBM";
+    }
     const i64 local_experts = num("num_local_experts", 0);
     if (model_type == "granitemoehybrid" || local_experts > 0) {
         cfg_.arch = ModelConfig::ArchGranite;

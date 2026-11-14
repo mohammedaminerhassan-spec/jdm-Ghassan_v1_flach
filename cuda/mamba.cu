@@ -159,9 +159,15 @@ __global__ void k_mamba_scan(const float* __restrict__ proj,
     const int i     = rem - h * d_head;
 
     // The state is CARRIED between calls (the prefill continues where the
-    // previous chunk stopped): it must be read, not zeroed.
+    // previous chunk stopped): it must be read, not zeroed. A null state
+    // means "no state to carry" (the backward's recompute): the scan then
+    // starts from zero.
     const int base = (b * n_heads + h) * d_head + i;
-    for (int j = lane; j < d_state; j += nthr) sh_state[j] = state[base * d_state + j];
+    if (state) {
+        for (int j = lane; j < d_state; j += nthr) sh_state[j] = state[base * d_state + j];
+    } else {
+        for (int j = lane; j < d_state; j += nthr) sh_state[j] = 0.0f;
+    }
     __syncthreads();
 
     const float a       = -expf(alog[h]);
@@ -202,8 +208,10 @@ __global__ void k_mamba_scan(const float* __restrict__ proj,
     }
 
     // Write the final state back.
-    for (int j = lane; j < d_state; j += nthr)
-        state[base * d_state + j] = sh_state[j];
+    if (state) {
+        for (int j = lane; j < d_state; j += nthr)
+            state[base * d_state + j] = sh_state[j];
+    }
 }
 
 // ---------------------------------------------------------------- gated norm
@@ -410,25 +418,107 @@ __global__ void k_mamba_gated_norm_bwd(const float* __restrict__ dy_norm,
     }
 }
 
+// The forward scan that RECORDS the state trajectory.
+//
+//   traj [rows_batch, T+1, d_state]   traj[l][0] = 0 (the state before the
+//   first token), traj[l][t+1] = the state after the token t.
+//
+// The backward needs two states of every token: s_t (the gradient of the
+// decay dA) and s_{t+1} (the gradient of the C channels, because
+// y_t = C_t . s_{t+1}). The old kernel replayed the whole prefix for
+// every token - O(T^2) per row, which is 3.2e11 state updates for one
+// Granite layer at T=1024 (hours per step). Recording the trajectory once
+// makes the backward O(T) and lets it use s_{t+1} exactly.
+//
+// The state starts at zero: the training sequence starts from zero (the
+// model resets the recurrent states before every sequence) and the
+// backward assumes the same.
+__global__ void k_mamba_scan_traj(const float* __restrict__ proj,
+                                  const float* __restrict__ bc,
+                                  const float* __restrict__ dtw,   // [n_heads]
+                                  const float* __restrict__ alog,  // [n_heads]
+                                  const float* __restrict__ Dv,    // [n_heads]
+                                  float* __restrict__ traj,        // [rows_batch, T+1, d_state]
+                                  float* __restrict__ y,           // [B, T, d_inner]
+                                  int B, int T, int n_heads, int d_head, int d_state,
+                                  int d_inner, int conv_dim, int proj_size,
+                                  int row_offset) {
+    extern __shared__ float sh_state[];   // [d_state]
+    __shared__ float sh_red[32];
+    const int lrow = blockIdx.x;          // the row inside the batch
+    const int row  = lrow + row_offset;   // the global row
+    const int lane = threadIdx.x;
+    const int nthr = blockDim.x;
+
+    const int inner = n_heads * d_head;
+    const int b     = row / inner;
+    const int rem   = row - b * inner;
+    const int h     = rem / d_head;
+    const int i     = rem - h * d_head;
+
+    const float a       = -expf(alog[h]);
+    const float dt_bias = dtw[h];
+    const float dskip   = Dv[h];
+    const int   x_off   = h * d_head + i;
+    const int   B_off   = d_inner;
+    const int   C_off   = d_inner + d_state;
+
+    float* mytraj = traj + (size_t)lrow * (size_t)(T + 1) * d_state;
+
+    for (int j = lane; j < d_state; j += nthr) { sh_state[j] = 0.0f; mytraj[j] = 0.0f; }
+    __syncthreads();
+
+    for (int t = 0; t < T; ++t) {
+        const float* prow = proj + (size_t(b) * T + t) * proj_size;
+        const float* brow = bc   + (size_t(b) * T + t) * conv_dim;
+
+        const float dt_in  = prow[proj_size - n_heads + h];
+        const float dt_val = (dt_in + dt_bias > 20.0f) ? (dt_in + dt_bias)
+                                                      : log1pf(expf(dt_in + dt_bias));
+        const float dA = expf(a * dt_val);
+        const float xv = brow[x_off];
+
+        float acc = 0.0f;
+        for (int j = lane; j < d_state; j += nthr) {
+            const float bj = brow[B_off + j];
+            float* sj = sh_state + j;
+            *sj = dA * (*sj) + (dt_val * bj) * xv;
+            acc += brow[C_off + j] * (*sj);
+        }
+        __syncthreads();
+        // The state after this token: s_{t+1}.
+        for (int j = lane; j < d_state; j += nthr)
+            mytraj[(size_t)(t + 1) * d_state + j] = sh_state[j];
+        __syncthreads();
+
+        acc = block_reduce_sum(acc, sh_red, lane, nthr);
+        if (lane == 0)
+            y[(size_t(b) * T + t) * d_inner + x_off] = acc + dskip * xv;
+        __syncthreads();
+    }
+}
+
 __global__ void k_mamba_scan_bwd(const float* __restrict__ proj,
                                  const float* __restrict__ bc,
                                  const float* __restrict__ dy_scan,
                                  const float* __restrict__ dtw,
                                  const float* __restrict__ alog,
                                  const float* __restrict__ Dv,
+                                 const float* __restrict__ traj,
                                  float* __restrict__ dbc,
                                  float* __restrict__ ddt_raw,
                                  float* __restrict__ dD,
                                  float* __restrict__ da_log,
                                  float* __restrict__ ddt_bias,
                                  int B, int T, int n_heads, int d_head, int d_state,
-                                 int d_inner, int conv_dim, int proj_size) {
+                                 int d_inner, int conv_dim, int proj_size,
+                                 int row_offset) {
     extern __shared__ float sh_mem[];
-    float* sh_state = sh_mem;
-    float* sh_ds    = sh_mem + d_state;
-    float* sh_red   = sh_mem + 2 * d_state;
+    float* sh_ds  = sh_mem;              // [d_state]
+    float* sh_red = sh_mem + d_state;    // [32]
 
-    const int row  = blockIdx.x;
+    const int lrow = blockIdx.x;         // the row inside the batch
+    const int row  = lrow + row_offset;  // the global row
     const int lane = threadIdx.x;
     const int nthr = blockDim.x;
 
@@ -445,29 +535,15 @@ __global__ void k_mamba_scan_bwd(const float* __restrict__ proj,
     const int   B_off     = d_inner;
     const int   C_off     = d_inner + d_state;
 
+    const float* mytraj = traj + (size_t)lrow * (size_t)(T + 1) * d_state;
+
+    // sh_ds holds the part of the state gradient that comes from the
+    // future (the y contribution of the previous token is added at every
+    // step). It starts at zero: the last token has no future.
     for (int j = lane; j < d_state; j += nthr) sh_ds[j] = 0.0f;
     __syncthreads();
 
-    // Replay forward and backward per token:
-    // To minimize memory, we do backward with sequential state replay
     for (int t = T - 1; t >= 0; --t) {
-        // Forward recompute from 0 to t for this token's state
-        for (int j = lane; j < d_state; j += nthr) sh_state[j] = 0.0f;
-        __syncthreads();
-        for (int step = 0; step < t; ++step) {
-            const float* prow = proj + (size_t(b) * T + step) * proj_size;
-            const float* brow = bc   + (size_t(b) * T + step) * conv_dim;
-            const float dt_in = prow[proj_size - n_heads + h];
-            const float dt_val = (dt_in + dt_bias_v > 20.0f) ? (dt_in + dt_bias_v)
-                                                            : log1pf(expf(dt_in + dt_bias_v));
-            const float dA = expf(a_val * dt_val);
-            const float xv = brow[x_off];
-            for (int j = lane; j < d_state; j += nthr) {
-                sh_state[j] = dA * sh_state[j] + (dt_val * brow[B_off + j]) * xv;
-            }
-            __syncthreads();
-        }
-
         const size_t tok_idx = size_t(b) * T + t;
         const float* prow = proj + tok_idx * proj_size;
         const float* brow = bc   + tok_idx * conv_dim;
@@ -481,6 +557,13 @@ __global__ void k_mamba_scan_bwd(const float* __restrict__ proj,
         const float dA = expf(a_val * dt_val);
         const float xv = brow[x_off];
 
+        // s_t (the state BEFORE this token) and s_{t+1} (the state after
+        // it). The C channels multiply s_{t+1} in the forward, so their
+        // gradient uses s_{t+1}; the decay dA multiplies s_t, so its
+        // gradient uses s_t. The old kernel used s_t for both.
+        const float* s_prev = mytraj + (size_t)t * d_state;
+        const float* s_curr = mytraj + (size_t)(t + 1) * d_state;
+
         if (dD && lane == 0) atomicAdd(&dD[h], dy_val * xv);
         float dx_val = dy_val * dskip;
 
@@ -491,10 +574,10 @@ __global__ void k_mamba_scan_bwd(const float* __restrict__ proj,
             const float Cj = brow[C_off + j];
             const float Bj = brow[B_off + j];
 
-            atomicAdd(&d_brow[C_off + j], dy_val * sh_state[j]);
+            atomicAdd(&d_brow[C_off + j], dy_val * s_curr[j]);
 
             const float total_ds = dy_val * Cj + sh_ds[j];
-            local_d_dA += total_ds * sh_state[j];
+            local_d_dA += total_ds * s_prev[j];
             local_d_dt += total_ds * Bj * xv;
 
             atomicAdd(&d_brow[B_off + j], total_ds * (dt_val * xv));
@@ -612,8 +695,23 @@ void mamba2_backward(const float* x,
     // Transient workspace for backward:
     // proj [N, proj_size] + bc [N, conv_dim] + y_scan [N, d_inner] +
     // dy_norm [N, d_inner] + dy_scan [N, d_inner] + dgate [N, d_inner] +
-    // dbc [N, conv_dim] + ddt_raw [N, n_heads] + dproj_bc [N, conv_dim] + dproj [N, proj_size]
-    const size_t total_floats = n_tok * (size_t(proj_size) * 2 + size_t(conv_dim) * 3 + size_t(d_inner) * 4 + n_heads) + 256;
+    // dbc [N, conv_dim] + ddt_raw [N, n_heads] + dproj_bc [N, conv_dim] +
+    // dproj [N, proj_size]
+    //
+    // Plus the TRAJECTORY of the recurrent state: [rows_batch, T+1, d_state].
+    // The whole trajectory of Granite (B=1, T=1024) would be 1.6 GB, so the
+    // rows are processed in batches and the trajectory buffer is bounded
+    // (32 MB). The batch is big enough to keep the GPU busy (a few dozen
+    // blocks per launch).
+    const int rows = B * n_heads * d_head;
+    const size_t per_row_traj = (size_t)(T + 1) * d_state;
+    const size_t traj_budget = 8u << 20;          // 8M floats = 32 MB
+    int rows_batch = (int)(traj_budget / (per_row_traj ? per_row_traj : 1));
+    if (rows_batch < 1) rows_batch = 1;
+    if (rows_batch > rows) rows_batch = rows;
+    const size_t traj_floats = (size_t)rows_batch * per_row_traj;
+
+    const size_t total_floats = n_tok * (size_t(proj_size) * 2 + size_t(conv_dim) * 3 + size_t(d_inner) * 4 + n_heads) + traj_floats + 256;
     float* ws = mamba_workspace(total_floats);
 
     float* proj     = ws;
@@ -626,6 +724,7 @@ void mamba2_backward(const float* x,
     float* ddt_raw  = dbc      + n_tok * size_t(conv_dim);
     float* dproj_bc = ddt_raw  + n_tok * size_t(n_heads);
     float* dproj    = dproj_bc + n_tok * size_t(conv_dim);
+    float* traj     = dproj    + n_tok * size_t(proj_size);
 
     // Forward recompute
     linear_forward(x, w_in, proj, B * T, d, proj_size);
@@ -638,13 +737,18 @@ void mamba2_backward(const float* x,
         CU_MAMBA_CHECK(cudaGetLastError());
     }
     {
-        const int rows = B * n_heads * d_head;
+        // The forward scan, recording the state trajectory (and the scan
+        // output the gated norm needs).
         const int block = 256;
         const size_t sh = sizeof(float) * d_state;
-        k_mamba_scan<<<rows, block, sh>>>(proj, bc, dt_bias, a_log, D,
-                                          nullptr, y_scan, B, T, n_heads, d_head,
-                                          d_state, d_inner, conv_dim, proj_size);
-        CU_MAMBA_CHECK(cudaGetLastError());
+        for (int r0 = 0; r0 < rows; r0 += rows_batch) {
+            const int nb = (rows - r0 < rows_batch) ? (rows - r0) : rows_batch;
+            k_mamba_scan_traj<<<nb, block, sh>>>(proj, bc, dt_bias, a_log, D,
+                                                 traj, y_scan, B, T, n_heads, d_head,
+                                                 d_state, d_inner, conv_dim, proj_size,
+                                                 r0);
+            CU_MAMBA_CHECK(cudaGetLastError());
+        }
     }
 
     // B1) Out projection backward
@@ -664,14 +768,16 @@ void mamba2_backward(const float* x,
     CU_MAMBA_CHECK(cudaMemset(dbc, 0, sizeof(float) * n_tok * conv_dim));
     CU_MAMBA_CHECK(cudaMemset(ddt_raw, 0, sizeof(float) * n_tok * n_heads));
     {
-        const int rows = B * n_heads * d_head;
         const int block = 256;
-        const size_t sh = sizeof(float) * (2 * d_state + 32);
-        k_mamba_scan_bwd<<<rows, block, sh>>>(proj, bc, dy_scan, dt_bias, a_log, D,
-                                              dbc, ddt_raw, dD, da_log, ddt_bias,
-                                              B, T, n_heads, d_head, d_state,
-                                              d_inner, conv_dim, proj_size);
-        CU_MAMBA_CHECK(cudaGetLastError());
+        const size_t sh = sizeof(float) * (d_state + 32);
+        for (int r0 = 0; r0 < rows; r0 += rows_batch) {
+            const int nb = (rows - r0 < rows_batch) ? (rows - r0) : rows_batch;
+            k_mamba_scan_bwd<<<nb, block, sh>>>(proj, bc, dy_scan, dt_bias, a_log, D,
+                                                traj, dbc, ddt_raw, dD, da_log, ddt_bias,
+                                                B, T, n_heads, d_head, d_state,
+                                                d_inner, conv_dim, proj_size, r0);
+            CU_MAMBA_CHECK(cudaGetLastError());
+        }
     }
 
     // B4) Conv1d backward

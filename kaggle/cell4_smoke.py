@@ -104,9 +104,30 @@ rc, out = run([
 if rc != 0:
     raise SystemExit("the smoke training failed")
 
-# ---- 5. did the loss go down? ----------------------------------------------
+# ---- 5. the Granite-shaped smoke training ----------------------------------
+# The dense smoke test above never touches the Mamba-2 block. This one runs
+# the whole Granite-4.0 shape (the Mamba-2 hybrid + the MoE with a shared
+# expert + the multipliers) on the GPU: forward, backward, optimizer and
+# checkpoint. The Mamba-2 backward is the part of the engine that had never
+# run on a GPU (it crashed on a null pointer and used the wrong recurrent
+# state), so it has to be exercised here, not only in the parity test.
+rc, out_g = run([
+    str(GAIT),
+    "--config", str(SRC / "configs" / "ghassan_v1_flash_smoke_granite.yaml"),
+    "--tokenizer", str(HF / "tokenizer.json"),
+    "--data", str(WORK / "artifacts" / "shards"),
+    "--checkpoint-dir", str(WORK / "artifacts" / "checkpoints" / "smoke_granite"),
+    "--max-steps", "20",
+    "--warmup", "5",
+    "--log-every", "1",
+    "--resume", "none",
+], env=env, tail=12000)
+if rc != 0:
+    raise SystemExit("the Granite-shaped smoke training failed (the Mamba-2 path)")
+
+# ---- 6. did the loss go down? ----------------------------------------------
 losses = [float(m) for m in re.findall(r"loss\s+([0-9]+\.[0-9]+)", out)]
-print("\nthe loss curve:", losses)
+print("\nthe loss curve (dense):", losses)
 if len(losses) >= 4:
     first = sum(losses[:2]) / 2.0
     last = sum(losses[-2:]) / 2.0
@@ -114,5 +135,18 @@ if len(losses) >= 4:
     if last >= first:
         raise SystemExit("the loss did NOT go down: the gradients are not reaching the weights")
     print("  the loss is going down: the backward is alive")
+else:
+    print("  (not enough loss lines to judge)")
+
+# The same for the Granite shape (the Mamba-2 path).
+glosses = [float(m) for m in re.findall(r"loss\s+([0-9]+\.[0-9]+)", out_g)]
+print("\nthe loss curve (granite hybrid):", glosses)
+if len(glosses) >= 4:
+    gfirst = sum(glosses[:2]) / 2.0
+    glast = sum(glosses[-2:]) / 2.0
+    print(f"  first {gfirst:.4f} -> last {glast:.4f}")
+    if glast >= gfirst:
+        raise SystemExit("the Granite-shaped loss did NOT go down: the Mamba-2 backward is broken")
+    print("  the loss is going down: the Mamba-2 backward is alive")
 else:
     print("  (not enough loss lines to judge)")

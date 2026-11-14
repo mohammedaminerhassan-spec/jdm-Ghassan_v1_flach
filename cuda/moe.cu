@@ -577,6 +577,11 @@ __global__ void k_router_dl(const float* x, const float* router_w,
             if (e >= 0 && e < ne) sum_p += pt[e];
         }
         float inv_S = sum_p > 1e-8f ? (1.0f / sum_p) : 0.0f;
+        // dL/dp_{e_k} = (g_k - SUM_j g_j*w_j) / S   for the selected experts.
+        //
+        // w_j = p_{e_j}/S and S = SUM_j p_{e_j}, so
+        //     dw_j/dp_{e_k} = delta_jk/S - w_j/S
+        // and the sum over j gives (g_k - SUM_j g_j*w_j)/S.
         float bar_g = 0.0f;
         for (int k = 0; k < K; ++k) {
             int e = idx[t * K + k];
