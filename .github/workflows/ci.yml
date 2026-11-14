@@ -78,6 +78,18 @@ jobs:
         run: |
           ./build-asan/bin/ghassan-ai info --model "granite-documentation/granit filles confiques" --config-only
 
+  linux-cuda:
+    name: linux / cuda (compile only)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The CUDA sources compile
+        # No GPU needed: this catches the typos and the type errors in the
+        # .cu files, which no CPU test can reach (the Mamba-2 backward had
+        # three bugs and a compile error that only nvcc could see).
+        run: bash scripts/check_cuda_compile.sh
+
   windows-msvc:
     name: windows / msvc
     runs-on: windows-2022

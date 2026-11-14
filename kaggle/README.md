@@ -88,24 +88,50 @@ os.environ["HF_PUBLIC"]   = "0"
 
 ### الخلية 4 (الـ smoke) — الأهم
 تشغّل:
-1. `ctest` → 4 اختبارات:
+1. `ctest` → 7 اختبارات:
    - `test_granite_compat` → **يطابق هندسة Granite-4.0-H بالـ element**
      (عدد البارامترات = عدد الـ checkpoint بالظبط = 6,939,037,248).
      اقرأ `GRANITE_COMPAT.md` — فيها مقارنة سطر بسطر مع مرجع transformers 4.56.
-   - `test_gradient_check` → finite-difference على التدرّجات.
-   - `test_cuda_parity` → **مقارنة تدرّجات CPU مع CUDA** (ده اللي بيثبت إن
-     تقطيع الـ GEMM صح على الـ GPU).
+   - `test_gradient_check` → finite-difference على التدرّجات (dense + MoE +
+     Granite + Granite بلا MoE عشان الـ routing المتقطع ما يفسدش القياس).
+   - `test_mamba_backward` → **طبقة الـ Mamba-2 لوحدها** (loss خطي → إشارة
+     نقية): كل بارامتر من بارامتراتها الـ 9 بيتقابل مع العددي.
+   - `test_cuda_parity` → **مقارنة تدرّجات CPU مع CUDA** (فيها حالة Granite
+     هجين: دي اللي بتثبت إن الـ backward بتاع الـ Mamba صح على الـ GPU).
    - `test_safetensors_roundtrip` → الكتابة والقراءة والمقارنة.
+   - `test_gguf_eos` / `test_gguf_quant` → الـ GGUF.
 2. `test_cuda_parity` → **مقارنة تدرّجات CPU مع CUDA**. دي اللي بتثبت إن
    التقطيع صح على الـ GPU. لو يفشل: الـ GPU بتحسب غير الـ CPU ✗.
-3. 20 خطوة تدريب + **فحص إن الـ loss نزل**. لو الـ loss ثابت → الـ gradients
-   مش بيوصلوا للـ weights.
+3. **20 خطوة تدريب على موديل dense** + **فحص إن الـ loss نزل**.
+4. **20 خطوة تدريب على موديل Granite shape** (Mamba-2 + MoE + الـ
+   multipliers، `configs/ghassan_v1_flash_smoke_granite.yaml`) + فحص إن الـ
+   loss نزل — دي_cell الـ Mamba-2 path على الـ GPU.
 
 ### الخلية 5 (التصدير)
 - `ghassan-ai export --format safetensors` → بيكتب `model.safetensors` +
   `config.json` + ملفات الـ tokenizer.
+- الـ `config.json` بيطلع **Granite-compatible بالظبط** (الـ `model_type` =
+  `granitemoehybrid`، الـ `layer_types`، الـ `intermediate_size` = عرض الـ
+  routed expert، الـ `shared_intermediate_size` = عرض الـ shared expert،
+  الـ multipliers، الـ NoPE) → فالموديل بيفتح تاني في أي Granite loader.
 - **ثم** `ghassan-ai info --model <out>` → بيثبت إن المحرك بيقرأ اللي كتبه
   (نفس مسار الكود اللي المستخدم هيشغله بعد الـ clone).
+
+### الـ GGUF (الـ deliverable)
+```python
+!{WORK}/build/bin/ghassan-ai quantize --model {HF} --out {WORK}/ghassan-v1-flash.gguf \
+    --profile fp16 --model-name "Ghassan v1 Flash" --compat native
+```
+الـ metadata بتبقى:
+- `general.name` = **"Ghassan v1 Flash"** (البراند بتاعك)
+- `general.base_model.0.name` = **`ibm-granite/granite-4.0-h`** (إنه مبني
+  على Granite — عشان يفضل معروف إنه Granite لما تفينتунه بعدين)
+- `general.description` = "Ghassan v1 Flash - based on ibm-granite/granite-4.0-h"
+- هندسة Granite كما هي (الـ hybrid، الـ mamba geometry، الـ layer types،
+  الـ multipliers) — **ما اتغيرش حاجة**.
+
+`scripts/gguf_xray.py` بيتحقق من كل ده (وبيقولك لو الـ brand leaks في أي
+مفتاح تاني).
 
 ---
 

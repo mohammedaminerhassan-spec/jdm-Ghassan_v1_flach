@@ -24,6 +24,8 @@
 | BUG-18 | **جديد**: الـ Mamba backward على الـ GPU كان O(T²) (replay لكل توكن) | حرجة (أداء) | `cuda/mamba.cu` | اتصلّح |
 | BUG-19 | **جديد**: الـ Mamba states بتتنقل بين خطوات التدريب (مش بتتصفّر) | حرجة | `model/model.cpp` | اتصلّح |
 | BUG-20 | **جديد**: `mamba_n_groups > 1` كان بيتبني بموديل غلط (layout الـ B/C) | متوسطة | `model/model.cpp` | اتصلّح (حارس) |
+| BUG-21 | **جديد**: الـ Mamba backward على الـ GPU بيمرّر `nullptr` لتدرّج الـ out projection | حرجة | `cuda/mamba.cu` | اتصلّح |
+| BUG-22 | **جديد**: خطأ ترجمة في `cuda/attention.cu` (`ldbB` بدل `ldaB`) — الـ build على Kaggle كان هيقع | حرجة | `cuda/attention.cu` | اتصلّح |
 
 **الاختبارات الجديدة** (الـ `CMakeLists.txt` كان بيبني `tests/test_*.cpp` من زمان والمجلد كان فاضي):
 
@@ -950,6 +952,60 @@ act_ = model_.make_activations(cfg_.batch_size, cfg_.seq_len, true, cfg_.ce_chun
 قيمة أكبر كانت هتبني موديل غلط من غير أي error.
 
 **الإصلاح:** حارس صريح في الـ validation.
+
+## BUG-22 🔴 — خطأ ترجمة في `cuda/attention.cu`: الـ build على الـ GPU كان هيقع
+
+**الموقع:** `cuda/attention.cu` — `attn_sbgemm()` (سطر 151)
+
+```cpp
+if (tb) { if (ldbB < k_chunk) k_chunk = ldbB; }   // ❌ ldbB مش معرّف
+else     { if (ldbB < m_chunk) m_chunk = ldbB; }
+```
+
+البارامتر اسمه **`ldaB`** (الـ leading dimension بتاع الـ B بتاع المحرّك) —
+`ldbB` متغيّر مش موجود أصلاً.
+
+**السبب:** السطر ده جزء من إصلاح BUG-03 (تقطيع الـ GEMM). الـ CPU بيبني
+دايماً، والـ `.cu` ملف **ما بيترجمش** على أي جهاز فيه nvcc → الخطأ فضل
+مخفي من غير ما حد يحس.
+
+**الأثر:** **أول خلية build على Kaggle كانت هتفشل** (cell2) →.Flow كله واقف.
+وBUG-03 نفسه (تقطيع الـ GEMM، اللي بيخلي cuBLAS يقبل الـ LoRA والم muon على
+الـ GPU) مكانش هتوصل for execution أصلاً.
+
+**الإصلاح:** `ldbB` → `ldaB` ✓.
+
+**وده اللي خلّى الفحص مهم:** `scripts/check_cuda_compile.sh` (جديد) بيترجم كل
+ملفات `.cu` **من غير GPU**، والـ CI بقى فيه job بيشغّله. أي typo في الـ
+`.cu` files هيتكشّف في الـ CI بدل ما يوصل Kaggle.
+
+> درس: الملف اللي ما بيترجمش محلياً هو Blind spot. الحل: **ترجمة بدون GPU**
+> (ومحتاجة CUDA ≥ 12.5 عشان `cublasGemmGroupedBatchedEx`).
+
+
+
+**الموقع:** `cuda/mamba.cu` — `mamba2_backward()`
+
+```cpp
+// القديم
+linear_backward(nullptr, w_out, dout, dy_norm, dw_out, B * T, d_inner, d);
+```
+
+و`linear_backward` في الـ CUDA بيحسب:
+
+```cpp
+if (dw) gemm(true, false, N, K, M, 1.0f, dy, N, x, K, 1.0f, dw, K);   // x = nullptr
+```
+
+يعني الـ GEMM كان هيقرأ العنوان صفر → **illegal memory access**. الـ CPU بيعدّ
+نفس الـ y_norm (خرج الـ gated norm) وبي passّيه ✓.
+
+**الأثر:** الـ backward بتاع الـ Mamba على الـ GPU كان **بينهار** (ما كانش
+بيوصل حتى لتدرّج الـ out projection). يعني: الـ Mamba backward على الـ GPU
+**ما اشتغلش ولا مرة** — والمرجع في commit `638e302` كان بيقول غير كده.
+
+**الإصلاح:** الـ backward بقى يعيد حساب خرج الـ gated norm (بنفس الـ kernel
+اللي الـ forward بيستعمله) وبي passّه لـ `linear_backward` ✓.
 
 ---
 

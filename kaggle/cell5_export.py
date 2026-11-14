@@ -73,3 +73,48 @@ else:
     api.create_repo(repo_id=REPO_ID, repo_type="model", private=not PUBLIC, exist_ok=True)
     api.upload_folder(folder_path=str(OUT), repo_id=REPO_ID, repo_type="model")
     print("\nuploaded to https://huggingface.co/" + REPO_ID)
+
+# =============================================================================
+# The GGUF (the deliverable the user opens)
+# =============================================================================
+# The profile is fp16: NO quantization. The weights keep the precision they
+# have (the Granite checkpoint is bf16, the GGUF is fp16: two bytes per
+# weight, the same size as the source).
+#
+# The metadata:
+#   general.name          = "Ghassan v1 Flash"        <- the brand
+#   general.base_model.*  = ibm-granite/granite-4.0-h <- the Granite identity
+#   the geometry          = Granite, untouched
+GGUF = pathlib.Path(os.environ.get("GGUF_OUT", str(WORK / "ghassan-v1-flash.gguf")))
+
+# Where do the weights come from? The trained checkpoint if there is one,
+# else the Granite checkpoint itself (the model IS Granite until it is
+# trained further).
+gguf_src = str(OUT)                      # the safetensors repository (the default)
+if not (pathlib.Path(gguf_src) / "config.json").exists():
+    gguf_src = str(HF)                   # the Granite checkpoint directory
+    print("\nthe GGUF is exported from the Granite checkpoint:", gguf_src)
+
+cmd = [str(BUILD / "bin" / "ghassan-ai"), "quantize",
+       "--model", gguf_src,
+       "--out", str(GGUF),
+       "--profile", os.environ.get("GGUF_PROFILE", "fp16"),
+       "--model-name", MODEL_NAME,
+       "--compat", "native"]
+print("\n$", " ".join(cmd))
+r = subprocess.run(cmd, capture_output=True, text=True)
+print(r.stdout[-4000:]); print(r.stderr[-4000:])
+if r.returncode != 0:
+    raise SystemExit("the GGUF export failed")
+print("the deliverable:", GGUF, f"({GGUF.stat().st_size/1024/1024:.1f} MB)")
+
+# ---- the X-ray: the metadata must say what it must say --------------------
+xray = SRC / "scripts" / "gguf_xray.py"
+if xray.exists():
+    print("\n$ python", xray, GGUF)
+    r = subprocess.run([sys.executable, str(xray), str(GGUF)],
+                       capture_output=True, text=True)
+    print(r.stdout[-4000:]); print(r.stderr[-2000:])
+    if r.returncode != 0:
+        raise SystemExit("the GGUF metadata check failed (see the report above)")
+    print("the metadata is right: Ghassan v1 Flash, based on Granite")

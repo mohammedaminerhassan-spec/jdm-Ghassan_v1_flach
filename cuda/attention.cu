@@ -148,8 +148,8 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
     int n_chunk = M, m_chunk = N, k_chunk = K;
     if (ta) { if (ldaA < k_chunk) k_chunk = ldaA; }   // cublasB OP_T: ldb >= k
     else     { if (ldaA < n_chunk) n_chunk = ldaA; }   // cublasB OP_N: ldb >= n
-    if (tb) { if (ldbB < k_chunk) k_chunk = ldbB; }   // cublasA OP_T: lda >= k
-    else     { if (ldbB < m_chunk) m_chunk = ldbB; }   // cublasA OP_N: lda >= m
+    if (tb) { if (ldaB < k_chunk) k_chunk = ldaB; }   // cublasA OP_T: lda >= k
+    else     { if (ldaB < m_chunk) m_chunk = ldaB; }   // cublasA OP_N: lda >= m
 
     // The per-batch base pointers (the packed ones in the fp16 branch).
     std::vector<const void*> Ah(nB), Bh(nB);

@@ -711,13 +711,14 @@ void mamba2_backward(const float* x,
     if (rows_batch > rows) rows_batch = rows;
     const size_t traj_floats = (size_t)rows_batch * per_row_traj;
 
-    const size_t total_floats = n_tok * (size_t(proj_size) * 2 + size_t(conv_dim) * 3 + size_t(d_inner) * 4 + n_heads) + traj_floats + 256;
+    const size_t total_floats = n_tok * (size_t(proj_size) * 2 + size_t(conv_dim) * 3 + size_t(d_inner) * 5 + n_heads) + traj_floats + 256;
     float* ws = mamba_workspace(total_floats);
 
     float* proj     = ws;
     float* bc       = proj     + n_tok * size_t(proj_size);
     float* y_scan   = bc       + n_tok * size_t(conv_dim);
-    float* dy_norm  = y_scan   + n_tok * size_t(d_inner);
+    float* y_norm   = y_scan   + n_tok * size_t(d_inner);
+    float* dy_norm  = y_norm   + n_tok * size_t(d_inner);
     float* dy_scan  = dy_norm  + n_tok * size_t(d_inner);
     float* dgate    = dy_scan  + n_tok * size_t(d_inner);
     float* dbc      = dgate    + n_tok * size_t(d_inner);
@@ -751,8 +752,20 @@ void mamba2_backward(const float* x,
         }
     }
 
-    // B1) Out projection backward
-    linear_backward(nullptr, w_out, dout, dy_norm, dw_out, B * T, d_inner, d);
+    // B1) Out projection backward.
+    //
+    // The out projection reads the gated norm OUTPUT, so its weight
+    // gradient needs that value. The old code passed a null pointer for it
+    // ("x"): the GEMM of the weight gradient would have read the address
+    // zero (an illegal memory access). The gated norm output is recomputed
+    // here (the same kernel the forward uses).
+    {
+        const int block = 256;
+        k_mamba_gated_norm<<<B * T, block>>>(y_scan, proj, norm_w,
+                                             y_norm, B * T, d_inner, proj_size, eps);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+    linear_backward(y_norm, w_out, dout, dy_norm, dw_out, B * T, d_inner, d);
 
     // B2) Gated RMSNorm backward
     {
