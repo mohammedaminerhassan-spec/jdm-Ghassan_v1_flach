@@ -100,3 +100,42 @@ if DATA.exists() and any(DATA.glob("*.txt")):
 print("\nthe shards:")
 for p in sorted(DATA.glob("*.gbin")):
     print(f"  {p.name}  ({p.stat().st_size/1024/1024:.1f} MB)")
+
+# =============================================================================
+# The model: a first generation on the T4 (or on the CPU)
+# =============================================================================
+# The weights are in MODEL_DIR (cell 0 downloaded them). The engine loads
+# them and generates: this is the "does the model work on my GPU" check.
+MODEL_DIR = pathlib.Path(os.environ.get("MODEL_DIR", str(WORK / "granite")))
+GGUF = pathlib.Path(os.environ.get("GGUF_OUT", str(WORK / "ghassan-v1-flash.gguf")))
+BIN = WORK / "build" / "bin" / "ghassan-ai"
+
+def pick_device():
+    forced = os.environ.get("DEVICE", "auto").lower()
+    if forced in ("cpu", "cuda"):
+        return forced
+    r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
+                        "--format=csv,noheader"], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        for line in r.stdout.strip().splitlines():
+            print("   the GPU:", line)
+        return "cuda"
+    print("   no GPU here: the CPU it is (the Granite decode on the host is slow)")
+    return "cpu"
+
+if BIN.exists() and (GGUF.exists() or (MODEL_DIR / "config.json").exists()):
+    model = str(GGUF) if GGUF.exists() else str(MODEL_DIR)
+    device = pick_device()
+    print(f"\n{'=' * 72}\nthe model: {model}\nthe device: {device}\n{'=' * 72}")
+    r = subprocess.run([str(BIN), "generate", "--model", model, "--device", device,
+                        "--ctx", "1024", "--max-tokens", "32", "--greedy",
+                        "--no-stream", "--prompt",
+                        "Please list one IBM Research laboratory located in the United States."],
+                       capture_output=True, text=True)
+    print(r.stdout[-4000:])
+    if r.stderr.strip():
+        print(r.stderr[-2000:])
+    if r.returncode != 0:
+        print("\n(the generation failed: the cell 6 tells you more)")
+else:
+    print("\nno model yet: run cell 0 (the Granite weights) first.")
