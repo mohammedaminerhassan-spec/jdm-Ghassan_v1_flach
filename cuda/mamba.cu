@@ -478,6 +478,15 @@ __global__ void k_mamba_scan_traj(const float* __restrict__ proj,
         const float dA = expf(a * dt_val);
         const float xv = brow[x_off];
 
+        // The state BEFORE this token (s_t) goes to the trajectory: the
+        // backward derives s_{t+1} from it with the same recurrence the
+        // forward uses (the CPU reference does exactly that: it keeps
+        // s_traj[t] and computes s_traj[t+1] = dA*s_traj[t] + u).
+        __syncthreads();
+        for (int j = lane; j < d_state; j += nthr)
+            mytraj[(size_t)t * d_state + j] = sh_state[j];
+        __syncthreads();
+
         float acc = 0.0f;
         for (int j = lane; j < d_state; j += nthr) {
             const float bj = brow[B_off + j];
@@ -485,10 +494,6 @@ __global__ void k_mamba_scan_traj(const float* __restrict__ proj,
             *sj = dA * (*sj) + (dt_val * bj) * xv;
             acc += brow[C_off + j] * (*sj);
         }
-        __syncthreads();
-        // The state after this token: s_{t+1}.
-        for (int j = lane; j < d_state; j += nthr)
-            mytraj[(size_t)(t + 1) * d_state + j] = sh_state[j];
         __syncthreads();
 
         acc = block_reduce_sum(acc, sh_red, lane, nthr);
@@ -557,12 +562,12 @@ __global__ void k_mamba_scan_bwd(const float* __restrict__ proj,
         const float dA = expf(a_val * dt_val);
         const float xv = brow[x_off];
 
-        // s_t (the state BEFORE this token) and s_{t+1} (the state after
-        // it). The C channels multiply s_{t+1} in the forward, so their
-        // gradient uses s_{t+1}; the decay dA multiplies s_t, so its
-        // gradient uses s_t. The old kernel used s_t for both.
+        // s_t (the state BEFORE this token) comes from the trajectory; s_{t+1}
+        // (the state after it) is derived with the same recurrence the
+        // forward uses: s_{t+1} = dA * s_t + (dt * B) * x. The C channels
+        // multiply s_{t+1} in the forward, so their gradient uses s_{t+1};
+        // the decay dA multiplies s_t, so its gradient uses s_t.
         const float* s_prev = mytraj + (size_t)t * d_state;
-        const float* s_curr = mytraj + (size_t)(t + 1) * d_state;
 
         if (dD && lane == 0) atomicAdd(&dD[h], dy_val * xv);
         float dx_val = dy_val * dskip;
@@ -573,8 +578,10 @@ __global__ void k_mamba_scan_bwd(const float* __restrict__ proj,
         for (int j = lane; j < d_state; j += nthr) {
             const float Cj = brow[C_off + j];
             const float Bj = brow[B_off + j];
+            // s_{t+1} (the state after this token).
+            const float s_curr = dA * s_prev[j] + (dt_val * Bj) * xv;
 
-            atomicAdd(&d_brow[C_off + j], dy_val * s_curr[j]);
+            atomicAdd(&d_brow[C_off + j], dy_val * s_curr);
 
             const float total_ds = dy_val * Cj + sh_ds[j];
             local_d_dA += total_ds * s_prev[j];
