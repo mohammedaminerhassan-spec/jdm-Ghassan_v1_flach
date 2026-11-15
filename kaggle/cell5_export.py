@@ -32,8 +32,18 @@ def find_granite():
     for root in [WORK / "granite", WORK / "hf"]:
         if (root / "config.json").exists():
             return root
+    # The HuggingFace cache (cell 0 downloads there, so the 20 GB of
+    # /kaggle/working stay free for the GGUF).
+    home = pathlib.Path(os.path.expanduser("~"))
+    for p in (home / ".cache" / "huggingface" / "hub").glob("models--*/snapshots/*/config.json"):
+        d = p.parent
+        if list(d.glob("*.safetensors")):
+            return d
+    # A Kaggle dataset (read-only: it does not use the 20 GB of /kaggle/working).
     for p in pathlib.Path("/kaggle/input").rglob("config.json"):
-        return p.parent
+        d = p.parent
+        if list(d.glob("*.safetensors")):
+            return d
     return None
 
 GRANITE = find_granite()

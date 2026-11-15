@@ -34,23 +34,52 @@ HF_REPO = os.environ.get("HF_REPO", "ibm-granite/granite-4.0-h-tiny")
 # big; the rest is a few MB.
 ALLOW = ["*.safetensors", "*.json", "tokenizer*", "*.jinja", "merges.txt", "vocab.json"]
 
-print("=" * 72)
-print("the Granite weights:", GRANITE)
-print("=" * 72)
 
-subprocess.run([sys.executable, "-m", "pip", "-q", "-U", "huggingface_hub"], check=False)
-from huggingface_hub import snapshot_download
+def find_installed():
+    """The weights are already on the disk: a Kaggle DATASET (read-only, it
+    does not use the 20 GB of /kaggle/working) or a previous download."""
+    for root in [WORK / "granite"]:
+        if (root / "config.json").exists():
+            return root
+    for p in pathlib.Path("/kaggle/input").rglob("config.json"):
+        d = p.parent
+        if list(d.glob("*.safetensors")):
+            return d
+    return None
 
-GRANITE.mkdir(parents=True, exist_ok=True)
-t0 = time.time()
-# The download goes to the HuggingFace cache first and is then copied (or
-# hard-linked) here. The resume is automatic: an interrupted download
-# continues where it stopped.
-path = snapshot_download(repo_id=HF_REPO,
-                        allow_patterns=ALLOW,
-                        local_dir=str(GRANITE),
-                        max_workers=8)
-print(f"\ndownloaded in {time.time()-t0:.0f}s -> {path}")
+
+installed = find_installed()
+if installed:
+    print("the weights are already here:", installed)
+    try:
+        st = os.statvfs(str(WORK))
+        free = st.f_bavail * st.f_frsize / (1024 ** 3)
+        print(f"the free space on /kaggle/working: {free:.1f} GB")
+    except Exception:
+        pass
+    if str(installed).startswith("/kaggle/input"):
+        print("(a dataset: it is read-only and it does NOT use the 20 GB of\n"
+              " /kaggle/working - so the GGUF export has the room it needs)")
+    GRANITE = installed
+else:
+    print("=" * 72)
+    print("the Granite weights (into the HuggingFace cache, NOT /kaggle/working:")
+    print("the working directory has 20 GB and the GGUF export needs 13 of them)")
+    print("=" * 72)
+
+    subprocess.run([sys.executable, "-m", "pip", "-q", "-U", "huggingface_hub"], check=False)
+    from huggingface_hub import snapshot_download
+
+    t0 = time.time()
+    # No local_dir: the files land in the HuggingFace cache (outside
+    # /kaggle/working, so the 20 GB there stay free for the GGUF export).
+    # The resume is automatic: an interrupted download continues where it
+    # stopped.
+    path = snapshot_download(repo_id=HF_REPO,
+                            allow_patterns=ALLOW,
+                            max_workers=8)
+    GRANITE = pathlib.Path(path)
+    print(f"\ndownloaded in {time.time()-t0:.0f}s -> {GRANITE}")
 
 print("\nthe files:")
 total = 0
