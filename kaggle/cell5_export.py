@@ -56,7 +56,17 @@ if not TOKENIZER:
         TOKENIZER_DIR = str(p.parent)
         break
 if not TOKENIZER:
-    raise SystemExit("no tokenizer.json: run cell 0 or cell 3 first")
+    raise SystemExit(
+        "no tokenizer.json was found.\n"
+        "  The Granite weights live in /kaggle/working/granite (cell 0 put them\n"
+        "  there). If you deleted that folder to free the disk, do this:\n"
+        "    1) run cell 0 again (30 s, it re-downloads the 3 shards),\n"
+        "    2) upload /kaggle/working/granite as a Kaggle Dataset (Add Data ->\n"
+        "       New Dataset -> the folder) and attach it,\n"
+        "    3) rm -rf /kaggle/working/granite   (frees the 13 GB),\n"
+        "    4) run this cell again: it reads the weights from\n"
+        "       /kaggle/input/granite (read-only, it does not use the 20 GB of\n"
+        "       /kaggle/working) and writes the GGUF here.")
 print("the tokenizer:", TOKENIZER)
 
 ckpt = pathlib.Path(CKPT)
