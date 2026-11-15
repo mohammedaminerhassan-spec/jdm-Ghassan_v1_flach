@@ -77,32 +77,44 @@ print("the device:", device)
 cmd = [str(BIN), "generate", "--model", model, "--device", device,
        "--ctx", str(CTX), "--max-tokens", str(MAX_TOKENS),
        "--temp", str(TEMPERATURE), "--top-p", str(TOP_P),
-       "--seed", str(SEED), "--no-stream",
+       "--seed", str(SEED),
        "--prompt", PROMPT]
 
 print("\n" + "=" * 72)
 print(PROMPT)
 print("=" * 72)
+print("(the weights are loading: 13 GB from the disk - the first token takes "
+      "a couple of minutes. The text appears as it is generated.)", flush=True)
+
+
+def run_generation(ctx):
+    """The generation, with the text streaming live (the notebook must not
+    look stuck for minutes). The stderr is captured so the 'does not fit'
+    error can be recognised."""
+    c = list(cmd)
+    c[c.index("--ctx") + 1] = str(ctx)
+    p = subprocess.Popen(c, stdout=None, stderr=subprocess.PIPE, text=True)
+    err = p.stderr.read()
+    p.wait()
+    return p.returncode, err
+
+
 t0 = time.time()
-r = subprocess.run(cmd, capture_output=True, text=True)
+ctx = CTX
+rc, err = run_generation(ctx)
 # The card can be too small for the context: the engine says so before it
 # starts ("it needs 14.78 GiB but the card has 14.56 GiB"). The context is
 # halved until it fits (the KV cache and the activations shrink with it).
-ctx = CTX
-while r.returncode != 0 and ctx > 128:
-    out = r.stdout + r.stderr
-    if "does not fit this GPU" not in out:
-        break
+while rc != 0 and ctx > 128 and "does not fit this GPU" in err:
     ctx //= 2
-    print(f"(the card is too small for a context of {ctx*2}: retrying with {ctx})")
-    cmd[cmd.index("--ctx") + 1] = str(ctx)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    print(f"(the card is too small for a context of {ctx*2}: retrying with {ctx})",
+          flush=True)
+    rc, err = run_generation(ctx)
 
-print(r.stdout)
-if r.stderr.strip():
-    print(r.stderr[-3000:])
+if err.strip():
+    print(err[-3000:])
 print(f"\n({time.time()-t0:.0f}s, the context was {ctx})")
-if r.returncode != 0:
+if rc != 0:
     raise SystemExit("the generation failed")
 
 # ---- the chat mode (Granite's role-tag template) ---------------------------
