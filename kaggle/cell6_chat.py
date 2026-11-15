@@ -31,6 +31,9 @@ PROMPT = """Please list one IBM Research laboratory located in the United States
 # The chat mode uses Granite's role-tag template (the model was trained with
 # it); the plain mode just continues the text.
 MODE = "chat"          # "chat" or "text"
+# The chat mode loads the model a SECOND time (the REPL is a separate
+# process), so it costs another 13 GB read. It is opt-in.
+RUN_CHAT = os.environ.get("RUN_CHAT", "0") == "1"
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "96"))
 # The context: the Granite weights are 12.93 GiB and the T4 has 14.56 GiB, so
 # only ~1.6 GiB are left for the activations and the workspaces. A context
@@ -118,7 +121,7 @@ if rc != 0:
     raise SystemExit("the generation failed")
 
 # ---- the chat mode (Granite's role-tag template) ---------------------------
-if MODE == "chat":
+if RUN_CHAT:
     print("\n" + "=" * 72)
     print("the chat mode (the role-tag template Granite was trained with):")
     print("=" * 72)
