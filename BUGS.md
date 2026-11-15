@@ -29,6 +29,13 @@
 | BUG-23 | **جديد**: مسار الـ state في الـ Mamba backward: كل batch كان بيقرا مسار الـ batch التاني | حرجة | `cuda/mamba.cu` | اتصلّح |
 | BUG-24 | **جديد**: تدرّج الـ x channels في الـ Mamba كان بيتحسب 256 مرة (مرة لكل thread) | حرجة | `cuda/mamba.cu` | اتصلّح |
 
+**الحالة النهائية:** كل الـ bugs متصلّحة ومتحقَّق منها على الـ T4 ✓ (8/8 tests ✓).
+الباقي معروف وموثّق: **BUG-13** (تدرّجات المجمّد بتتخصّص) و **BUG-14** (الـ
+fine-tune الكامل لـ Granite-4.0-H (6.9B) مش داخلش على T4 16 GB: الـ weights
+بـ fp32 = 27.7 GB + الـ gradients + الـ optimizer states). الحل: تخزين الـ
+weights بـ fp16 بلا masters fp32 (12.9 GB) — ده شغل **مستقبل** ✗ (الـ user
+said: no fine-tuning for now ✓).
+
 **الاختبارات الجديدة** (الـ `CMakeLists.txt` كان بيبني `tests/test_*.cpp` من زمان والمجلد كان فاضي):
 
 | الاختبار | إيه بيعمل |
@@ -47,16 +54,31 @@ cd build && ctest --output-on-failure
 
 ## Verification after the fixes
 
+**All of it runs on Kaggle (T4 x2, CUDA 13.0) — the final run:**
+
+```
+1/8 test_cuda_parity ......... Passed   (dense + moe + lora + GRANITE)
+2/8 test_gguf_eos ........... Passed
+3/8 test_gguf_quant .......... Passed
+4/8 test_gradient_check ...... Passed
+5/8 test_granite_compat ...... Passed
+6/8 test_mamba_backward ...... Passed
+7/8 test_mamba_cuda_parity ... Passed
+8/8 test_safetensors_roundtrip Passed
+100% tests passed, 0 tests failed out of 8
+```
+
 | What | How | Result |
 |---|---|---|
-| The CPU gradients | `tests/test_gradient_check.cpp` (finite differences) | ✅ every parameter to < 5% (the MoE parts < 1.5%) |
-| The Mamba-2 layer alone | `tests/test_mamba_backward.cpp` (a linear loss → a clean signal) | ✅ the 9 tensors to < 2.2% (most < 0.2%) |
-| The Mamba-2 in the full model | the same test, Granite shape without the MoE | ✅ < 0.4% |
-| The Granite geometry | `tests/test_granite_compat.cpp` | ✅ the parameter count matches the checkpoint exactly |
-| The export round trip | `tests/test_safetensors_roundtrip.cpp` | ✅ write → read → identical |
-| **The CUDA sources compile** | `scripts/check_cuda_compile.sh` (no GPU, CUDA ≥ 12.5) | ✅ all 5 files (nvcc 12.8) |
-| **The full Linux + CUDA build** | the same build cell 2 does on Kaggle | ✅ 70/70 targets, all the binaries |
-| The CPU ↔ CUDA gradients | `tests/test_cuda_parity.cpp` (needs a GPU) | runs on Kaggle (cell 4) |
+| The CPU gradients | `test_gradient_check` (finite differences) | ✅ every parameter to < 5% (the MoE parts < 1.5%) |
+| The Mamba-2 layer alone (CPU) | `test_mamba_backward` (a linear loss → a clean signal) | ✅ the 9 tensors to < 2.2% (most < 0.2%) |
+| The Mamba-2 layer alone (GPU) | `test_mamba_cuda_parity` (CPU vs CUDA, the same inputs) | ✅ **every gradient to 1e-10 .. 1e-05** (the forward to 3.6e-07) |
+| The whole model (CPU vs GPU) | `test_cuda_parity` (dense, MoE, LoRA, **Granite**) | ✅ all four cases |
+| The Granite geometry | `test_granite_compat` | ✅ the parameter count matches the checkpoint exactly (6,939,037,248) |
+| The export round trip | `test_safetensors_roundtrip` | ✅ write → read → identical |
+| The CUDA sources compile | `scripts/check_cuda_compile.sh` (no GPU, CUDA ≥ 11) | ✅ all 5 files (nvcc 12.0 / 12.8 / 13.0) |
+| The full Linux + CUDA build | the same build cell 2 does on Kaggle | ✅ 74/74 targets |
+| The model answers | `ghassan-ai generate` on the T4 | ✅ "IBM Almaden Research Center, situated in San Jose, California" |
 
 > The CUDA sources were a blind spot: nothing on a CPU-only machine compiles
 > them, so a typo there (BUG-22) survived from the first audit until the
