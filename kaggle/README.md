@@ -43,13 +43,13 @@ git push -u origin main
 
 | # | الخلية (في الـ notebook) | إيه بتعمل |
 |---|---|---|
-| 0 | `!python {SRC}/kaggle/cell0_granite_weights.py` | **بينزّل الـ Granite weights** (3 safetensors، 13.9 GB) في `/kaggle/working/granite` + يتحقق إن المحرك بيقراها |
+| 0 | `!python {SRC}/kaggle/cell0_granite_weights.py` | **بينزّل الـ Granite weights** (3 safetensors، 12.93 GB) في **كاش HuggingFace** — مش في `/kaggle/working` (عشان الـ 20 GB تفضل فاضية للـ GGUF) |
 | 1 | `!git clone --depth 1 https://github.com/mohammedaminerhassan-spec/jdm-Ghassan_v1_flach.git /kaggle/working/ghassan-ai` | ياخد الكود (أو شغّل `kaggle/cell1_setup.py`) |
 | 2 | `!python {SRC}/kaggle/cell2_build.py` | **البناء بـ CUDA** (أول compile بـ nvcc) |
 | 3 | `!python {SRC}/kaggle/cell3_data.py` | الـ tokenizer + البيانات + الـ shards |
 | 4 | `!python {SRC}/kaggle/cell4_smoke.py` | الاختبارات + **تحقق Granite** + تدريب dense + تدريب Granite shape |
 | 4b | `!python {SRC}/kaggle/cell4b_sanitizer.py` | **compute-sanitizer**: لو في خطأ ذاكرة على الـ GPU بيقولك السطر بالظبط |
-| 5 | `!python {SRC}/kaggle/cell5_export.py` | يصدّر **safetensors + GGUF** + يرفعه على HuggingFace |
+| 5 | `!python {SRC}/kaggle/cell5_export.py` | يصدّر **safetensors + GGUF** (fp16، من غير quantization) + يرفعه على HuggingFace |
 | 6 | `!python {SRC}/kaggle/cell6_chat.py` | **"HERE I PUT THE TEXT I WANT"** — حطّ النص في أعلى الخلية والموديل يجاوبك (T4 لو موجودة) |
 
 > `{SRC}` = `/kaggle/working/ghassan-ai` (حدده في الخلية الأولى).
