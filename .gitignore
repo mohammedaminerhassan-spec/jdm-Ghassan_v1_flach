@@ -60,3 +60,10 @@ plan*.md
 plam*.md
 Qwen2.5-Omni-main/
 
+# The Granite checkpoint (13.8 GB) lives on the disk and in the Kaggle
+# dataset - NEVER in git. One accidental "git add -A" put it in bb4faa7 and
+# turned .git into 10.4 GB (every push failed).
+granite-documentation/granit filles confiques/
+*.safetensors
+*.sig
+

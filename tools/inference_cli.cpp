@@ -389,6 +389,38 @@ static int cmd_tokenizer_info(const Args& args) {
     std::cout << "add_bos=" << (tk.add_bos() ? 1 : 0) << "\n";
     std::cout << "add_eos=" << (tk.add_eos() ? 1 : 0) << "\n";
     std::cout << "eos_id=" << tk.eos_id() << "\n";
+
+    // The chat prompt, rendered with the engine's own template and printed
+    // with its token ids. It answers "what does the model actually see?"
+    // without loading the 13 GB of weights (the tokenizer is enough).
+    if (args.has("chat-text")) {
+        const std::string text = args.str("chat-text");
+        const bool granite = tk.token_to_id("<|start_of_role|>") >= 0 &&
+                             tk.token_to_id("<|end_of_role|>") >= 0;
+        const ChatTemplate kind = granite ? ChatTemplate::Granite : ChatTemplate::ChatML;
+        std::vector<Message> msgs;
+        msgs.push_back({Role::User, text});
+        const std::vector<i32> ids = encode_chat(tk, kind, msgs, true, nullptr);
+        std::cout << "chat_template=" << (granite ? "granite" : "chatml") << "\n";
+        std::cout << "chat_prompt_ids=";
+        for (i32 id : ids) std::cout << id << " ";
+        std::cout << "\n";
+        std::cout << "chat_prompt_len=" << ids.size() << "\n";
+        // The prompt, token by token: a special token on its own, then the
+        // text pieces. This is what the model receives.
+        std::cout << "chat_prompt_tokens=";
+        for (i32 id : ids) {
+            const std::string piece = tk.decode({id}, true);
+            std::cout << "[" << id << "]" << piece << " ";
+        }
+        std::cout << "\n";
+        // Is the first generated token the end of the turn? The Granite chat
+        // ends the assistant turn with <|end_of_text|>, so an immediate EOS
+        // means the prompt is not what the model expects.
+        std::cout << "eos_is_in_the_prompt="
+                  << (std::find(ids.begin(), ids.end(), tk.eos_id()) != ids.end() ? 1 : 0)
+                  << "\n";
+    }
     return 0;
 }
 
