@@ -32,12 +32,6 @@ static inline float jitter_u_cpu(gai::i64 tt, int ee) {
     return (static_cast<float>((h >> 40) & 0xFFFFFF) / static_cast<float>(1 << 24)) - 0.5f;
 }
 
-namespace gai {
-namespace cpu {
-
-}
-}
-
 #ifdef GAI_OPENMP
 #include <omp.h>
 #endif
@@ -353,7 +347,7 @@ void moe_backward(const float* x, const float* router_w,
         std::fill(sc.dx.begin(), sc.dx.begin() + d, 0.0f);
         std::fill(sc.dp.begin(), sc.dp.begin() + ne, 0.0f);
 
-        if (sh_g && sh_u && sh_d && dsh_g && dsh_u && dsh_d) {
+        if (sh_g && sh_u && sh_d) {
             // The shared expert has its OWN width (SH), not the routed
             // expert width (E). Granite-4.0 uses shared=1024 with routed=512,
             // so using E here silently dropped the upper half of the shared
@@ -362,6 +356,10 @@ void moe_backward(const float* x, const float* router_w,
             // buffer was written with a wrong layout.
             // The SH-sized scratch (sg/su/sa/dsg/dsu/dsa) exists exactly for
             // this block; the E-sized one belongs to the routed experts.
+            //
+            // BUG-13: the dW pointers can be null (a frozen shared expert).
+            // The forward + the dx are ALWAYS computed - the dx carries the
+            // gradient to the previous layers - and only the dW is skipped.
             linear_forward(xt, sh_g, sc.sg.data(), 1, d, SH);
             linear_forward(xt, sh_u, sc.su.data(), 1, d, SH);
             swiglu_forward(sc.sg.data(), sc.su.data(), sc.sa.data(), SH);
@@ -388,9 +386,11 @@ void moe_backward(const float* x, const float* router_w,
             const float* ge = gates + (size_t)e * E * d;
             const float* ue = ups   + (size_t)e * E * d;
             const float* de = downs + (size_t)e * d * E;
-            float* dge = dgates + (size_t)e * E * d;
-            float* due = dups   + (size_t)e * E * d;
-            float* dde = ddowns + (size_t)e * d * E;
+            // BUG-13: a null dW means the expert is frozen - the dx is still
+            // computed, only the weight gradient is skipped.
+            float* dge = dgates ? dgates + (size_t)e * E * d : nullptr;
+            float* due = dups   ? dups   + (size_t)e * E * d : nullptr;
+            float* dde = ddowns ? ddowns + (size_t)e * d * E : nullptr;
             float* dact = s_dact + slot;
 
             const float* sa = s_act + slot;
@@ -434,8 +434,10 @@ void moe_backward(const float* x, const float* router_w,
                 float dl = pt[e] * (sc.dp[e] - pdot);
                 if (jj > 0.0f) dl *= (1.0f + jj * 2.0f * jitter_u_cpu(t, e));
                 sc.dlogit[e] = dl;
+            if (drouter_w) {
             float* dr = drouter_w + (size_t)e * d;
             for (int j = 0; j < d; ++j) dr[j] += dl * xt[j];
+            }
             const float* rr = router_w + (size_t)e * d;
             for (int j = 0; j < d; ++j) sc.dx[j] += dl * rr[j];
         }

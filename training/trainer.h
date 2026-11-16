@@ -53,7 +53,9 @@ struct TrainerConfig {
     DType param_dtype   = DType::F32;
     bool  gemm_fp16     = true;
     bool  fp16_weight_cache = false;
-    double loss_scale_init   = 65536.0;
+    // Must match loss_scale_cap() in trainer.cpp (16384): the old 65536
+    // default was always clamped with a warning on every single run.
+    double loss_scale_init   = 16384.0;
     int    loss_scale_window = 2000;
 
     double loss_scale_max    = 0.0;

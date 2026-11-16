@@ -21,11 +21,21 @@ Args::Args(int argc, char** argv) {
         std::string a = argv[i];
 
         auto looks_like_key = [](const std::string& s) {
-            if (s.size() < 2 || s[0] != '-') return false;
-            const char c1 = s[1];
-            if (c1 >= '0' && c1 <= '9') return false;
-            if (c1 == '.' && s.size() > 2 && s[2] >= '0' && s[2] <= '9') return false;
-            return true;
+            if (s.empty()) return false;
+            // A value like "1e-3", ".5", "-3" or a plain number is NOT a key.
+            // Only strings starting with "--" or a single "-" followed by a
+            // non-numeric character are options; otherwise `--temp 1e-3` was
+            // mis-parsed as the flag `--temp` with value "1" plus a stray key.
+            const char c0 = s[0];
+            if (c0 == '-') {
+                if (s.size() < 2) return true;
+                const char c1 = s[1];
+                if (c1 >= '0' && c1 <= '9') return false;
+                if (c1 == '.' && s.size() > 2 && s[2] >= '0' && s[2] <= '9') return false;
+                return true;
+            }
+            if (c0 == '.' || c0 == '+' || (c0 >= '0' && c0 <= '9')) return false;
+            return false;
         };
         if (a.rfind("--", 0) == 0) {
             std::string key = a.substr(2);
@@ -101,8 +111,15 @@ u64 Args::num_u64(const std::string& k, u64 def) const {
 double Args::real(const std::string& k, double def) const {
     auto it = kv_.find(k);
     if (it == kv_.end()) return def;
-    try { return std::stod(it->second); }
-    catch (...) {
+    try {
+        size_t pos = 0;
+        const double v = std::stod(it->second, &pos);
+        if (pos != it->second.size() || !std::isfinite(v)) {
+            log_warn("args: ignoring malformed number for '--" + k + "': '" + it->second + "'");
+            return def;
+        }
+        return v;
+    } catch (...) {
         log_warn("args: ignoring malformed number for '--" + k + "': '" + it->second + "'");
         return def;
     }

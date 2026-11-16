@@ -24,8 +24,6 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
     const DeviceInfo& di = device_info();
     if (!di.cuda_available || di.total_mem == 0) return;
 
-    const Model::MemoryPlan plan =
-        Model::plan_memory(cfg, 1, ctx > 0 ? ctx : 512, false, 1, fp16_cache_on, fp16_weights);
     // Use the requested context if given; otherwise fall back to 4096 (a
     // realistic inference budget).  Using cfg.max_seq_len (131 072 for
     // Granite) as the fallback caused the guard to report an absurdly large
@@ -47,7 +45,6 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
     const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, act_T);
     const size_t need = plan2.weights + plan2.fp16_cache + plan2.activations +
                         kv + mam + wsp.gemm_bytes + wsp.moe_bytes;
-    (void)plan;
 
     log_info(strfmt("[mem ] GPU plan: weights %s | fp16 cache %s | activations %s | "
                     "kv %s | mamba %s | workspaces %s = %s of %s (%.0f%%)%s",

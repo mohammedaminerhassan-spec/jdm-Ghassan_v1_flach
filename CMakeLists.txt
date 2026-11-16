@@ -115,13 +115,10 @@ if(OpenMP_CXX_FOUND)
 endif()
 
 if(GAI_HAVE_CUDA)
-    # Without an explicit architecture, nvcc targets its own default (sm_52
-    # for CUDA 11/12) and the T4 runs the PTX through a JIT. Building for the
-    # real architectures of the engine (the T4 = sm_75) gives the tensor-core
-    # kernels their own SASS.
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89)
-    endif()
+    # CUDA architectures are set once, near the toolkit detection above
+    # (75-real 80-real 90-real, sm_75 first for the T4). This block used to
+    # re-set them to "75 80 86 89" but that was unreachable dead code — the
+    # variable was already DEFINED — so it was removed.
     file(GLOB GAI_CUDA_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cuda/*.cu)
     add_library(gai_cuda STATIC ${GAI_CUDA_SOURCES})
     target_include_directories(gai_cuda PUBLIC ${CMAKE_SOURCE_DIR})

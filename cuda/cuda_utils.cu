@@ -261,8 +261,9 @@ std::string phase_report() {
         sl.used = false;
     }
     char buf[256];
-    std::snprintf(buf, sizeof(buf), "ph [%s %.1f %s %.1f %s %.1f %s %.1f]",
-                  names[0], ms[0], names[1], ms[1], names[2], ms[2], names[3], ms[3]);
+    std::snprintf(buf, sizeof(buf), "ph [%s %.1f %s %.1f %s %.1f %s %.1f %s %.1f]",
+                  names[0], ms[0], names[1], ms[1], names[2], ms[2], names[3], ms[3],
+                  names[4], ms[4]);
     return std::string(buf);
 }
 
