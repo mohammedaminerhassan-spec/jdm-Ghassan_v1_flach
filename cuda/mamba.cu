@@ -901,7 +901,7 @@ __global__ void k_mamba_step_conv(const float* __restrict__ proj,
                                   const float* __restrict__ b,
                                   float* __restrict__ conv_state,
                                   float* __restrict__ bc_out,
-                                  int d_inner, int conv_dim, int k, int proj_size) {
+                                  int d_inner, int conv_dim, int k) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= conv_dim) return;
     const int win = k - 1;
@@ -989,7 +989,7 @@ static void mamba_step_impl(const float* x,
         const int n = conv_dim;
         k_mamba_step_conv<<<(n + 127) / 128, 128>>>(proj, conv_w, conv_b,
                                                     conv_state, bc,
-                                                    d_inner, conv_dim, k, proj_size);
+                                                    d_inner, conv_dim, k);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
     {
