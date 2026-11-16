@@ -14,8 +14,12 @@
 #include <fstream>
 #include <filesystem>
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
+#include <utility>
+#include <vector>
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -69,6 +73,7 @@ static void usage() {
     "  --system <text>   system prompt (default: none)\n"
     "  --no-stream       print the reply at once\n"
     "  --print-ids      print the generated token ids (verification)\n"
+    "  --top <n>        print the top-n candidates for the first token (diagnosis)\n"
     "  --device auto|cpu|cuda  (metal/vulkan fall back to portable CPU)\n"
     "  --gemm-fp16 0|1        CUDA tensor-core GEMMs (default 1; 0 = pure fp32)\n"
     "  --no-fp16-cache        disable persistent FP16 inference weights\n"
@@ -141,8 +146,23 @@ static int cmd_generate(const Args& args) {
         (stream || print_ids) ? Generator::StreamFn(on_piece) : nullptr;
 
     std::string out;
+    // The diagnostic: the top candidates for the first generated token.
+    // It tells a wrong prompt (the expected token is far down the list)
+    // from a broken forward pass (the list is garbage).
+    const int top_n = args.num_int("top", 0);
+    std::function<void()> probe;
+    if (top_n > 0) {
+        probe = [&]() {
+            const std::vector<std::pair<i32, float>> cands = gen.top_candidates(top_n);
+            std::cerr << "  the top candidates after the prompt:\n";
+            for (const auto& c : cands) {
+                std::cerr << "    " << c.first << "  " << strfmt("%.4f", c.second)
+                          << "  " << lm.tokenizer.decode_one(c.first) << "\n";
+            }
+        };
+    }
     if (args.flag("raw")) {
-        out = gen.complete(prompt, g, on_tok);
+        out = gen.complete(prompt, g, on_tok, probe);
     } else {
         std::vector<Message> msgs;
         const std::string sys = args.str("system", "");
@@ -161,7 +181,7 @@ static int cmd_generate(const Args& args) {
                             static_cast<int>(ids.size())));
             log_info("[prompt] " + lm.tokenizer.decode(ids, true));
         }
-        out = gen.chat(msgs, g, on_tok);
+        out = gen.chat(msgs, g, on_tok, probe);
     }
     if (stream) std::cout << std::endl;
     else std::cout << out << std::endl;
@@ -189,6 +209,13 @@ static int cmd_info(const Args& args) {
         std::cout << "\n  file        : " << path << "\n";
         std::cout << "  size        : " << human_bytes(r.file_size()) << "\n";
         std::cout << "  format      : GGUF\n";
+        std::cout << "  name        : " << r.get_string("general.name", "(unset)") << "\n";
+        const std::string base = r.get_string("general.base_model.0.name", "");
+        if (!base.empty())
+            std::cout << "  base model  : " << base << "\n";
+        const std::string desc = r.get_string("general.description", "");
+        if (!desc.empty())
+            std::cout << "  description : " << desc << "\n";
         std::cout << "  quant       : " << r.get_string("ghassan.quantization.profile",
                      r.get_string("general.quantization_version", "?")) << "\n";
         std::cout << "  arch        : " << r.get_string("general.architecture", "?") << "\n";
