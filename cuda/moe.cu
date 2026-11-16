@@ -26,6 +26,19 @@ static inline void moe_linear(const float* x, const W* w, float* y, int M, int K
     }
 }
 
+// The weight-aware backward. dw is computed from the FP32 activations alone
+// (the weight pointer is not used for dw); dx needs the real weight values,
+// so the half branch must NOT reinterpret u16 as float.
+template <typename W>
+static inline void moe_linear_bwd(const float* x, const W* w, const float* dy,
+                                  float* dx, float* dw, int M, int K, int N) {
+    if constexpr (std::is_same<W, u16>::value) {
+        linear_backward_half(x, w, dy, dx, dw, M, K, N);
+    } else {
+        linear_backward(x, w, dy, dx, dw, M, K, N);
+    }
+}
+
 static inline int grid_for(i64 n, int block) {
     i64 g = (n + block - 1) / block;
     if (g < 1) g = 1;
@@ -928,9 +941,10 @@ void moe_forward_bias_half(const float* x, const float* router_w, const float* r
                                s_gate, s_up, s_act, N, d, E, ne, K, SH);
 }
 
-void moe_backward(const float* x, const float* router_w,
-                  const float* gates, const float* ups, const float* downs,
-                  const float* sh_g, const float* sh_u, const float* sh_d,
+template <typename W>
+static void moe_backward_impl(const float* x, const float* router_w,
+                  const W* gates, const W* ups, const W* downs,
+                  const W* sh_g, const W* sh_u, const W* sh_d,
                   const float* probs, const i32* idx, const float* tw,
                   const float* s_gate, const float* s_up, const float* s_act,
                   const float* aux_frac, float aux_scale,
@@ -976,19 +990,23 @@ void moe_backward(const float* x, const float* router_w,
     float* Pblk = (float*)carve16(ws, sizeof(float) * (size_t)NK);
     float* DLblk = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
 
-    if (sh_g && sh_u && sh_d && dsh_g && dsh_u && dsh_d) {
+    if (sh_g && sh_u && sh_d) {
         // The shared expert has its own width (SH), not the routed width E.
-        linear_forward(x, sh_g, shg, (int)N, d, SH);
-        linear_forward(x, sh_u, shu, (int)N, d, SH);
+        //
+        // BUG-13: the dW pointers can be null (a frozen shared expert). The
+        // forward and the dx are ALWAYS computed - the dx carries the
+        // gradient to the previous layers - and only the dW is skipped.
+        moe_linear(x, sh_g, shg, (int)N, d, SH);
+        moe_linear(x, sh_u, shu, (int)N, d, SH);
         k_swiglu<<<grid_for(N * SH, 256), 256>>>(shg, shu, sha, N * SH);
         CU_CHECK(cudaGetLastError());
 
-    gemm(false, false, (int)N, SH, d, 1.0f, dout, d, sh_d, SH, 0.0f, shda, SH);
+    moe_linear(dout, sh_d, shda, (int)N, d, SH);
     k_swiglu_bwd_assign<<<grid_for(N * SH, 256), 256>>>(shg, shu, shda, shdg, shdu, N * SH);
         CU_CHECK(cudaGetLastError());
-        linear_backward(sha, sh_d, dout, nullptr, dsh_d, (int)N, SH, d);
-        linear_backward(x, sh_g, shdg, dx, dsh_g, (int)N, d, SH);
-        linear_backward(x, sh_u, shdu, dx, dsh_u, (int)N, d, SH);
+        moe_linear_bwd(sha, sh_d, dout, nullptr, dsh_d, (int)N, SH, d);
+        moe_linear_bwd(x, sh_g, shdg, dx, dsh_g, (int)N, d, SH);
+        moe_linear_bwd(x, sh_u, shdu, dx, dsh_u, (int)N, d, SH);
     }
 
     CU_CHECK(cudaMemset(dpfull, 0, sizeof(float) * (size_t)NK));
@@ -1008,7 +1026,7 @@ void moe_backward(const float* x, const float* router_w,
     for (int e = 0; e < ne; ++e) {
         i64 ns = (i64)h_cnt[e];
         if (ns == 0) continue;
-        const float* de = downs + (size_t)e * d * E;
+        const W* de = downs + (size_t)e * d * E;
 
         gemm(false, false, (int)ns, E, d, 1.0f,
              Sblk + (size_t)h_off[e] * d, d, de, E, 0.0f,
@@ -1022,33 +1040,35 @@ void moe_backward(const float* x, const float* router_w,
         i64 ns = (i64)h_cnt[e];
         if (ns == 0) continue;
         i32* d_slots = grouped + h_off[e];
-        const float* ge = gates + (size_t)e * E * d;
-        const float* ue = ups   + (size_t)e * E * d;
-        const float* de = downs + (size_t)e * d * E;
-        float* dge = dgates + (size_t)e * E * d;
-        float* due = dups   + (size_t)e * E * d;
-        float* dde = ddowns + (size_t)e * d * E;
+        const W* ge = gates + (size_t)e * E * d;
+        const W* ue = ups   + (size_t)e * E * d;
+        const W* de = downs + (size_t)e * d * E;
+        // BUG-13: a null dW means the expert is frozen - the dx is still
+        // computed, only the weight gradient is skipped.
+        float* dge = dgates ? dgates + (size_t)e * E * d : nullptr;
+        float* due = dups   ? dups   + (size_t)e * E * d : nullptr;
+        float* dde = ddowns ? ddowns + (size_t)e * d * E : nullptr;
         const float* Gp = Gblk + (size_t)h_off[e] * E;
         const float* Up = Ublk + (size_t)h_off[e] * E;
         const float* Ap = Ablk + (size_t)h_off[e] * E;
         const float* Xp = Xblk + (size_t)h_off[e] * d;
         const float* Sp = Sblk + (size_t)h_off[e] * d;
 
-        linear_backward(Ap, de, Sp, nullptr, dde, (int)ns, E, d);
+        moe_linear_bwd(Ap, de, Sp, nullptr, dde, (int)ns, E, d);
 
         zero(Sblk + (size_t)h_off[e] * d, (i64)ns * d);
-        linear_backward(Xp, ge, Gp, Sblk + (size_t)h_off[e] * d, dge, (int)ns, d, E);
+        moe_linear_bwd(Xp, ge, Gp, Sblk + (size_t)h_off[e] * d, dge, (int)ns, d, E);
         k_scatter_add<<<grid_for(ns, 256), 256>>>(dx, Sblk + (size_t)h_off[e] * d, d_slots,
                                                   nullptr, ns, d, K);
         CU_CHECK(cudaGetLastError());
 
         zero(Sblk + (size_t)h_off[e] * d, (i64)ns * d);
-        linear_backward(Xp, ue, Up, Sblk + (size_t)h_off[e] * d, due, (int)ns, d, E);
+        moe_linear_bwd(Xp, ue, Up, Sblk + (size_t)h_off[e] * d, due, (int)ns, d, E);
         k_scatter_add<<<grid_for(ns, 256), 256>>>(dx, Sblk + (size_t)h_off[e] * d, d_slots,
                                                   nullptr, ns, d, K);
         CU_CHECK(cudaGetLastError());
 
-        linear_forward(Ap, de, Sblk + (size_t)h_off[e] * d, (int)ns, E, d);
+        moe_linear(Ap, de, Sblk + (size_t)h_off[e] * d, (int)ns, E, d);
         k_dp_dot<<<grid_for(ns, 256), 256>>>(dout, Sblk + (size_t)h_off[e] * d, d_slots, Pblk, ns, d, K);
         k_scatter_copy<<<grid_for(ns, 256), 256>>>(Pblk, d_slots, dpfull, ns, 1);
         CU_CHECK(cudaGetLastError());
@@ -1059,7 +1079,44 @@ void moe_backward(const float* x, const float* router_w,
     k_router_dl<<<(unsigned)N, 32>>>(x, router_w, probs, dpfull, idx, aux_frac,
                                     aux_coef, g_moe_jitter, g_moe_jitter_seed, DLblk, dx, N, d, ne, K);
     CU_CHECK(cudaGetLastError());
-    gemm(true, false, ne, d, (int)N, 1.0f, DLblk, ne, x, d, 1.0f, drouter_w, d);
+    // BUG-13: the router can be frozen (no gradient buffer) - the dx it
+    // produces is always needed, only its weight gradient is skipped.
+    if (drouter_w)
+        gemm(true, false, ne, d, (int)N, 1.0f, DLblk, ne, x, d, 1.0f, drouter_w, d);
+}
+
+void moe_backward(const float* x, const float* router_w,
+                  const float* gates, const float* ups, const float* downs,
+                  const float* sh_g, const float* sh_u, const float* sh_d,
+                  const float* probs, const i32* idx, const float* tw,
+                  const float* s_gate, const float* s_up, const float* s_act,
+                  const float* aux_frac, float aux_scale,
+                  const float* dout, float* dx,
+                  float* drouter_w, float* dgates, float* dups, float* ddowns,
+                  float* dsh_g, float* dsh_u, float* dsh_d,
+                  float* s_dact,
+                  i64 N, int d, int E, int ne, int K, int SH) {
+    moe_backward_impl<float>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                             probs, idx, tw, s_gate, s_up, s_act, aux_frac, aux_scale,
+                             dout, dx, drouter_w, dgates, dups, ddowns,
+                             dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
+}
+
+void moe_backward_half(const float* x, const float* router_w,
+                  const u16* gates, const u16* ups, const u16* downs,
+                  const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                  const float* probs, const i32* idx, const float* tw,
+                  const float* s_gate, const float* s_up, const float* s_act,
+                  const float* aux_frac, float aux_scale,
+                  const float* dout, float* dx,
+                  float* drouter_w, float* dgates, float* dups, float* ddowns,
+                  float* dsh_g, float* dsh_u, float* dsh_d,
+                  float* s_dact,
+                  i64 N, int d, int E, int ne, int K, int SH) {
+    moe_backward_impl<u16>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                           probs, idx, tw, s_gate, s_up, s_act, aux_frac, aux_scale,
+                           dout, dx, drouter_w, dgates, dups, ddowns,
+                           dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
 }
 
 __global__ void k_aux_accum(const float* probs, const i32* idx,

@@ -80,6 +80,7 @@ void split_qkv(Device dev, const float* qkv, float* q, float* k, float* v,
                i64 n, int qd, int kvd);
 void linear_forward_fp16(Device dev, const float* x, const u16* w, float* y, int M, int K, int N);
 void convert_f32_to_f16(Device dev, const float* src, u16* dst, i64 n);
+void convert_f16_to_f32(Device dev, const u16* src, float* dst, i64 n);
 void register_fp16_weight(const float* master, const u16* half, i64 n);
 void unregister_fp16_weight(const float* master);
 
@@ -95,6 +96,9 @@ void embedding_forward_half(Device dev, const i32* ids, const u16* table, float*
 
 void linear_backward(Device dev, const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N);
+// FP16-stored weight: reads the real half bytes (no float reinterpretation).
+void linear_backward_half(Device dev, const float* x, const u16* w, const float* dy,
+                          float* dx, float* dw, int M, int K, int N);
 
 void add(Device dev, const float* a, const float* b, float* out, i64 n);
 void add_inplace(Device dev, float* a, const float* b, i64 n);
@@ -176,6 +180,20 @@ void moe_forward_bias_half(Device dev,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
                       i64 N, int d, int E, int ne, int K, int SH);
+// FP16-stored expert matrices: no float reinterpretation of the weights.
+void moe_backward_half(Device dev,
+                   const float* x, const float* router_w,
+                   const u16* gates, const u16* ups, const u16* downs,
+                   const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                   const float* probs, const i32* idx, const float* tw,
+                   const float* s_gate, const float* s_up, const float* s_act,
+                   const float* aux_frac, float aux_scale,
+                   const float* dout, float* dx,
+                   float* drouter_w, float* dgates, float* dups, float* ddowns,
+                   float* dsh_g, float* dsh_u, float* dsh_d,
+                   float* s_dact,
+                   i64 N, int d, int E, int ne, int K, int SH);
+
 void moe_backward(Device dev,
                   const float* x, const float* router_w,
                   const float* gates, const float* ups, const float* downs,
@@ -230,6 +248,31 @@ void mamba2_forward_half(Device dev,
                     float* out,
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                     int d_head, int d_state, int k, float eps);
+
+// FP16-stored Mamba projections: reads the real half bytes.
+void mamba2_backward_half(Device dev,
+                     const float* x,
+                     const u16* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const u16* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     float* dbc_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps);
 
 void mamba2_backward(Device dev,
                      const float* x,

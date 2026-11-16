@@ -263,6 +263,16 @@ static inline void mamba_linear(const float* x, const W* w, float* y, int M, int
 }
 
 template <typename W>
+static inline void mamba_linear_bwd(const float* x, const W* w, const float* dy,
+                                    float* dx, float* dw, int M, int K, int N) {
+    if constexpr (std::is_same<W, u16>::value) {
+        linear_backward_half(x, w, dy, dx, dw, M, K, N);
+    } else {
+        linear_backward(x, w, dy, dx, dw, M, K, N);
+    }
+}
+
+template <typename W>
 static void mamba2_forward_impl(const float* x,          // [B, T, d]
                     const W* w_in,       // [proj_size, d]
                     const float* conv_w,     // [conv_dim, k]
@@ -678,15 +688,16 @@ __global__ void k_mamba_assemble_dproj(const float* __restrict__ dgate,
     for (int i = lane; i < n_heads; i += nthr) dp[d_inner + conv_dim + i] = ddt_p[i];
 }
 
-void mamba2_backward(const float* x,
-                     const float* w_in,
+template <typename W>
+static void mamba2_backward_impl(const float* x,
+                     const W* w_in,
                      const float* conv_w,
                      const float* conv_b,
                      const float* dt_bias,
                      const float* a_log,
                      const float* D,
                      const float* norm_w,
-                     const float* w_out,
+                     const W* w_out,
                      const float* dout,
                      float* dx,
                      float* dw_in,
@@ -741,7 +752,7 @@ void mamba2_backward(const float* x,
     float* traj     = dproj    + n_tok * size_t(proj_size);
 
     // Forward recompute
-    linear_forward(x, w_in, proj, B * T, d, proj_size);
+    mamba_linear(x, w_in, proj, B * T, d, proj_size);
     {
         dim3 grid(conv_dim, B);
         const int block = 128;
@@ -778,7 +789,7 @@ void mamba2_backward(const float* x,
                                              y_norm, B * T, d_inner, proj_size, eps);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
-    linear_backward(y_norm, w_out, dout, dy_norm, dw_out, B * T, d_inner, d);
+    mamba_linear_bwd(y_norm, w_out, dout, dy_norm, dw_out, B * T, d_inner, d);
 
     // B2) Gated RMSNorm backward
     {
@@ -839,13 +850,71 @@ void mamba2_backward(const float* x,
                                                 B * T, d_inner, conv_dim, n_heads, proj_size);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
-    linear_backward(x, w_in, dproj, dx, dw_in, B * T, d, proj_size);
+    mamba_linear_bwd(x, w_in, dproj, dx, dw_in, B * T, d, proj_size);
 
     // The scan's gradient (the one the conv backward reads). It is optional:
     // the diagnostic (the CPU<->CUDA parity) asks for it.
     if (dbc_out)
         CU_MAMBA_CHECK(cudaMemcpy(dbc_out, dbc, sizeof(float) * n_tok * conv_dim,
                                   cudaMemcpyDeviceToHost));
+}
+
+void mamba2_backward(const float* x,
+                     const float* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const float* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     float* dbc_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps) {
+    mamba2_backward_impl<float>(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                                norm_w, w_out, dout, dx, dw_in, dconv_w, dconv_b,
+                                ddt_bias, da_log, dD, dnorm_w, dw_out, dbc_out,
+                                B, T, d, d_inner, conv_dim, n_heads, d_head,
+                                d_state, k, eps);
+}
+
+void mamba2_backward_half(const float* x,
+                     const u16* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const u16* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     float* dbc_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps) {
+    mamba2_backward_impl<u16>(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                              norm_w, w_out, dout, dx, dw_in, dconv_w, dconv_b,
+                              ddt_bias, da_log, dD, dnorm_w, dw_out, dbc_out,
+                              B, T, d, d_inner, conv_dim, n_heads, d_head,
+                              d_state, k, eps);
 }
 
 }  // namespace cuda_ops

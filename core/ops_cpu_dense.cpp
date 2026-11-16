@@ -152,6 +152,17 @@ void linear_backward(const float* x, const float* w, const float* dy,
     if (dw) gemm(true,  false, N, K, M, 1.0f, dy, N, x, K, 1.0f, dw, K);
 }
 
+void linear_backward_half(const float* x, const u16* w, const float* dy,
+                          float* dx, float* dw, int M, int K, int N) {
+    if (M <= 0 || K <= 0 || N <= 0) return;
+    // The CPU half path is reference-grade. Widen the half weights once per
+    // call into a local FP32 buffer, then reuse the ordinary backward.
+    std::vector<float> wf(static_cast<size_t>(K) * static_cast<size_t>(N));
+    for (size_t i = 0; i < wf.size(); ++i) wf[i] = fp16_to_fp32(w[i]);
+    if (dx) gemm(false, false, M, K, N, 1.0f, dy, N, wf.data(), K, 1.0f, dx, K);
+    if (dw) gemm(true,  false, N, K, M, 1.0f, dy, N, x, K, 1.0f, dw, K);
+}
+
 void add(const float* a, const float* b, float* out, i64 n) {
 #ifdef GAI_OPENMP
     #pragma omp parallel for if(n > 8192) schedule(static)
@@ -233,6 +244,10 @@ void embedding_backward(const i32* ids, const float* dout, float* dtable,
                         i64 ntok, int dim, int vocab) {
 
     if (ntok <= 0) return;
+    // A frozen embedding table has no gradient buffer (BUG-13): the whole
+    // call is skipped, and the dx that carries the gradient to the previous
+    // layers is not affected (it was computed by the layer below).
+    if (!dtable) return;
     if (ntok < 256) {
         for (i64 t = 0; t < ntok; ++t) {
             i32 id = ids[t];

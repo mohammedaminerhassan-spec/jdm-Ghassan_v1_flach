@@ -450,6 +450,18 @@ void convert_f32_to_f16(const float* src, u16* dst, i64 n) {
     CU_CHECK(cudaGetLastError());
 }
 
+__global__ void k_f16_to_f32_flat(const __half* src, float* dst, i64 n) {
+    i64 i = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) dst[i] = __half2float(src[i]);
+}
+
+void convert_f16_to_f32(const u16* src, float* dst, i64 n) {
+    if (n <= 0) return;
+    k_f16_to_f32_flat<<<grid_for(n, 256), 256>>>(reinterpret_cast<const __half*>(src), dst, n);
+    CU_CHECK(cudaGetLastError());
+}
+
 void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, int N) {
     if (M <= 0 || N <= 0) return;
     if (K <= 0) {
@@ -514,6 +526,41 @@ void linear_backward(const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N) {
     if (dx) gemm(false, false, M, K, N, 1.0f, dy, N, w, K, 1.0f, dx, K);
     if (dw) gemm(true,  false, N, K, M, 1.0f, dy, N, x, K, 1.0f, dw, K);
+}
+
+void linear_backward_half(const float* x, const u16* w, const float* dy,
+                          float* dx, float* dw, int M, int K, int N) {
+    if (M <= 0 || K <= 0 || N <= 0) return;
+    // dx = dy [M,N] @ w [N,K], computed with the half weights and an FP32
+    // accumulator. Only dy (M*N, small) is mirrored to half; the weight is
+    // already half and is read directly, so no weight-sized FP32 copy and no
+    // extra VRAM is needed.
+    if (dx) {
+        __half* dyh = (__half*)workspace(sizeof(__half) * (size_t)M * N);
+        k_f32_to_f16_flat<<<grid_for((i64)M * N, 256), 256>>>(dy, dyh, (i64)M * N);
+        CU_CHECK(cudaGetLastError());
+        cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
+        const float alpha = 1.0f, beta = 1.0f;  // dx arrives pre-zeroed; accumulate
+        // cuBLAS is column-major. The row-major half weight [N,K] with lda=K
+        // is seen as [K,N]; dyh [M,N] with ldb=N as [N,M]. C is [K,M] col-major
+        // = [M,K] row-major with ldc=K. All leading dims satisfy cuBLAS.
+        cublasStatus_t s = cublasGemmEx(h,
+                                        CUBLAS_OP_N, CUBLAS_OP_N,
+                                        K, M, N,
+                                        &alpha,
+                                        w, CUDA_R_16F, K,
+                                        dyh, CUDA_R_16F, N,
+                                        &beta,
+                                        dx, CUDA_R_32F, K,
+                                        CUBLAS_COMPUTE_32F,
+                                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (s != CUBLAS_STATUS_SUCCESS)
+            GAI_FAIL(strfmt("cublasGemmEx fp16 backward failed (status=%d) | M=%d N=%d K=%d",
+                            static_cast<int>(s), M, N, K));
+    }
+    // dw = dy^T @ x. Both operands are FP32 activations (the weight pointer
+    // is not used here), so the existing GEMM is correct and needs no half path.
+    if (dw) gemm(true, false, N, K, M, 1.0f, dy, N, x, K, 1.0f, dw, K);
 }
 
 __global__ void k_add(const float* a, const float* b, float* o, i64 n) {
@@ -614,6 +661,8 @@ void embedding_forward_half(const i32* ids, const u16* table, float* out,
 void embedding_backward(const i32* ids, const float* dout, float* dtable,
                         i64 ntok, int dim, int vocab) {
     if (ntok <= 0) return;
+    // A frozen embedding table has no gradient buffer (BUG-13).
+    if (!dtable) return;
     GAI_CHECK(ntok <= 2147483647LL, "embedding_backward: ntok exceeds INT_MAX");
     int block = dim >= 256 ? 256 : ((dim + 31) / 32) * 32;
     if (block < 32) block = 32;

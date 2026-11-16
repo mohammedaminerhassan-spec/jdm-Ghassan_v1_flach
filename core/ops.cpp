@@ -12,6 +12,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #ifdef GAI_CUDA
 #define GAI_DISPATCH(dev, call) \
@@ -257,6 +258,20 @@ void convert_f32_to_f16(Device dev, const float* src, u16* dst, i64 n) {
     }
 #ifdef GAI_CUDA
     cuda_ops::convert_f32_to_f16(src, dst, n);
+#else
+    GAI_FAIL("convert_f32_to_f16: CUDA device requested but the build has no CUDA support");
+#endif
+}
+
+void convert_f16_to_f32(Device dev, const u16* src, float* dst, i64 n) {
+    if (dev == Device::CPU) {
+        for (i64 i = 0; i < n; ++i) dst[i] = fp16_to_fp32(src[i]);
+        return;
+    }
+#ifdef GAI_CUDA
+    cuda_ops::convert_f16_to_f32(src, dst, n);
+#else
+    GAI_FAIL("convert_f16_to_f32: CUDA device requested but the build has no CUDA support");
 #endif
 }
 
@@ -281,6 +296,18 @@ void linear_backward(Device dev, const float* x, const float* w, const float* dy
 
     g_perf_gemm.fetch_add((dx ? 1u : 0u) + (dw ? 1u : 0u), std::memory_order_relaxed);
     GAI_DISPATCH(dev, linear_backward(x, w, dy, dx, dw, M, K, N));
+}
+
+void linear_backward_half(Device dev, const float* x, const u16* w, const float* dy,
+                          float* dx, float* dw, int M, int K, int N) {
+    g_perf_gemm.fetch_add((dx ? 1u : 0u) + (dw ? 1u : 0u), std::memory_order_relaxed);
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::linear_backward_half(x, w, dy, dx, dw, M, K, N);
+        return;
+    }
+#endif
+    cpu::linear_backward_half(x, w, dy, dx, dw, M, K, N);
 }
 
 void add(Device dev, const float* a, const float* b, float* out, i64 n) {
@@ -467,6 +494,51 @@ void mamba2_forward_half(Device dev,
     cpu::mamba2_forward_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
                              state, out, B, T, d, d_inner, conv_dim, n_heads,
                              d_head, d_state, k, eps);
+}
+
+void mamba2_backward_half(Device dev,
+                     const float* x,
+                     const u16* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const u16* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     float* dbc_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::mamba2_backward_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                                       norm_w, w_out, dout, dx, dw_in, dconv_w, dconv_b,
+                                       ddt_bias, da_log, dD, dnorm_w, dw_out, dbc_out,
+                                       B, T, d, d_inner, conv_dim, n_heads,
+                                       d_head, d_state, k, eps);
+        return;
+    }
+#endif
+    (void)dev;
+    const i64 nin = static_cast<i64>(d_inner + conv_dim + n_heads) * d;
+    const i64 nout = static_cast<i64>(d) * d_inner;
+    std::vector<float> wi(static_cast<size_t>(nin)), wo(static_cast<size_t>(nout));
+    for (i64 i = 0; i < nin; ++i) wi[static_cast<size_t>(i)] = fp16_to_fp32(w_in[i]);
+    for (i64 i = 0; i < nout; ++i) wo[static_cast<size_t>(i)] = fp16_to_fp32(w_out[i]);
+    cpu::mamba2_backward(x, wi.data(), conv_w, conv_b, dt_bias, a_log, D, norm_w, wo.data(),
+                         dout, dx, dw_in, dconv_w, dconv_b, ddt_bias, da_log, dD,
+                         dnorm_w, dw_out, dbc_out, B, T, d, d_inner, conv_dim, n_heads,
+                         d_head, d_state, k, eps);
 }
 
 void mamba2_backward(Device dev,
@@ -688,6 +760,50 @@ void moe_forward_bias_half(Device dev,
                                out, probs_cache, idx_cache, w_cache,
                                s_gate, s_up, s_act, N, d, E, ne, K, SH);
     perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+}
+
+void moe_backward_half(Device dev,
+                  const float* x, const float* router_w,
+                  const u16* gates, const u16* ups, const u16* downs,
+                  const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                  const float* probs, const i32* idx, const float* tw,
+                  const float* s_gate, const float* s_up, const float* s_act,
+                  const float* aux_frac, float aux_scale,
+                  const float* dout, float* dx,
+                  float* drouter_w, float* dgates, float* dups, float* ddowns,
+                  float* dsh_g, float* dsh_u, float* dsh_d,
+                  float* s_dact,
+                  i64 N, int d, int E, int ne, int K, int SH) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_backward_half(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                                    probs, idx, tw, s_gate, s_up, s_act,
+                                    aux_frac, aux_scale, dout, dx,
+                                    drouter_w, dgates, dups, ddowns,
+                                    dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
+        return;
+    }
+#endif
+    // CPU reference: widen once, then reuse the FP32 kernel.
+    const i64 ng = static_cast<i64>(ne) * E * d;
+    const i64 nd = static_cast<i64>(ne) * d * E;
+    const i64 ns = static_cast<i64>(SH) * d;
+    auto widen = [](const u16* src, i64 n) {
+        std::vector<float> v(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; ++i) v[static_cast<size_t>(i)] = fp16_to_fp32(src[i]);
+        return v;
+    };
+    std::vector<float> gf = widen(gates, ng), uf = widen(ups, ng), df = widen(downs, nd);
+    std::vector<float> sf = sh_g ? widen(sh_g, ns) : std::vector<float>();
+    std::vector<float> su = sh_u ? widen(sh_u, ns) : std::vector<float>();
+    std::vector<float> sd = sh_d ? widen(sh_d, ns) : std::vector<float>();
+    cpu::moe_backward(x, router_w, gf.data(), uf.data(), df.data(),
+                      sh_g ? sf.data() : nullptr, sh_u ? su.data() : nullptr,
+                      sh_d ? sd.data() : nullptr,
+                      probs, idx, tw, s_gate, s_up, s_act,
+                      aux_frac, aux_scale, dout, dx,
+                      drouter_w, dgates, dups, ddowns,
+                      dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
 }
 
 void moe_backward(Device dev,

@@ -621,6 +621,14 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
                         pos.c_str()));
     }
 
+    // HuggingFace's load-balancing coefficient. granite-4.0-h-tiny ships
+    // router_aux_loss_coef = 0.0: leaving the engine default (0.01) would add
+    // an auxiliary loss the reference model never applies, changing every
+    // fine-tuning gradient and the reported loss.
+    if (j.has("router_aux_loss_coef")) {
+        cfg_.moe_aux_scale = static_cast<float>(fnum("router_aux_loss_coef", 0.0));
+    }
+
     // RoPE scaling (YaRN). Map the factor onto the engine's YaRN rope path so
     // a long-context checkpoint keeps the intended frequencies instead of
     // silently running the base theta. Only YaRN is supported precisely.

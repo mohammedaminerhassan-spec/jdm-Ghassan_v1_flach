@@ -445,9 +445,9 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
 
     if (target == GGMLType::Q4_1) {
 
-        // GGML's block_q4_1: f16 d, f16 m, then 16 bytes of nibbles. The low
-        // nibble of byte j holds element j, the high nibble element j+16, and
-        // the value is d*q + m.
+        // GGML's block_q4_1: f16 d, f16 m, then 16 bytes of nibbles. Unlike
+        // Q4_0, GGML stores ADJACENT elements: low nibble = 2*j, high nibble
+        // = 2*j+1, value = d*q + m. (quantize.cpp uses the same layout.)
         size_t nblocks = (n + 31) / 32;
         std::vector<uint8_t> out(nblocks * 20);
         for (size_t b = 0; b < nblocks; ++b) {
@@ -477,8 +477,10 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
             std::memcpy(block, &sh_d, 2);
             std::memcpy(block + 2, &sh_m, 2);
             for (int j = 0; j < 16; ++j) {
-                const float f0 = (start + j      < end) ? src[start + j]      : mn;
-                const float f1 = (start + j + 16 < end) ? src[start + j + 16] : mn;
+                const size_t i0 = static_cast<size_t>(2 * j);
+                const size_t i1 = i0 + 1;
+                const float f0 = (start + i0 < end) ? src[start + i0] : mn;
+                const float f1 = (start + i1 < end) ? src[start + i1] : mn;
                 const int xi0 = std::max(0, std::min(15, static_cast<int>(std::lround((f0 - mn) * inv))));
                 const int xi1 = std::max(0, std::min(15, static_cast<int>(std::lround((f1 - mn) * inv))));
                 block[4 + j] = static_cast<uint8_t>((xi1 << 4) | xi0);
@@ -614,8 +616,8 @@ void GGUFWriter::write() {
                         const float m = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(blk + 2));
                         for (int j = 0; j < 16; ++j) {
                             const uint8_t byte = blk[4 + j];
-                            const size_t i0 = b * 32 + static_cast<size_t>(j);
-                            const size_t i1 = i0 + 16;
+                            const size_t i0 = b * 32 + static_cast<size_t>(2 * j);
+                            const size_t i1 = i0 + 1;
                             if (i0 < n) back[i0] = d * static_cast<float>(byte & 0x0F) + m;
                             if (i1 < n) back[i1] = d * static_cast<float>(byte >> 4) + m;
                         }
@@ -902,36 +904,56 @@ bool GGUFReader::get_bool(const std::string& key, bool def) const {
     return def;
 }
 
-std::vector<i32> GGUFReader::eos_ids() const {
+namespace {
+
+// A GGUF EOS id may be a scalar UINT32 or an ARRAY of UINT32/INT32. The
+// scalar-only reader silently dropped the array form used by many llama.cpp
+// exports, so generation never stopped on those tokens.
+i32 gguf_read_id_bytes(const uint8_t* p) {
+    return static_cast<i32>(static_cast<uint32_t>(p[0]) |
+                            (static_cast<uint32_t>(p[1]) << 8) |
+                            (static_cast<uint32_t>(p[2]) << 16) |
+                            (static_cast<uint32_t>(p[3]) << 24));
+}
+
+void gguf_append_ids(const GGUFMetadataValue& v, std::vector<i32>& out) {
+    if (v.type == GGUFType::UINT32 && v.data.size() >= 4) {
+        const i32 id = gguf_read_id_bytes(v.data.data());
+        if (std::find(out.begin(), out.end(), id) == out.end()) out.push_back(id);
+        return;
+    }
+    if (v.type != GGUFType::ARRAY || v.data.size() < 12) return;
+    const uint8_t* p = v.data.data();
+    const GGUFType et = static_cast<GGUFType>(p[0] | (p[1] << 8) | (p[2] << 16) |
+                                              (static_cast<uint32_t>(p[3]) << 24));
+    uint64_t cnt = 0;
+    for (int k = 0; k < 8; ++k) cnt |= static_cast<uint64_t>(p[4 + k]) << (8 * k);
+    const size_t esz = gguf_scalar_size(et);
+    if (esz == 0 || (et != GGUFType::UINT32 && et != GGUFType::INT32)) return;
+    for (uint64_t j = 0; j < cnt; ++j) {
+        const size_t off = 12 + static_cast<size_t>(j) * esz;
+        if (off + 4 > v.data.size()) break;
+        const i32 id = gguf_read_id_bytes(p + off);
+        if (std::find(out.begin(), out.end(), id) == out.end()) out.push_back(id);
+    }
+}
+
+}  // namespace
+
+std::vector<i32> gguf_stop_ids(const GGUFReader& r) {
     std::vector<i32> out;
     // Only push an id when the key is actually present. Falling back to 0
     // would make the generator stop on the very first sampled token (0 is a
-    // perfectly ordinary token in most vocabularies).
-    //
-    // UINT32 metadata is stored in 4 bytes (see GGUFWriter::set_u32). The
-    // reader used to require 8 and silently pushed 0 otherwise, so every
-    // exported file reported eos = 0. On Granite id 0 is "!", which made the
-    // generator stop as soon as the model emitted an exclamation mark
-    // ("Hello" instead of "Hello! I am an AI ...").
-    auto it = metadata_.find("tokenizer.ggml.eos_token_id");
-    if (it != metadata_.end() && it->second.type == GGUFType::UINT32 &&
-        it->second.data.size() >= 4) {
-        out.push_back(static_cast<i32>(
-            static_cast<uint32_t>(it->second.data[0]) |
-            (static_cast<uint32_t>(it->second.data[1]) << 8) |
-            (static_cast<uint32_t>(it->second.data[2]) << 16) |
-            (static_cast<uint32_t>(it->second.data[3]) << 24)));
-    }
-    it = metadata_.find("tokenizer.ggml.eot_token_id");
-    if (it != metadata_.end() && it->second.type == GGUFType::UINT32 &&
-        it->second.data.size() >= 4) {
-        const i32 eot = static_cast<i32>(it->second.data[0] |
-                                         (static_cast<uint32_t>(it->second.data[1]) << 8) |
-                                         (static_cast<uint32_t>(it->second.data[2]) << 16) |
-                                         (static_cast<uint32_t>(it->second.data[3]) << 24));
-        if (std::find(out.begin(), out.end(), eot) == out.end()) out.push_back(eot);
+    // perfectly ordinary token in most vocabularies, "!" on Granite).
+    for (const char* key : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"}) {
+        auto it = r.metadata().find(key);
+        if (it != r.metadata().end()) gguf_append_ids(it->second, out);
     }
     return out;
+}
+
+std::vector<i32> GGUFReader::eos_ids() const {
+    return gguf_stop_ids(*this);
 }
 
 bool GGUFReader::has_tokenizer() const {
@@ -1321,14 +1343,11 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
             const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
             const float m = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block + 2));
             for (int j = 0; j < 16; ++j) {
-                if (b*32 + j >= nelems) break;
+                const size_t i0 = b * 32 + static_cast<size_t>(2 * j);
+                const size_t i1 = i0 + 1;
                 const uint8_t byte = block[4 + j];
-                dst[b*32 + j] = d * static_cast<float>(byte & 0x0F) + m;
-                acc(dst[b*32 + j]);
-                if (b*32 + j + 16 < nelems) {
-                    dst[b*32 + j + 16] = d * static_cast<float>(byte >> 4) + m;
-                    acc(dst[b*32 + j + 16]);
-                }
+                if (i0 < nelems) { dst[i0] = d * static_cast<float>(byte & 0x0F) + m; acc(dst[i0]); }
+                if (i1 < nelems) { dst[i1] = d * static_cast<float>(byte >> 4) + m; acc(dst[i1]); }
             }
         }
     } else if (ti->type == GGMLType::Q4_0) {

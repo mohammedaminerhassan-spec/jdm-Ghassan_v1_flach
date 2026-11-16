@@ -10,6 +10,7 @@
 #include "cuda/cuda_utils.h"
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -482,6 +483,10 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         Parameter* tok_emb_early = model_.find_parameter("tok_embeddings");
         GAI_CHECK(tok_emb_early != nullptr, "freeze_embeddings: tok_embeddings not found");
         tok_emb_early->frozen = true;
+        // BUG-13: a frozen parameter must not keep a gradient buffer (4 bytes
+        // per parameter; 27 GB for the 6.94B Granite) and the backward must
+        // not compute its dW.
+        tok_emb_early->g = Tensor();
         frozen_emb_ = tok_emb_early;
     } else {
         frozen_emb_ = nullptr;
@@ -1847,7 +1852,12 @@ void Trainer::sync_model() {
         size_t numel = static_cast<size_t>(p->w.numel());
         if (numel == 0) continue;
 
-        dist_->broadcast(p->w.data_ptr(), numel, sizeof(float), 0);
+        // The half weight storage mode keeps the frozen base matrices in
+        // FP16. Broadcasting them as FP32 read/wrote 2x the allocated bytes
+        // (out-of-bounds device access). Derive the element size from the
+        // tensor itself; broadcast() maps it to the matching nccl data type.
+        const int elem_bytes = (p->w.dtype() == DType::F16) ? 2 : 4;
+        dist_->broadcast(p->w.data_ptr(), numel, elem_bytes, 0);
     }
     dist_->barrier();
 #else

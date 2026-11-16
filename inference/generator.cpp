@@ -648,7 +648,12 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     Tensor utmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
     Tensor atmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
 
-    ops::embedding_forward(dev, d_ids.i32p(), model_.tok_embeddings().w.f32(), x.f32(), P, d, c.vocab_size);
+    if (model_.tok_embeddings().is_half())
+        ops::embedding_forward_half(dev, d_ids.i32p(), model_.tok_embeddings().w.ptr<u16>(),
+                                    x.f32(), P, d, c.vocab_size);
+    else
+        ops::embedding_forward(dev, d_ids.i32p(), model_.tok_embeddings().w.f32(),
+                               x.f32(), P, d, c.vocab_size);
     // Granite scales the embeddings (12x). The prefill must do it too, or it
     // disagrees with the decode path and with the model's forward.
     if (c.embedding_multiplier != 1.0f)
@@ -705,14 +710,11 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
         }
 
         if (cache_.fp16()) {
+            // kp/vp live on the device. Converting them on the host was an
+            // illegal device-pointer dereference; do it with the device kernel.
             const size_t n = static_cast<size_t>(P) * static_cast<size_t>(kvd);
-            std::vector<u16> kh(n), vh(n);
-            for (size_t i = 0; i < n; ++i) {
-                kh[i] = fp32_to_fp16(kp[i]);
-                vh[i] = fp32_to_fp16(vp[i]);
-            }
-            device_copy(cache_.k_f16(l), dev, kh.data(), Device::CPU, sizeof(u16) * n);
-            device_copy(cache_.v_f16(l), dev, vh.data(), Device::CPU, sizeof(u16) * n);
+            ops::convert_f32_to_f16(dev, kp, cache_.k_f16(l), static_cast<i64>(n));
+            ops::convert_f32_to_f16(dev, vp, cache_.v_f16(l), static_cast<i64>(n));
         } else {
             device_copy(cache_.k(l), dev, kp, dev, sizeof(float) * (size_t)P * kvd);
             device_copy(cache_.v(l), dev, vp, dev, sizeof(float) * (size_t)P * kvd);
@@ -727,7 +729,18 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
         ops::rmsnorm_forward(dev, x.f32(), L.ffn_norm.w.f32(), xb.f32(), nullptr, P, d, c.rms_eps);
         if (L.has_moe()) {
             const float* bias = model_.moe_bias_ptr(l);
-            ops::moe_forward_bias(dev, xb.f32(), L.router.w.f32(), bias,
+            if (L.moe_gate.is_half()) {
+                ops::moe_forward_bias_half(dev, xb.f32(), L.router.w.f32(), bias,
+                                  L.moe_gate.w.ptr<u16>(), L.moe_up.w.ptr<u16>(), L.moe_down.w.ptr<u16>(),
+                                  L.sh_gate.w.defined() ? L.sh_gate.w.ptr<u16>() : nullptr,
+                                  L.sh_up.w.defined()   ? L.sh_up.w.ptr<u16>()   : nullptr,
+                                  L.sh_down.w.defined() ? L.sh_down.w.ptr<u16>() : nullptr,
+                                  proj.f32(), nullptr, nullptr, nullptr,
+                                  mg.f32(), mu.f32(), ma.f32(),
+                                  P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
+                                  c.shared_width());
+            } else {
+                ops::moe_forward_bias(dev, xb.f32(), L.router.w.f32(), bias,
                                   L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
                                   L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
                                   L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
@@ -736,6 +749,7 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
                                   mg.f32(), mu.f32(), ma.f32(),
                                   P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
                                   c.shared_width());
+            }
         } else {
             linear_param(dev, L.w_gate.w, xb.f32(), gtmp.f32(), P, d, c.intermediate_size);
             linear_param(dev, L.w_up.w, xb.f32(), utmp.f32(), P, d, c.intermediate_size);
@@ -753,6 +767,9 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
                          nullptr, 1, d, c.rms_eps);
     linear_param(dev, model_.lm_head().w, hlast_.f32(),
                  logits_dev_.f32(), 1, d, c.vocab_size);
+    // Keep the first sampled token on the same scale as all decode steps.
+    if (c.logits_scaling != 1.0f)
+        ops::scale_inplace(dev, logits_dev_.f32(), 1.0f / c.logits_scaling, c.vocab_size);
     device_copy(logits_host_.data(), Device::CPU,
                 logits_dev_.f32(), dev,
                 sizeof(float) * (size_t)c.vocab_size);
@@ -938,8 +955,26 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
     return out;
 }
 
+std::vector<std::pair<i32, float>> Generator::top_candidates(int n) {
+    const int V = model_.config().vocab_size;
+    std::vector<float> host(static_cast<size_t>(V), 0.0f);
+    device_copy(host.data(), Device::CPU, logits_dev_.f32(), model_.device(),
+                sizeof(float) * static_cast<size_t>(V));
+    std::vector<std::pair<i32, float>> v;
+    v.reserve(static_cast<size_t>(V));
+    for (int i = 0; i < V; ++i) v.emplace_back(static_cast<i32>(i), host[static_cast<size_t>(i)]);
+    const int k = std::min<int>(n, static_cast<int>(v.size()));
+    if (k > 0 && k < static_cast<int>(v.size())) {
+        std::partial_sort(v.begin(), v.begin() + k, v.end(),
+                          [](const auto& a, const auto& b) { return a.second > b.second; });
+        v.resize(static_cast<size_t>(k));
+    }
+    return v;
+}
+
 std::string Generator::complete(const std::string& prompt, const GenerationConfig& cfg,
-                                StreamFn on_token) {
+                                StreamFn on_token,
+                                std::function<void()> after_prefill) {
     GAI_CHECK(cfg.max_context == 0 || cfg.max_context == max_context_,
               "GenerationConfig::max_context must match the Generator context");
     reset();
@@ -948,13 +983,15 @@ std::string Generator::complete(const std::string& prompt, const GenerationConfi
     // here made the served prompt differ from what the model was trained on.
     std::vector<i32> ids = tok_.encode(prompt, tok_.add_bos(), false);
     prefill(ids);
+    if (after_prefill) after_prefill();
     std::vector<i32> gen = generate(cfg, on_token);
     std::string text = tok_.decode(gen, true);
     return cfg.echo_prompt ? prompt + text : text;
 }
 
 std::string Generator::chat(const std::vector<Message>& msgs, const GenerationConfig& cfg,
-                            StreamFn on_token) {
+                            StreamFn on_token,
+                            std::function<void()> after_prefill) {
     GAI_CHECK(cfg.max_context == 0 || cfg.max_context == max_context_,
               "GenerationConfig::max_context must match the Generator context");
     reset();
@@ -986,6 +1023,7 @@ std::string Generator::chat(const std::vector<Message>& msgs, const GenerationCo
                         budget));
     }
     prefill(ids, 0, nullptr, nullptr, 0);
+    if (after_prefill) after_prefill();
     std::vector<i32> gen = generate(cfg, on_token);
     return tok_.decode(gen, true);
 }

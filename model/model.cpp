@@ -31,6 +31,18 @@ inline void linear_param(Device dev, const Tensor& w, const float* x, float* y,
         ops::linear_forward(dev, x, w.f32(), y, M, K, N);
 }
 
+// The gradient pointer of a parameter, or nullptr when the parameter is
+// frozen (no gradient buffer) or when the tensor does not exist.
+//
+// BUG-13: the frozen weights used to get a full fp32 gradient buffer (27 GB
+// for a 6.94B Granite) and their dW was computed on every step, even
+// though the optimizer throws it away. Every op that writes a dW must
+// accept a nullptr and skip only the dW part - the dx (the gradient that
+// flows to the previous layers) is always needed.
+inline float* gptr(Tensor& g) {
+    return g.defined() ? g.ptr<float>() : nullptr;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- MoE aux loss
@@ -773,14 +785,14 @@ static void lora_backward(LoraAdapter& ad, Device dev, const float* x, const flo
     const float s = ad.scale();
     // gB += s * dY^T * R
     ops::gemm(dev, true, false, ad.out_dim, r, M, s, dy, ad.out_dim,
-              ad.r_buf.f32(), r, 1.0f, ad.B.g.f32(), r);
+              ad.r_buf.f32(), r, 1.0f, gptr(ad.B.g), r);
     // dR = s * dY * B
     Tensor dR({M, r}, DType::F32, dev);
     ops::gemm(dev, false, false, M, r, ad.out_dim, s, dy, ad.out_dim,
               ad.B.w.f32(), r, 0.0f, dR.f32(), r);
     // gA += dR^T * X
     ops::gemm(dev, true, false, r, ad.in_dim, M, 1.0f, dR.f32(), r, x, ad.in_dim,
-              1.0f, ad.A.g.f32(), ad.in_dim);
+              1.0f, gptr(ad.A.g), ad.in_dim);
     // dx += dR * A
     if (dx) {
         ops::gemm(dev, false, false, M, ad.in_dim, r, 1.0f, dR.f32(), r, ad.A.w.f32(), ad.in_dim,
@@ -901,6 +913,12 @@ void Model::forward_mamba_layer(Device dev, int l, Activations& act, i64 N) {
 DType Model::storage_dtype_for(const std::string& name) const {
     if (!weight_f16_) return DType::F32;
 
+    // The LoRA adapters are the TRAINABLE parameters in the half mode: the
+    // base weights are frozen (the optimizer never touches them, so they do
+    // not need an fp32 master) but the adapters DO get updated, and a half
+    // master would swallow the small updates. They stay fp32.
+    if (name.find("lora_") != std::string::npos) return DType::F32;
+
     // The fragile vectors stay fp32. This is the same list the GGUF export
     // keeps at full precision, and the same reason: the values cancel or
     // feed an exponential, so a 4-bit (or even a 16-bit) copy moves the
@@ -942,11 +960,14 @@ Model::Model(ModelConfig cfg, Device dev, bool fp16_weights) : cfg_(std::move(cf
     // The storage dtype has to be known BEFORE the parameters are allocated.
     weight_f16_ = fp16_weights;
     if (weight_f16_ && cfg_.lora_rank > 0) {
-        // Training needs the fp32 masters: the gradients and the optimizer
-        // states are fp32 and a half master would break the update.
-        log_warn("[prec] the fp16 weight storage mode is off: LoRA training needs "
-                 "the fp32 masters");
-        weight_f16_ = false;
+        // BUG-14: the half storage mode is COMPATIBLE with a LoRA run: the
+        // base weights are frozen (the optimizer never updates them, so they
+        // need no fp32 master) and the adapters - the only trainable
+        // parameters - stay fp32. This is what makes a LoRA run of the 6.94B
+        // Granite fit on a 16 GB T4: 12.9 GB of weights instead of 27.7 GB.
+        log_info("[prec] the half weight storage is on: the base weights are "
+                 "frozen (12.9 GB instead of 27.7 GB for the Granite) and the "
+                 "LoRA adapters stay fp32");
     }
 
     // YaRN is approximate NTK extrapolation (not exact long-ctx training).
@@ -1300,14 +1321,25 @@ void Model::merge_lora() {
         // that OOMs the machine. The GPU does the same arithmetic in one
         // pass, with no copy at all.
         Parameter& base = *j.base;
-        GAI_CHECK(base.w.dtype() == DType::F32,
-                  "merge_lora: the base weights must be fp32 (the LoRA mode keeps "
-                  "the fp32 masters; the half storage mode is disabled when an "
-                  "adapter is present): " + base.name);
-        ops::gemm(device_, false, false, out_d, in_d, r, sc,
-                  j.ad->B.w.f32(), r,
-                  j.ad->A.w.f32(), in_d,
-                  1.0f, base.w.f32(), in_d);
+        if (base.w.dtype() == DType::F16) {
+            // The half-storage LoRA run keeps its base weights in FP16. Merge
+            // one adapter at a time in an FP32 tile (a few MB), then write the
+            // half bytes back — no 27 GB FP32 master copy, no host roundtrip.
+            Tensor tmp(base.w.shape(), DType::F32, device_);
+            ops::convert_f16_to_f32(device_, base.w.ptr<u16>(), tmp.f32(), base.numel());
+            ops::gemm(device_, false, false, out_d, in_d, r, sc,
+                      j.ad->B.w.f32(), r,
+                      j.ad->A.w.f32(), in_d,
+                      1.0f, tmp.f32(), in_d);
+            ops::convert_f32_to_f16(device_, tmp.f32(), base.w.ptr<u16>(), base.numel());
+        } else {
+            GAI_CHECK(base.w.dtype() == DType::F32,
+                      "merge_lora: unsupported base weight dtype for " + base.name);
+            ops::gemm(device_, false, false, out_d, in_d, r, sc,
+                      j.ad->B.w.f32(), r,
+                      j.ad->A.w.f32(), in_d,
+                      1.0f, base.w.f32(), in_d);
+        }
     }
 
     // The adapters are now baked into the base weights: neutralize them so a
@@ -1485,6 +1517,15 @@ void Model::enable_grad(bool on) {
     }
     for (Parameter* p : params_) {
         if (on) {
+            // BUG-13: a frozen parameter gets NO gradient buffer. The buffer
+            // was 4 bytes per parameter: 27 GB for the 6.94B Granite, and
+            // the optimizer ignored it anyway. The backward now passes
+            // nullptr for these weights and skips the dW (the dx is still
+            // computed - it carries the gradient to the previous layers).
+            if (p->frozen) {
+                p->g = Tensor();
+                continue;
+            }
             if (!p->g.defined()) {
                 p->g = Tensor::zeros(p->shape, DType::F32, device_);
                 p->g.set_name(p->name + ".grad");
@@ -2364,9 +2405,20 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                Activations& act, i64* out_ntok, float dout_scale,
                                bool want_aux_stats, const i32* segment_ids,
                                const i32* host_targets) {
-    GAI_CHECK(!weight_f16_,
-              "the training path needs the fp32 masters: turn the fp16 weight "
-              "storage off (--weight-f16 0)");
+    // BUG-14: the half weight storage mode is allowed in the training path
+    // as long as every TRAINABLE parameter keeps an fp32 master. The frozen
+    // base weights are never updated by the optimizer, so they need no
+    // master at all: that is what lets a LoRA run of the 6.94B Granite fit
+    // on a 16 GB T4 (12.9 GB of weights instead of 27.7 GB).
+    if (weight_f16_) {
+        for (const Parameter* p : params_) {
+            if (p->frozen) continue;
+            GAI_CHECK(p->w.dtype() == DType::F32,
+                      "the training path needs an fp32 master for the trainable "
+                      "parameter " + p->name +
+                      " (turn the half weight storage off, or freeze it)");
+        }
+    }
     GAI_CHECK(act.with_grad, "forward_backward requires gradient activations");
     GAI_CHECK(grad_enabled_, "call enable_grad(true) before forward_backward");
 
@@ -2379,7 +2431,13 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     const int KV  = cfg_.num_kv_heads;
     const int hd  = cfg_.head_dim();
     const i64 N   = static_cast<i64>(B) * T;
-    const float scale = (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale_local(cfg_);
+    // Must match forward_body() exactly: Granite ships an explicit
+    // attention_multiplier (1/head_dim = 0.0078125 for granite-4.0-h-tiny).
+    // Using 1/sqrt(hd) here made the recomputed backward probabilities ~11x
+    // too large and silently corrupted every attention gradient.
+    const float scale = (cfg_.attention_multiplier > 0.0f)
+                            ? cfg_.attention_multiplier
+                            : (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale_local(cfg_);
     Device dev = device_;
 
     forward_body(ids, B, T, act, segment_ids);
@@ -2435,8 +2493,12 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
         float chunk_dscale = eff_scale;
         if (cfg_.logits_scaling != 1.0f) chunk_dscale /= cfg_.logits_scaling;
         if (chunk_dscale != 1.0f) ops::scale_inplace(dev, dlogits_c, chunk_dscale, Cr * V);
-        ops::linear_backward(dev, hnorm_full + r0 * d, lm_head().w.f32(), dlogits_c,
-                             act.dxb.f32() + r0 * d, lm_head().g.f32(), Ci, d, V);
+        if (lm_head().is_half())
+            ops::linear_backward_half(dev, hnorm_full + r0 * d, lm_head().w.ptr<u16>(), dlogits_c,
+                                      act.dxb.f32() + r0 * d, gptr(lm_head().g), Ci, d, V);
+        else
+            ops::linear_backward(dev, hnorm_full + r0 * d, lm_head().w.f32(), dlogits_c,
+                                 act.dxb.f32() + r0 * d, gptr(lm_head().g), Ci, d, V);
     }
     double loss_sum = 0.0;
     i64 ntok = 0;
@@ -2461,7 +2523,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     // ---- final norm
     ops::zero(dev, act.dx.f32(), N * d);
     ops::rmsnorm_backward(dev, act.saved_xfinal.f32(), final_norm_.w.f32(), act.dxb.f32(),
-                          act.saved_rrms_final.f32(), act.dx.f32(), final_norm_.g.f32(), N, d);
+                          act.saved_rrms_final.f32(), act.dx.f32(), gptr(final_norm_.g), N, d);
 
     // ---- layers, in reverse
     for (int l = cfg_.num_layers - 1; l >= 0; --l) {
@@ -2510,7 +2572,28 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                  static_cast<float>(cfg_.num_layers > 0 ? cfg_.num_layers : 1);
             }
             ops::zero(dev, act.dxb.f32(), N * d);
-            ops::moe_backward(dev, act.saved_xb2[sl].f32(), L.router.w.f32(),
+            if (L.moe_gate.is_half()) {
+                ops::moe_backward_half(dev, act.saved_xb2[sl].f32(), L.router.w.f32(),
+                              L.moe_gate.w.ptr<u16>(), L.moe_up.w.ptr<u16>(), L.moe_down.w.ptr<u16>(),
+                              L.sh_gate.w.defined() ? L.sh_gate.w.ptr<u16>() : nullptr,
+                              L.sh_up.w.defined()   ? L.sh_up.w.ptr<u16>()   : nullptr,
+                              L.sh_down.w.defined() ? L.sh_down.w.ptr<u16>() : nullptr,
+                              act.saved_moe_probs[sl].f32(),
+                              act.saved_moe_idx[sl].i32p(),
+                              act.saved_moe_w[sl].f32(),
+                              act.saved_gate[sl].f32(), act.saved_up[sl].f32(),
+                              act.saved_act[sl].f32(),
+                              aux_frac, aux_scale_grad,
+                              dy_ffn, act.dxb.f32(),
+                              gptr(L.router.g), gptr(L.moe_gate.g),
+                              gptr(L.moe_up.g), gptr(L.moe_down.g),
+                              L.sh_gate.g.defined() ? L.sh_gate.g.f32() : nullptr,
+                              L.sh_up.g.defined()   ? L.sh_up.g.f32()   : nullptr,
+                              L.sh_down.g.defined() ? L.sh_down.g.f32() : nullptr,
+                              act.moe_dact.f32(),
+                              N, d, E, ne, K, cfg_.shared_width());
+            } else {
+                ops::moe_backward(dev, act.saved_xb2[sl].f32(), L.router.w.f32(),
                               L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
                               L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
                               L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
@@ -2522,17 +2605,22 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                               act.saved_act[sl].f32(),
                               aux_frac, aux_scale_grad,
                               dy_ffn, act.dxb.f32(),
-                              L.router.g.f32(), L.moe_gate.g.f32(),
-                              L.moe_up.g.f32(), L.moe_down.g.f32(),
+                              gptr(L.router.g), gptr(L.moe_gate.g),
+                              gptr(L.moe_up.g), gptr(L.moe_down.g),
                               L.sh_gate.g.defined() ? L.sh_gate.g.f32() : nullptr,
                               L.sh_up.g.defined()   ? L.sh_up.g.f32()   : nullptr,
                               L.sh_down.g.defined() ? L.sh_down.g.f32() : nullptr,
                               act.moe_dact.f32(),
                               N, d, E, ne, K, cfg_.shared_width());
+            }
         } else {
             ops::zero(dev, act.dact.f32(), N * F);
-            ops::linear_backward(dev, act.saved_act[sl].f32(), L.w_down.w.f32(), dy_ffn,
-                                 act.dact.f32(), L.w_down.g.f32(), static_cast<int>(N), F, d);
+            if (L.w_down.is_half())
+                ops::linear_backward_half(dev, act.saved_act[sl].f32(), L.w_down.w.ptr<u16>(), dy_ffn,
+                                          act.dact.f32(), gptr(L.w_down.g), static_cast<int>(N), F, d);
+            else
+                ops::linear_backward(dev, act.saved_act[sl].f32(), L.w_down.w.f32(), dy_ffn,
+                                     act.dact.f32(), gptr(L.w_down.g), static_cast<int>(N), F, d);
             lora_backward(L.lora_down, dev, act.saved_act[sl].f32(), dy_ffn, act.dact.f32(), static_cast<int>(N));
 
             ops::zero(dev, act.dgate.f32(), N * F);
@@ -2541,17 +2629,24 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                  act.dact.f32(), act.dgate.f32(), act.dup.f32(), N * F);
 
             ops::zero(dev, act.dxb.f32(), N * d);
-            ops::linear_backward(dev, act.saved_xb2[sl].f32(), L.w_gate.w.f32(), act.dgate.f32(),
-                                 act.dxb.f32(), L.w_gate.g.f32(), static_cast<int>(N), d, F);
-            ops::linear_backward(dev, act.saved_xb2[sl].f32(), L.w_up.w.f32(), act.dup.f32(),
-                                 act.dxb.f32(), L.w_up.g.f32(), static_cast<int>(N), d, F);
+            if (L.w_gate.is_half()) {
+                ops::linear_backward_half(dev, act.saved_xb2[sl].f32(), L.w_gate.w.ptr<u16>(), act.dgate.f32(),
+                                          act.dxb.f32(), gptr(L.w_gate.g), static_cast<int>(N), d, F);
+                ops::linear_backward_half(dev, act.saved_xb2[sl].f32(), L.w_up.w.ptr<u16>(), act.dup.f32(),
+                                          act.dxb.f32(), gptr(L.w_up.g), static_cast<int>(N), d, F);
+            } else {
+                ops::linear_backward(dev, act.saved_xb2[sl].f32(), L.w_gate.w.f32(), act.dgate.f32(),
+                                     act.dxb.f32(), gptr(L.w_gate.g), static_cast<int>(N), d, F);
+                ops::linear_backward(dev, act.saved_xb2[sl].f32(), L.w_up.w.f32(), act.dup.f32(),
+                                     act.dxb.f32(), gptr(L.w_up.g), static_cast<int>(N), d, F);
+            }
             lora_backward(L.lora_gate, dev, act.saved_xb2[sl].f32(), act.dgate.f32(), act.dxb.f32(), static_cast<int>(N));
             lora_backward(L.lora_up, dev, act.saved_xb2[sl].f32(), act.dup.f32(), act.dxb.f32(), static_cast<int>(N));
         }
 
         // dx_mid = dx (residual) + rmsnorm_backward(dxb)
         ops::rmsnorm_backward(dev, act.saved_xmid[sl].f32(), L.ffn_norm.w.f32(), act.dxb.f32(),
-                              act.saved_rrms2[sl].f32(), act.dx.f32(), L.ffn_norm.g.f32(), N, d);
+                              act.saved_rrms2[sl].f32(), act.dx.f32(), gptr(L.ffn_norm.g), N, d);
 
         const bool is_granite    = (cfg_.arch == ModelConfig::ArchGranite);
         const int  granite_kind  = (is_granite && sl < cfg_.layer_types.size())
@@ -2568,7 +2663,10 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
             }
 
             ops::zero(dev, act.dxb.f32(), N * d);
-            if (!L.mamba_in_proj.frozen) {
+            {
+                // Always run the backward: dx must reach the earlier layers
+                // even when every base weight is frozen (LoRA / half storage).
+                // The kernels skip only the null dW pointers.
                 const int d_inner     = cfg_.mamba_expand * d;
                 const int n_heads     = cfg_.mamba_n_heads;
                 const int d_head      = cfg_.mamba_d_head;
@@ -2576,7 +2674,32 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                 const int n_groups    = cfg_.mamba_n_groups;
                 const int d_state_tot = n_groups * d_state;
                 const int conv_dim    = d_inner + 2 * d_state_tot;
-                ops::mamba2_backward(dev,
+                if (L.mamba_in_proj.is_half()) {
+                    ops::mamba2_backward_half(dev,
+                                     act.saved_xb[sl].f32(),
+                                     L.mamba_in_proj.w.ptr<u16>(),
+                                     L.mamba_conv_w.w.f32(),
+                                     L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32() : nullptr,
+                                     L.mamba_dt_bias.w.f32(),
+                                     L.mamba_A_log.w.f32(),
+                                     L.mamba_D.w.f32(),
+                                     L.mamba_norm.w.f32(),
+                                     L.mamba_out_proj.w.ptr<u16>(),
+                                     dy_mamba,
+                                     act.dxb.f32(),
+                                     L.mamba_in_proj.g.defined() ? L.mamba_in_proj.g.f32() : nullptr,
+                                     L.mamba_conv_w.g.defined() ? L.mamba_conv_w.g.f32() : nullptr,
+                                     L.mamba_conv_b.w.defined() && L.mamba_conv_b.g.defined() ? L.mamba_conv_b.g.f32() : nullptr,
+                                     L.mamba_dt_bias.g.defined() ? L.mamba_dt_bias.g.f32() : nullptr,
+                                     L.mamba_A_log.g.defined() ? L.mamba_A_log.g.f32() : nullptr,
+                                     L.mamba_D.g.defined() ? L.mamba_D.g.f32() : nullptr,
+                                     L.mamba_norm.g.defined() ? L.mamba_norm.g.f32() : nullptr,
+                                     L.mamba_out_proj.g.defined() ? L.mamba_out_proj.g.f32() : nullptr,
+                                     nullptr,   // dbc_out (the diagnostic only)
+                                     B, T, d, d_inner, conv_dim, n_heads, d_head, d_state,
+                                     cfg_.mamba_d_conv, cfg_.rms_eps);
+                } else {
+                    ops::mamba2_backward(dev,
                                      act.saved_xb[sl].f32(),
                                      L.mamba_in_proj.w.f32(),
                                      L.mamba_conv_w.w.f32(),
@@ -2596,13 +2719,14 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                      L.mamba_D.g.defined() ? L.mamba_D.g.f32() : nullptr,
                                      L.mamba_norm.g.defined() ? L.mamba_norm.g.f32() : nullptr,
                                      L.mamba_out_proj.g.defined() ? L.mamba_out_proj.g.f32() : nullptr,
-                                     nullptr,   // dbc_out (the diagnostic only)
+                                     nullptr,
                                      B, T, d, d_inner, conv_dim, n_heads, d_head, d_state,
                                      cfg_.mamba_d_conv, cfg_.rms_eps);
+                }
             }
 
             ops::rmsnorm_backward(dev, act.saved_x[sl].f32(), L.attn_norm.w.f32(), act.dxb.f32(),
-                                  act.saved_rrms1[sl].f32(), act.dx.f32(), L.attn_norm.g.f32(), N, d);
+                                  act.saved_rrms1[sl].f32(), act.dx.f32(), gptr(L.attn_norm.g), N, d);
         } else {
 
         // attention: x_mid = x_in + W_o(attn(...))
@@ -2613,8 +2737,12 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
             ops::scale_inplace(dev, act.dtmp.f32(), cfg_.residual_multiplier, N * d);
             dy_attn = act.dtmp.f32();
         }
-        ops::linear_backward(dev, act.saved_attout[sl].f32(), L.wo.w.f32(), dy_attn,
-                             act.dattout.f32(), L.wo.g.f32(), static_cast<int>(N), qd, d);
+        if (L.wo.is_half())
+            ops::linear_backward_half(dev, act.saved_attout[sl].f32(), L.wo.w.ptr<u16>(), dy_attn,
+                                      act.dattout.f32(), gptr(L.wo.g), static_cast<int>(N), qd, d);
+        else
+            ops::linear_backward(dev, act.saved_attout[sl].f32(), L.wo.w.f32(), dy_attn,
+                                 act.dattout.f32(), gptr(L.wo.g), static_cast<int>(N), qd, d);
         lora_backward(L.lora_o, dev, act.saved_attout[sl].f32(), dy_attn, act.dattout.f32(), static_cast<int>(N));
 
         ops::zero(dev, act.dq.f32(), N * qd);
@@ -2651,13 +2779,13 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
             ops::copy(dev, act.att_out.f32(), act.dq.f32(), N * qd);
             ops::zero(dev, act.dq.f32(), N * qd);
             ops::rmsnorm_backward(dev, act.saved_qk_raw_q[sl].f32(), L.qk_qnorm.w.f32(), act.att_out.f32(),
-                                  act.saved_qk_rms_q[sl].f32(), act.dq.f32(), L.qk_qnorm.g.f32(),
+                                  act.saved_qk_rms_q[sl].f32(), act.dq.f32(), gptr(L.qk_qnorm.g),
                                   N * H, hd);
             // K path: stage dout in dattout, zero dk, then rmsnorm_backward.
             ops::copy(dev, act.dattout.f32(), act.dk.f32(), N * kvd);
             ops::zero(dev, act.dk.f32(), N * kvd);
             ops::rmsnorm_backward(dev, act.saved_qk_raw_k[sl].f32(), L.qk_knorm.w.f32(), act.dattout.f32(),
-                                  act.saved_qk_rms_k[sl].f32(), act.dk.f32(), L.qk_knorm.g.f32(),
+                                  act.saved_qk_rms_k[sl].f32(), act.dk.f32(), gptr(L.qk_knorm.g),
                                   N * KV, hd);
         }
 
@@ -2665,15 +2793,24 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
         lora_backward(L.lora_q, dev, act.saved_xb[sl].f32(), act.dq.f32(), act.dxb.f32(), static_cast<int>(N));
         lora_backward(L.lora_k, dev, act.saved_xb[sl].f32(), act.dk.f32(), act.dxb.f32(), static_cast<int>(N));
         lora_backward(L.lora_v, dev, act.saved_xb[sl].f32(), act.dv.f32(), act.dxb.f32(), static_cast<int>(N));
-        ops::linear_backward(dev, act.saved_xb[sl].f32(), L.wq.w.f32(), act.dq.f32(),
-                             act.dxb.f32(), L.wq.g.f32(), static_cast<int>(N), d, qd);
-        ops::linear_backward(dev, act.saved_xb[sl].f32(), L.wk.w.f32(), act.dk.f32(),
-                             act.dxb.f32(), L.wk.g.f32(), static_cast<int>(N), d, kvd);
-        ops::linear_backward(dev, act.saved_xb[sl].f32(), L.wv.w.f32(), act.dv.f32(),
-                             act.dxb.f32(), L.wv.g.f32(), static_cast<int>(N), d, kvd);
+        if (L.wq.is_half()) {
+            ops::linear_backward_half(dev, act.saved_xb[sl].f32(), L.wq.w.ptr<u16>(), act.dq.f32(),
+                                      act.dxb.f32(), gptr(L.wq.g), static_cast<int>(N), d, qd);
+            ops::linear_backward_half(dev, act.saved_xb[sl].f32(), L.wk.w.ptr<u16>(), act.dk.f32(),
+                                      act.dxb.f32(), gptr(L.wk.g), static_cast<int>(N), d, kvd);
+            ops::linear_backward_half(dev, act.saved_xb[sl].f32(), L.wv.w.ptr<u16>(), act.dv.f32(),
+                                      act.dxb.f32(), gptr(L.wv.g), static_cast<int>(N), d, kvd);
+        } else {
+            ops::linear_backward(dev, act.saved_xb[sl].f32(), L.wq.w.f32(), act.dq.f32(),
+                                 act.dxb.f32(), gptr(L.wq.g), static_cast<int>(N), d, qd);
+            ops::linear_backward(dev, act.saved_xb[sl].f32(), L.wk.w.f32(), act.dk.f32(),
+                                 act.dxb.f32(), gptr(L.wk.g), static_cast<int>(N), d, kvd);
+            ops::linear_backward(dev, act.saved_xb[sl].f32(), L.wv.w.f32(), act.dv.f32(),
+                                 act.dxb.f32(), gptr(L.wv.g), static_cast<int>(N), d, kvd);
+        }
 
         ops::rmsnorm_backward(dev, act.saved_x[sl].f32(), L.attn_norm.w.f32(), act.dxb.f32(),
-                              act.saved_rrms1[sl].f32(), act.dx.f32(), L.attn_norm.g.f32(), N, d);
+                              act.saved_rrms1[sl].f32(), act.dx.f32(), gptr(L.attn_norm.g), N, d);
         }
     }
 
@@ -2681,7 +2818,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     if (cfg_.embedding_multiplier != 1.0f) {
         ops::scale_inplace(dev, act.dx.f32(), cfg_.embedding_multiplier, N * d);
     }
-    ops::embedding_backward(dev, ids, act.dx.f32(), tok_emb_.g.f32(), N, d, V);
+    ops::embedding_backward(dev, ids, act.dx.f32(), gptr(tok_emb_.g), N, d, V);
 
     double loss = loss_sum / static_cast<double>(ntok);
     // DeepSeek-style aux loss: per-layer raw (ne*sum(mean_prob*frac)).
@@ -2729,12 +2866,16 @@ double Model::moe_aux_loss(Activations& act, int B, int T) {
 }
 
 // ---------------------------------------------------------------- raw io
-static constexpr u32 RAW_MAGIC = 0x57415247u;   // "GRAW"
+static constexpr u32 RAW_MAGIC = 0x57415247u;   // "GRAW" (legacy, FP32 only)
+static constexpr u32 RAW_MAGIC2 = 0x32515247u;  // "GRW2" (per-tensor dtype)
+static constexpr u32 dtype_code(DType d) {
+    return d == DType::F16 ? 1u : 0u;  // 0 = F32, 1 = F16
+}
 
 void Model::save_raw(const std::string& path) const {
     std::ofstream f(path, std::ios::binary);
     GAI_CHECK(f.good(), "cannot write model: " + path);
-    u32 magic = RAW_MAGIC;
+    u32 magic = RAW_MAGIC2;
     f.write(reinterpret_cast<const char*>(&magic), 4);
     u32 n = static_cast<u32>(params_.size());
     f.write(reinterpret_cast<const char*>(&n), 4);
@@ -2744,6 +2885,8 @@ void Model::save_raw(const std::string& path) const {
         f.write(p->name.data(), len);
         u64 ne = static_cast<u64>(p->numel());
         f.write(reinterpret_cast<const char*>(&ne), 8);
+        u32 dt = dtype_code(p->w.dtype());
+        f.write(reinterpret_cast<const char*>(&dt), 4);
         Tensor cpu = p->w.to(Device::CPU);
         f.write(reinterpret_cast<const char*>(cpu.data_ptr()),
                 static_cast<std::streamsize>(cpu.nbytes()));
@@ -2756,7 +2899,8 @@ bool Model::load_raw(const std::string& path) {
     if (!f.good()) return false;
     u32 magic = 0, n = 0;
     if (!f.read(reinterpret_cast<char*>(&magic), 4)) return false;
-    if (magic != RAW_MAGIC) return false;
+    if (magic != RAW_MAGIC && magic != RAW_MAGIC2) return false;
+    const bool has_dtype = (magic == RAW_MAGIC2);
     if (!f.read(reinterpret_cast<char*>(&n), 4)) return false;
     // FIX: old code accepted dense->MoE / tied->untied files (extra model
     // params stayed zero, returned true -> silent corrupt training) and
@@ -2769,14 +2913,28 @@ bool Model::load_raw(const std::string& path) {
         if (!f.read(name.data(), static_cast<std::streamsize>(len))) return false;
         u64 ne = 0;
         if (!f.read(reinterpret_cast<char*>(&ne), 8)) return false;
+        u32 dt = 0;
+        if (has_dtype && !f.read(reinterpret_cast<char*>(&dt), 4)) return false;
         Parameter* p = find_parameter(name);
         if (!p || static_cast<u64>(p->numel()) != ne) return false;
         if (p->shape.empty()) return false;
-        Tensor cpu(p->shape, DType::F32, Device::CPU);
+        DType file_dt = has_dtype && dt == 1u ? DType::F16 : DType::F32;
+        Tensor cpu(p->shape, file_dt, Device::CPU);
         if (cpu.nbytes() == 0) return false;
         if (!f.read(reinterpret_cast<char*>(cpu.data_ptr()),
                     static_cast<std::streamsize>(cpu.nbytes()))) return false;
-        p->w.copy_from(cpu);
+        if (file_dt == p->w.dtype()) {
+            p->w.copy_from(cpu);
+        } else {
+            // Convert on the host and use the dtype-aware copy
+            // (copy_from_f32 halves the PCIe traffic for half storage).
+            std::vector<float> f32(static_cast<size_t>(ne));
+            for (size_t i = 0; i < f32.size(); ++i)
+                f32[i] = file_dt == DType::F16 ? fp16_to_fp32(cpu.ptr<u16>()[i]) : cpu.f32()[i];
+            Tensor src(p->shape, DType::F32, Device::CPU);
+            std::memcpy(src.data_ptr(), f32.data(), f32.size() * sizeof(float));
+            p->w.copy_from_f32(src);
+        }
     }
     if (fp16_weight_cache_) enable_fp16_weight_cache(true);
     return true;

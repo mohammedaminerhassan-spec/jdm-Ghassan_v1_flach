@@ -36,6 +36,8 @@ void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, i
 void split_qkv(const float* qkv, float* q, float* k, float* v, i64 n, int qd, int kvd);
 void linear_backward(const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N);
+void linear_backward_half(const float* x, const u16* w, const float* dy,
+                          float* dx, float* dw, int M, int K, int N);
 
 // ---- the elementwise ops (ops_cpu_dense.cpp)
 
