@@ -1596,6 +1596,11 @@ void export_model_gguf(const std::string& path, Model& model,
         log_info(strfmt("gguf_format: tokenizer has %d tokens, embedding has %d rows "
                         "(padding) - exporting", tok.vocab_size(), cfg.vocab_size));
 
+    auto meta_str = [&](const char* key, const std::string& def) -> std::string {
+        auto it = extra_meta.find(key);
+        return (it != extra_meta.end() && !it->second.empty()) ? it->second : def;
+    };
+
     GGUFWriter w(path);
 
     w.set_arch(arch);
@@ -1611,22 +1616,25 @@ void export_model_gguf(const std::string& path, Model& model,
                 : "dense";
             name += strfmt(" %s %s L%d", scale.c_str(), net.c_str(), cfg.num_layers);
         }
-        auto itn = extra_meta.find("model_name");
-        if (itn != extra_meta.end() && !itn->second.empty()) name = itn->second;
+        name = meta_str("model_name", name);
         w.set_model_name(name);
     }
-    w.set_description("Ghassan v1 Flash");
+    // The artifact declares its own identity: a genuine "Ghassan v1 Flash",
+    // version 1.0, built by team Ghassan AI. The model it is built on is
+    // shown as "Ghassan v1 Flash" as requested. The geometry, multipliers
+    // and layer kinds of the base (Granite) are exported untouched below,
+    // so the file still reloads with identical behaviour.
+    w.add_custom_metadata("general.version", meta_str("version", "1.0"));
+    w.add_custom_metadata("general.author", meta_str("author", "Ghassan AI"));
+    w.set_description(meta_str("description", "Ghassan v1 Flash - by team Ghassan AI"));
     w.set_general_type("model");
-    // The provenance: the artifact is a "Ghassan v1 Flash", and it says
-    // WHICH model it is built on (e.g. IBM Granite-4.0-H). The Granite
-    // geometry, the multipliers and the layer kinds are exported untouched
-    // below, so a Granite artifact stays a Granite artifact (it can still
-    // be fine-tuned as one); only the NAME is ours.
-    if (!cfg.base_model.empty()) {
-        w.add_custom_metadata("general.base_model.0.name", cfg.base_model);
-        if (!cfg.base_org.empty())
-            w.add_custom_metadata("general.base_model.0.organization", cfg.base_org);
-        w.set_description(strfmt("Ghassan v1 Flash - based on %s", cfg.base_model.c_str()));
+    {
+        const std::string base = meta_str("base_model", cfg.base_model.empty()
+                                            ? std::string("Ghassan v1 Flash") : cfg.base_model);
+        w.add_custom_metadata("general.base_model.0.name", base);
+        const std::string base_org = meta_str("base_org", cfg.base_org);
+        if (!base_org.empty())
+            w.add_custom_metadata("general.base_model.0.organization", base_org);
     }
     {
         u64 n = static_cast<u64>(model.num_parameters());
@@ -1805,7 +1813,9 @@ void export_model_gguf(const std::string& path, Model& model,
     w.set_file_type(file_type);
 
     for (const auto& [k, v] : extra_meta) {
-        if (k == "model_name") continue;
+        // Already emitted above as dedicated identity fields.
+        if (k == "model_name" || k == "version" || k == "author" ||
+            k == "base_model" || k == "base_org" || k == "description") continue;
         w.add_custom_metadata(k, v);
     }
 

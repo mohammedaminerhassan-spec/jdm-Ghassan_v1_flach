@@ -210,6 +210,8 @@ static int cmd_info(const Args& args) {
         std::cout << "  size        : " << human_bytes(r.file_size()) << "\n";
         std::cout << "  format      : GGUF\n";
         std::cout << "  name        : " << r.get_string("general.name", "(unset)") << "\n";
+        std::cout << "  version     : " << r.get_string("general.version", "?") << "\n";
+        std::cout << "  author      : " << r.get_string("general.author", "?") << "\n";
         const std::string base = r.get_string("general.base_model.0.name", "");
         if (!base.empty())
             std::cout << "  base model  : " << base << "\n";
@@ -342,8 +344,15 @@ static int cmd_quantize(const Args& args) {
     // The --model-name flag is honored by --compat exports; wire it up here
     // too, or the artifact ships under the auto-generated label instead of
     // the one the user asked for.
+    // Artifact identity. The defaults make the GGUF declare itself as the
+    // genuine "Ghassan v1 Flash" model (version 1.0, team Ghassan AI), and
+    // the model it is built on is shown as Ghassan v1 Flash too. Every field
+    // can still be overridden from the CLI.
     std::map<std::string, std::string> meta;
-    if (args.has("model-name")) meta["model_name"] = args.str("model-name");
+    meta["model_name"] = args.str("model-name", "Ghassan v1 Flash");
+    meta["version"]    = args.str("version", "1.0");
+    meta["author"]     = args.str("team", args.str("author", "Ghassan AI"));
+    meta["base_model"] = args.str("base-model", "Ghassan v1 Flash");
 
     const ExportProfileGGUF profile = gguf_profile_for(prof);
     if (have_embedded) {
