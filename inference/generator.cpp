@@ -169,6 +169,13 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
             MambaState st;
             st.conv_host.assign(static_cast<size_t>(conv_dim) * conv_win, 0.0f);
             st.ssm_host.assign(static_cast<size_t>(c.mamba_n_heads) * c.mamba_d_head * c.mamba_d_state, 0.0f);
+            if (dev == Device::CUDA) {
+                st.conv_dev = Tensor::zeros({static_cast<i64>(conv_dim) * conv_win},
+                                            DType::F32, dev);
+                st.ssm_dev = Tensor::zeros({static_cast<i64>(c.mamba_n_heads) *
+                                            c.mamba_d_head * c.mamba_d_state},
+                                           DType::F32, dev);
+            }
             mamba_host_conv_w_.push_back(stage(L.mamba_conv_w.w));
             mamba_host_conv_b_.push_back(stage(L.mamba_conv_b.w));
             mamba_host_dt_bias_.push_back(stage(L.mamba_dt_bias.w));
@@ -196,6 +203,8 @@ void Generator::reset() {
     for (MambaState& st : mamba_states_) {
         st.conv_host.assign(st.conv_host.size(), 0.0f);
         st.ssm_host.assign(st.ssm_host.size(), 0.0f);
+        if (st.conv_dev.defined()) st.conv_dev.zero_();
+        if (st.ssm_dev.defined())  st.ssm_dev.zero_();
     }
 }
 
@@ -326,32 +335,14 @@ float* Generator::decode_step_logits(i32 token, int position) {
         {
             if (cache_.fp16()) {
                 // Store fp16: half the cache memory and half the decode
-                // bandwidth at long contexts. The K/V activations live on
-                // the device, so stage them through the host before the
-                // fp32 -> fp16 conversion.
-                thread_local std::vector<u16> kh, vh;
-                if (kh.size() < static_cast<size_t>(kvd)) {
-                    kh.resize(static_cast<size_t>(kvd));
-                    vh.resize(static_cast<size_t>(kvd));
-                }
-                const float* kp_src = kp;
-                const float* vp_src = vp;
-                if (dev != Device::CPU) {
-                    device_copy(kv_stage_k_.data(), Device::CPU, kp, dev,
-                                sizeof(float) * static_cast<size_t>(kvd));
-                    device_copy(kv_stage_v_.data(), Device::CPU, vp, dev,
-                                sizeof(float) * static_cast<size_t>(kvd));
-                    kp_src = kv_stage_k_.data();
-                    vp_src = kv_stage_v_.data();
-                }
-                for (int i = 0; i < kvd; ++i) {
-                    kh[static_cast<size_t>(i)] = fp32_to_fp16(kp_src[i]);
-                    vh[static_cast<size_t>(i)] = fp32_to_fp16(vp_src[i]);
-                }
+                // bandwidth. kp/vp are device pointers; converting them on
+                // the host required two D2H + two H2D *synchronous* copies per
+                // layer per token (the dominant decode latency). The device
+                // kernel keeps the whole store on the GPU: zero syncs.
                 u16* kdst = cache_.k_f16(l) + static_cast<size_t>(slot) * kvd;
                 u16* vdst = cache_.v_f16(l) + static_cast<size_t>(slot) * kvd;
-                device_copy(kdst, dev, kh.data(), Device::CPU, sizeof(u16) * static_cast<size_t>(kvd));
-                device_copy(vdst, dev, vh.data(), Device::CPU, sizeof(u16) * static_cast<size_t>(kvd));
+                ops::convert_f32_to_f16(dev, kp, kdst, kvd);
+                ops::convert_f32_to_f16(dev, vp, vdst, kvd);
             } else {
                 size_t bytes = sizeof(float) * static_cast<size_t>(kvd);
                 char* kdst = reinterpret_cast<char*>(cache_.k(l)) + static_cast<size_t>(slot) * bytes;
@@ -466,6 +457,30 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
         GAI_FAIL("granite mamba: the recurrent state is missing");
     }
     MambaState& st = mamba_states_[si];
+
+    // CUDA: the whole single-token step stays on the device. This removes the
+    // two synchronous copies per Mamba layer per token (72 per token on
+    // Granite) and runs the small recurrence on the GPU instead of the host.
+    if (dev == Device::CUDA && st.ssm_dev.defined()) {
+        if (L.mamba_in_proj.is_half()) {
+            ops::mamba2_step_half(dev, x_in,
+                L.mamba_in_proj.w.ptr<u16>(), L.mamba_conv_w.w.f32(),
+                L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32() : nullptr,
+                L.mamba_dt_bias.w.f32(), L.mamba_A_log.w.f32(), L.mamba_D.w.f32(),
+                L.mamba_norm.w.f32(), L.mamba_out_proj.w.ptr<u16>(),
+                st.conv_dev.f32(), st.ssm_dev.f32(), out,
+                d, d_inner, conv_dim, n_heads, d_head, d_state, conv_k, c.rms_eps);
+        } else {
+            ops::mamba2_step(dev, x_in,
+                L.mamba_in_proj.w.f32(), L.mamba_conv_w.w.f32(),
+                L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32() : nullptr,
+                L.mamba_dt_bias.w.f32(), L.mamba_A_log.w.f32(), L.mamba_D.w.f32(),
+                L.mamba_norm.w.f32(), L.mamba_out_proj.w.f32(),
+                st.conv_dev.f32(), st.ssm_dev.f32(), out,
+                d, d_inner, conv_dim, n_heads, d_head, d_state, conv_k, c.rms_eps);
+        }
+        return;
+    }
 
     // ---- 1) in_proj on the device into the persistent scratch
     const size_t proj_n = static_cast<size_t>(proj);

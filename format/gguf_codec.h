@@ -4,6 +4,7 @@
 #include "model/model.h"
 #include "tokenizer/tokenizer.h"
 #include <cstdint>
+#include <functional>
 #include <istream>
 #include <map>
 #include <ostream>
@@ -112,6 +113,13 @@ public:
     void set_description(const std::string& desc);
 
     void add_tensor(const std::string& name, const Tensor& t, GGMLType dtype = GGMLType::F16);
+    // Streaming variant: `produce()` is called only when this tensor is about
+    // to be quantized and written, and its result is released immediately
+    // afterwards. This keeps the export host RAM at ~one tensor instead of
+    // holding the whole model in FP32 (28 GB for a 6.9B model — an OOM on a
+    // 30 GB Kaggle machine). `shape` is the final (possibly reshaped) layout.
+    void add_tensor_deferred(const std::string& name, const std::vector<i64>& shape,
+                             GGMLType dtype, std::function<Tensor()> produce);
     void write();
 
     // The per-tensor reconstruction error of the file that was just written:
@@ -129,7 +137,14 @@ public:
 private:
     std::string path_;
     std::map<std::string, GGUFMetadataValue> metadata_;
-    std::vector<std::pair<std::string, std::pair<Tensor, GGMLType>>> tensors_;
+    struct PendingTensor {
+        std::string name;
+        std::vector<i64> shape;
+        GGMLType dtype = GGMLType::F16;
+        Tensor direct;                   // set by add_tensor()
+        std::function<Tensor()> produce; // set by add_tensor_deferred()
+    };
+    std::vector<PendingTensor> tensors_;
     std::vector<GGUFTensorInfo> tensor_infos_;
     std::vector<TensorError> errors_;
 

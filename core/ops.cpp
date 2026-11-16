@@ -496,6 +496,50 @@ void mamba2_forward_half(Device dev,
                              d_head, d_state, k, eps);
 }
 
+void mamba2_step(Device dev,
+                 const float* x,
+                 const float* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const float* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps) {
+#ifdef GAI_CUDA
+    GAI_CHECK(dev == Device::CUDA, "mamba2_step is a CUDA-only decode kernel");
+    cuda_ops::mamba2_step(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                          conv_state, ssm_state, out, d, d_inner, conv_dim, n_heads,
+                          d_head, d_state, k, eps);
+#else
+    (void)x; (void)w_in; (void)conv_w; (void)conv_b; (void)dt_bias; (void)a_log;
+    (void)D; (void)norm_w; (void)w_out; (void)conv_state; (void)ssm_state; (void)out;
+    (void)d; (void)d_inner; (void)conv_dim; (void)n_heads; (void)d_head;
+    (void)d_state; (void)k; (void)eps; (void)dev;
+    GAI_FAIL("mamba2_step: CUDA support not compiled in");
+#endif
+}
+
+void mamba2_step_half(Device dev,
+                 const float* x,
+                 const u16* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const u16* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps) {
+#ifdef GAI_CUDA
+    GAI_CHECK(dev == Device::CUDA, "mamba2_step_half is a CUDA-only decode kernel");
+    cuda_ops::mamba2_step_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                               conv_state, ssm_state, out, d, d_inner, conv_dim, n_heads,
+                               d_head, d_state, k, eps);
+#else
+    (void)x; (void)w_in; (void)conv_w; (void)conv_b; (void)dt_bias; (void)a_log;
+    (void)D; (void)norm_w; (void)w_out; (void)conv_state; (void)ssm_state; (void)out;
+    (void)d; (void)d_inner; (void)conv_dim; (void)n_heads; (void)d_head;
+    (void)d_state; (void)k; (void)eps; (void)dev;
+    GAI_FAIL("mamba2_step_half: CUDA support not compiled in");
+#endif
+}
+
 void mamba2_backward_half(Device dev,
                      const float* x,
                      const u16* w_in,

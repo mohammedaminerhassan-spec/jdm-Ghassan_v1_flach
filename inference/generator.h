@@ -46,11 +46,22 @@ public:
 
     std::vector<i32> generate(const GenerationConfig& cfg, StreamFn on_token = nullptr);
 
+    // The top candidates for the next token, read from the logits of the
+    // last forward pass. It is the diagnostic that tells a wrong prompt
+    // (the expected token is far down the list) from a broken forward pass
+    // (the list is garbage).
+    std::vector<std::pair<i32, float>> top_candidates(int n);
+
+    // The optional `after_prefill` hook runs right after the prompt has been
+    // processed and before the first token is sampled (the diagnostic hook
+    // for `top_candidates`).
     std::string complete(const std::string& prompt, const GenerationConfig& cfg,
-                         StreamFn on_token = nullptr);
+                         StreamFn on_token = nullptr,
+                         std::function<void()> after_prefill = nullptr);
 
     std::string chat(const std::vector<Message>& msgs, const GenerationConfig& cfg,
-                     StreamFn on_token = nullptr);
+                     StreamFn on_token = nullptr,
+                     std::function<void()> after_prefill = nullptr);
 
     double score_tokens(const std::vector<i32>& tokens, const std::vector<u8>* mask = nullptr,
                         i64* out_ntok = nullptr,
@@ -111,6 +122,10 @@ private:
     struct MambaState {
         std::vector<float> conv_host;
         std::vector<float> ssm_host;
+        // On CUDA the whole step (conv + scan + norm) runs on the device with
+        // these states carried across tokens — no per-layer host round trip.
+        Tensor conv_dev;  // [conv_dim, conv_win]
+        Tensor ssm_dev;   // [n_heads * d_head * d_state]
     };
     std::vector<MambaState> mamba_states_;
     bool mamba_states_ready_ = false;

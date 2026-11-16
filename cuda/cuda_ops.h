@@ -159,6 +159,23 @@ void mamba2_forward_half(const float* x,
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                     int d_head, int d_state, int k, float eps);
 
+// Single-token decode: conv window + SSM state are carried on the device,
+// so no host<->device sync is needed per Mamba layer per token.
+void mamba2_step(const float* x,
+                 const float* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const float* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps);
+void mamba2_step_half(const float* x,
+                 const u16* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const u16* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps);
+
 void mamba2_backward_half(const float* x,
                      const u16* w_in,
                      const float* conv_w,

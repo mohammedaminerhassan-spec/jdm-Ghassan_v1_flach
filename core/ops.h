@@ -249,6 +249,25 @@ void mamba2_forward_half(Device dev,
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
                     int d_head, int d_state, int k, float eps);
 
+// Single-token Mamba decode step. The recurrent/conv state stays on the
+// device; used only by the CUDA inference path.
+void mamba2_step(Device dev,
+                 const float* x,
+                 const float* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const float* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps);
+void mamba2_step_half(Device dev,
+                 const float* x,
+                 const u16* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const u16* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps);
+
 // FP16-stored Mamba projections: reads the real half bytes.
 void mamba2_backward_half(Device dev,
                      const float* x,

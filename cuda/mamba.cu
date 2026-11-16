@@ -888,6 +888,151 @@ void mamba2_backward(const float* x,
                                 d_state, k, eps);
 }
 
+// ---------------------------------------------------------------- single-token decode
+// Granite-4.0 has 36 Mamba layers. The old decode staged the projection to
+// the host and the normed vector back for every layer (72 synchronous copies
+// per token) and ran the tiny recurrence on the CPU. These kernels keep the
+// whole step — conv window, selective SSM state and gated norm — on the GPU,
+// with the state carried across tokens. n_groups is always 1 (enforced by
+// ModelConfig::validate), so B and C are a single block of d_state each.
+
+__global__ void k_mamba_step_conv(const float* __restrict__ proj,
+                                  const float* __restrict__ w,
+                                  const float* __restrict__ b,
+                                  float* __restrict__ conv_state,
+                                  float* __restrict__ bc_out,
+                                  int d_inner, int conv_dim, int k, int proj_size) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= conv_dim) return;
+    const int win = k - 1;
+    float acc = b ? b[ch] : 0.0f;
+    for (int j = 0; j < win; ++j)
+        acc += w[ch * k + j] * conv_state[(size_t)ch * win + j];
+    acc += w[ch * k + win] * proj[d_inner + ch];
+    bc_out[ch] = acc / (1.0f + expf(-acc));
+    for (int j = 0; j + 1 < win; ++j)
+        conv_state[(size_t)ch * win + j] = conv_state[(size_t)ch * win + j + 1];
+    if (win > 0) conv_state[(size_t)ch * win + win - 1] = proj[d_inner + ch];
+}
+
+__global__ void k_mamba_step_scan(const float* __restrict__ proj,
+                                  const float* __restrict__ bc_out,
+                                  const float* __restrict__ dt_bias,
+                                  const float* __restrict__ a_log,
+                                  const float* __restrict__ Dv,
+                                  float* __restrict__ ssm_state,
+                                  float* __restrict__ y,
+                                  int d_inner, int n_heads, int d_head,
+                                  int d_state, int proj_size) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_heads * d_head;
+    if (row >= total) return;
+    const int h = row / d_head;
+    const float u = proj[proj_size - n_heads + h] + dt_bias[h];
+    const float dt = (u > 20.0f) ? u : log1pf(expf(u));
+    const float A = -expf(a_log[h]);
+    const float dA = expf(A * dt);
+    const float xv = bc_out[row];                 // x channel: h*d_head + hh
+    const float* Bv = bc_out + d_inner;            // n_groups == 1
+    const float* Cv = Bv + d_state;
+    float* s = ssm_state + (size_t)row * d_state;
+    float acc = 0.0f;
+    for (int j = 0; j < d_state; ++j) {
+        s[j] = dA * s[j] + (dt * Bv[j]) * xv;
+        acc += Cv[j] * s[j];
+    }
+    y[row] = acc + Dv[h] * xv;
+}
+
+__global__ void k_mamba_step_norm(const float* __restrict__ y,
+                                  const float* __restrict__ gate,
+                                  const float* __restrict__ w,
+                                  float* __restrict__ out,
+                                  int d_inner, float eps) {
+    extern __shared__ float sh_red[];
+    const int lane = threadIdx.x;
+    const int nthr = blockDim.x;
+    float ss = 0.0f;
+    for (int i = lane; i < d_inner; i += nthr) {
+        const float g = gate[i] / (1.0f + expf(-gate[i]));
+        const float v = y[i] * g;
+        out[i] = v;
+        ss += v * v;
+    }
+    ss = block_reduce_sum(ss, sh_red, lane, nthr);
+    __shared__ float s_inv;
+    if (lane == 0) s_inv = rsqrtf(ss / static_cast<float>(d_inner) + eps);
+    __syncthreads();
+    for (int i = lane; i < d_inner; i += nthr) out[i] = out[i] * s_inv * w[i];
+}
+
+template <typename W>
+static void mamba_step_impl(const float* x,
+                            const W* w_in, const float* conv_w, const float* conv_b,
+                            const float* dt_bias, const float* a_log, const float* D,
+                            const float* norm_w, const W* w_out,
+                            float* conv_state, float* ssm_state,
+                            float* out,
+                            int d, int d_inner, int conv_dim, int n_heads,
+                            int d_head, int d_state, int k, float eps) {
+    const int proj_size = d_inner + conv_dim + n_heads;
+    float* ws = mamba_workspace((size_t)proj_size + (size_t)conv_dim +
+                                (size_t)d_inner * 2 + 64);
+    float* proj = ws;
+    float* bc = proj + proj_size;
+    float* y = bc + conv_dim;
+    float* normed = y + d_inner;
+
+    mamba_linear(x, w_in, proj, 1, d, proj_size);
+
+    const int win = k > 1 ? k - 1 : 1;
+    {
+        const int n = conv_dim;
+        k_mamba_step_conv<<<(n + 127) / 128, 128>>>(proj, conv_w, conv_b,
+                                                    conv_state, bc,
+                                                    d_inner, conv_dim, k, proj_size);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+    {
+        const int n = n_heads * d_head;
+        k_mamba_step_scan<<<(n + 255) / 256, 256>>>(proj, bc, dt_bias, a_log, D,
+                                                    ssm_state, y,
+                                                    d_inner, n_heads, d_head,
+                                                    d_state, proj_size);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+    {
+        k_mamba_step_norm<<<1, 256, sizeof(float) * 32>>>(y, proj, norm_w, normed,
+                                                          d_inner, eps);
+        CU_MAMBA_CHECK(cudaGetLastError());
+    }
+    mamba_linear(normed, w_out, out, 1, d_inner, d);
+}
+
+void mamba2_step(const float* x,
+                 const float* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const float* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps) {
+    mamba_step_impl<float>(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                           conv_state, ssm_state, out, d, d_inner, conv_dim, n_heads,
+                           d_head, d_state, k, eps);
+}
+
+void mamba2_step_half(const float* x,
+                 const u16* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const u16* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps) {
+    mamba_step_impl<u16>(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                         conv_state, ssm_state, out, d, d_inner, conv_dim, n_heads,
+                         d_head, d_state, k, eps);
+}
+
 void mamba2_backward_half(const float* x,
                      const u16* w_in,
                      const float* conv_w,

@@ -306,7 +306,22 @@ void GGUFWriter::add_custom_metadata(const std::string& key, bool value) {
 }
 
 void GGUFWriter::add_tensor(const std::string& name, const Tensor& t, GGMLType dtype) {
-    tensors_.emplace_back(name, std::make_pair(t, dtype));
+    PendingTensor e;
+    e.name = name;
+    e.shape = t.shape();
+    e.dtype = dtype;
+    e.direct = t;
+    tensors_.push_back(std::move(e));
+}
+
+void GGUFWriter::add_tensor_deferred(const std::string& name, const std::vector<i64>& shape,
+                                     GGMLType dtype, std::function<Tensor()> produce) {
+    PendingTensor e;
+    e.name = name;
+    e.shape = shape;
+    e.dtype = dtype;
+    e.produce = std::move(produce);
+    tensors_.push_back(std::move(e));
 }
 
 static size_t ggml_type_size(GGMLType t) {
@@ -526,17 +541,17 @@ void GGUFWriter::write() {
         std::vector<TensorData> tdata;
         tdata.reserve(tensors_.size());
 
-        for (auto& [name, pair] : tensors_) {
-            const Tensor& t  = pair.first;
-            GGMLType dtype   = pair.second;
+        for (const auto& e : tensors_) {
             TensorData td;
-            td.name = name;
+            td.name = e.name;
 
-            auto shape = t.shape();
-            for (auto it = shape.rbegin(); it != shape.rend(); ++it)
+            // GGUF stores dimensions reversed (innermost first).
+            for (auto it = e.shape.rbegin(); it != e.shape.rend(); ++it)
                 td.dims.push_back(static_cast<uint64_t>(*it));
-            td.type = dtype;
-            td.nbytes = ggml_nbytes(dtype, static_cast<size_t>(t.numel()));
+            i64 numel = 1;
+            for (i64 d : e.shape) numel *= d;
+            td.type = e.dtype;
+            td.nbytes = ggml_nbytes(e.dtype, static_cast<size_t>(numel));
             tdata.push_back(std::move(td));
         }
 
@@ -579,8 +594,11 @@ void GGUFWriter::write() {
                         tdata.size()));
         for (size_t ti = 0; ti < tdata.size(); ++ti) {
             const auto& td = tdata[ti];
-            const Tensor& src = tensors_[ti].second.first;
-            Tensor cpu = src.to(Device::CPU);
+            const PendingTensor& entry = tensors_[ti];
+            // Stream: materialize this tensor only now, release it at the end
+            // of the iteration. No whole-model FP32 staging in host RAM.
+            Tensor cpu = entry.produce ? entry.produce()
+                                       : entry.direct.to(Device::CPU);
             if (cpu.dtype() != DType::F32) cpu = quant::dequantize(cpu, DType::F32);
             std::vector<uint8_t> payload = tensor_to_ggml_bytes(cpu, td.type);
             GAI_CHECK(payload.size() == td.nbytes, "gguf_format: payload size drift for " + td.name);
@@ -1800,8 +1818,11 @@ void export_model_gguf(const std::string& path, Model& model,
     for (Parameter* p : model.parameters()) {
         GGMLType dt = gguf_dtype_for(p->name, prof);
         std::string wname = p->name;
-        Tensor cpu = p->w.to(Device::CPU);
-        if (cpu.dtype() != DType::F32) cpu = quant::dequantize(cpu, DType::F32);
+        std::vector<i64> shape = p->shape;
+        // llama_moe needs the expert matrices reshaped to 3D (one block per
+        // expert). Compute the final shape here; the data is produced lazily
+        // inside the writer, one tensor at a time.
+        int reshape = 0;  // 0 = none, 1 = [ne,E,d], 2 = [ne,d,E]
         if (want_llama) {
             wname = llama_tensor_name(p->name);
             GAI_CHECK(!wname.empty(),
@@ -1811,39 +1832,36 @@ void export_model_gguf(const std::string& path, Model& model,
             GAI_CHECK(!wname.empty(),
                       "gguf_format: no llama_moe name for tensor: " + p->name +
                       " (shared experts / QK-norm have no Ollama equivalent; use native GGUF)");
-
-            // The expert tensors must be 3D (one block per expert) to match
-            // llama.cpp:
-            //   ffn_gate_exps / ffn_up_exps : [n_embd, n_ff, n_expert]
-            //   ffn_down_exps               : [n_ff,  n_embd, n_expert]
-            // The Gai layout stores the experts contiguously
-            //   moe_gate / moe_up : [ne*E, d] -> per expert [E, d]
-            //   moe_down          : [ne*d, E] -> per expert [d, E]
-            // which is exactly the per-expert block llama.cpp expects, so the
-            // conversion is a reshape and NOT a transpose.
             if (p->name.find("moe_gate") != std::string::npos ||
                 p->name.find("moe_up") != std::string::npos) {
-                const i64 ne = cfg.num_experts, E = cfg.moe_expert_dim, d = cfg.hidden_size;
-                GAI_CHECK(cpu.shape().size() == 2 && cpu.shape()[0] == ne * E &&
-                          cpu.shape()[1] == d,
-                          "gguf_format: unexpected moe_gate/moe_up shape for llama_moe export");
-                cpu = reshape_3d(cpu, ne, E, d);
+                shape = {cfg.num_experts, cfg.moe_expert_dim,
+                         static_cast<i64>(cfg.hidden_size)};
+                reshape = 1;
             } else if (p->name.find("moe_down") != std::string::npos) {
-                const i64 ne = cfg.num_experts, E = cfg.moe_expert_dim, d = cfg.hidden_size;
-                GAI_CHECK(cpu.shape().size() == 2 && cpu.shape()[0] == ne * d &&
-                          cpu.shape()[1] == E,
-                          "gguf_format: unexpected moe_down shape for llama_moe export");
-                cpu = reshape_3d(cpu, ne, d, E);
+                shape = {cfg.num_experts, static_cast<i64>(cfg.hidden_size),
+                         cfg.moe_expert_dim};
+                reshape = 2;
             }
         }
         size_t est = ggml_nbytes(dt, static_cast<size_t>(p->numel()));
         total_bytes += static_cast<u64>(est);
-        w.add_tensor(wname, cpu, dt);
+        auto producer = [p, reshape, &cfg]() -> Tensor {
+            Tensor cpu = p->w.to(Device::CPU);
+            if (cpu.dtype() != DType::F32) cpu = quant::dequantize(cpu, DType::F32);
+            if (reshape == 1)
+                return reshape_3d(cpu, cfg.num_experts, cfg.moe_expert_dim,
+                                  static_cast<i64>(cfg.hidden_size));
+            if (reshape == 2)
+                return reshape_3d(cpu, cfg.num_experts,
+                                  static_cast<i64>(cfg.hidden_size), cfg.moe_expert_dim);
+            return cpu;
+        };
+        w.add_tensor_deferred(wname, shape, dt, producer);
 
         if ((want_llama || want_moe) && p->name == "tok_embeddings" && cfg.tie_embeddings) {
             size_t est2 = ggml_nbytes(dt, static_cast<size_t>(p->numel()));
             total_bytes += static_cast<u64>(est2);
-            w.add_tensor("output.weight", cpu, dt);
+            w.add_tensor_deferred("output.weight", shape, dt, producer);
         }
     }
 
