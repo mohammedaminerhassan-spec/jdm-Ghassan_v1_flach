@@ -362,6 +362,12 @@ float* Generator::decode_step_logits(i32 token, int position) {
             // while the cache holds at least that many tokens; a short
             // prompt would otherwise trip the kernel's range check.
             const int pinned = std::min(cache_.pinned_prefix(), cache_.length());
+            // Attention-sink correctness: the ring kernels start their window
+            // at `cur_len - window`, which would DROP the pinned system prefix.
+            // A pinned prefix IS the sink, so keep the full context whenever
+            // one is present (Granite ships sliding_window=0, so this only
+            // affects models that enable both features).
+            const int win = (pinned > 0) ? 0 : c.sliding_window;
             // The query must be the one that was actually produced above.
             // With the fused fp16 QKV path the query lives in `qkv_`, not in
             // `q_` (which stays uninitialized in that path).
@@ -369,12 +375,12 @@ float* Generator::decode_step_logits(i32 token, int position) {
                 ops::attention_decode_ring_fp16(dev, qp, cache_.k_f16(l), cache_.v_f16(l),
                                                 attn_.f32(), H, KV, hd, cache_.ring_start(),
                                                 pinned, cache_.length(), cache_.capacity(),
-                                                scale, scores_.f32(), c.sliding_window);
+                                                scale, scores_.f32(), win);
             } else {
                 ops::attention_decode_ring(dev, qp, cache_.k(l), cache_.v(l), attn_.f32(),
                                            H, KV, hd, cache_.ring_start(), pinned,
                                            cache_.length(), cache_.capacity(), scale, scores_.f32(),
-                                           c.sliding_window);
+                                           win);
             }
         }
 

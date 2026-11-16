@@ -420,6 +420,21 @@ flowchart LR
 
 The base stays packed and frozen; only the LoRA adapters (FP32) train and receive gradients. `merge_lora()` folds them back into the Q4 base by dequantizing → merging → re-quantizing one adapter at a time. Verified by `test_quant` (dequantizer matches the reference to FP16 rounding) and `test_lora` (merge preserves the forward output exactly).
 
+### Long-context techniques (what applies to a pretrained checkpoint)
+
+| Technique | In this engine? | Note |
+|---|---|---|
+| **Native Q4 weights** | ✅ `--weight-q4 0` | More VRAM headroom → longer usable context |
+| **FP16 KV cache** | ✅ default | Half the cache traffic vs FP32 |
+| **Ring cache + pinned sink** | ✅ | System prompt survives eviction; sliding window is disabled while a sink is active so it cannot be dropped |
+| **Granite native 131k ctx** | ✅ | No YaRN needed inside training length |
+| **YaRN / dynamic NTK** | ✅ `--rope-scale`, `--yarn-mscale` | For extending **beyond** the trained length (validate with perplexity) |
+| **MLA (DeepSeek-style KV latent)** | ❌ | **Requires training the compression projections in** — cannot be bolted onto an existing checkpoint |
+| **MTP / speculative decoding** | ❌ | Needs a trained prediction head or a draft model |
+| **FP8** | ❌ | T4 has no FP8 hardware; FP16 is the ceiling |
+
+`test_kv_cache` verifies the ring/sink invariants (pinned slots never move, no aliasing across live positions).
+
 ---
 
 ## 11. GPU compatibility
