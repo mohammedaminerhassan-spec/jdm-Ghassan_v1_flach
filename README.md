@@ -1,183 +1,489 @@
-# Ghassan v1 Flash — a from-scratch LLM engine (C++20 / CUDA)
+<div align="center">
 
-**The body**: a self-contained inference + training engine — no external
-libraries, **no Python, no PyTorch**. **The mind**: the weights, straight from
-a HuggingFace safetensors checkpoint.
+# Ghassan v1 Flash
 
-It **runs, trains and exports**:
+### *A from-scratch C++20 inference & training engine built around IBM Granite-4.0-H — rebranded as a standalone model artifact.*
 
-- **IBM Granite-4.0-H-Tiny** (`GraniteMoeHybridForCausalLM`: a hybrid
-  **Mamba-2 + GQA + MoE** model, 6.939 B parameters) directly from its
-  safetensors — the multipliers, the NoPE path, the attention scale and the
-  packed MoE layout are implemented exactly, and verified against
-  `transformers` and against the real safetensors headers.
-- a **self-contained GGUF** named *Ghassan v1 Flash* (Q4_0 / Q8_0 / fp16),
-  self-contained: the vocabulary, the merges and the chat template are
-  embedded.
-- **LoRA fine-tuning** from a dense model (init -> train -> checkpoint ->
-  restore -> merge -> export), with AdamW / Lion / Muon and a DDP trainer.
+![build](https://img.shields.io/badge/build-CMake%20%7C%20C%2B%2B20-00599C?style=for-the-badge&logo=cmake)
+![cuda](https://img.shields.io/badge/CUDA-11.8%2B%20%7C%20sm__75-76B900?style=for-the-badge&logo=nvidia)
+![gguf](https://img.shields.io/badge/format-GGUF%20%7C%20safetensors-FF6B00?style=for-the-badge)
+![license](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
+![model](https://img.shields.io/badge/model-Ghassan%20v1%20Flash-6E40C9?style=for-the-badge)
 
-```
-core/        tensors · dtypes · device (CPU/CUDA) · ops · mmap · RNG · unicode · JSON
-model/       the model: dense + MoE, GQA, RoPE (NTK/YaRN), SWA, Granite hybrid
-tokenizer/   byte-level BPE (GPT-2 / Qwen / Llama-3 / Granite) · chat styles
-format/      GGUF codec (native + llama.cpp compatible) · HuggingFace safetensors
-inference/   generator · paged/ring KV cache · sampler · chat session
-quantization/ Q4_0 · Q8_0 · Q4_1
-evaluation/  perplexity
-cuda/        attention · MoE · Mamba-2 kernels (sm_75 / T4 and up)
-training/    trainer · AdamW / Lion / Muon · LoRA · dataloader · checkpoint
-tools/       ghassan-ai (serve/inspect/export) · gai_train
-```
+**[Model on Hugging Face →](https://huggingface.co/ghassan-ai/Ghassan-v1-Flash-GGUF)**
 
-```bash
-ghassan-ai info     --model <hf-dir|model.gguf>
-ghassan-ai generate --model <hf-dir> --prompt "hi" --max-tokens 64
-ghassan-ai quantize --model <hf-dir> --out ghassan-v1-flash.gguf \
-    --profile q8_k --model-name "Ghassan v1 Flash"
-gai_train --config <recipe.yaml>
-```
+</div>
 
-### The CPU kernels
+---
 
-They are split per family (`core/ops_cpu.h` maps every declaration to its
-file):
+## Table of contents
 
-| file | what it holds |
+1. [What this is](#1-what-this-is)
+2. [Design philosophy](#2-design-philosophy)
+3. [Architecture at a glance](#3-architecture-at-a-glance)
+4. [The model artifact](#4-the-model-artifact)
+5. [Repository layout](#5-repository-layout)
+6. [Quick start — build & export](#6-quick-start--build--export)
+7. [The 13-step pipeline](#7-the-13-step-pipeline)
+8. [Configuration reference](#8-configuration-reference)
+9. [Performance & memory](#9-performance--memory)
+10. [GPU compatibility](#10-gpu-compatibility)
+11. [Training (roadmap)](#11-training-roadmap)
+12. [Multimodal — Ghassan v1 Flash VL (roadmap)](#12-multimodal--ghassan-v1-flash-vl-roadmap)
+13. [Testing](#13-testing)
+14. [Known limitations — honest notes](#14-known-limitations--honest-notes)
+15. [Contributing & license](#15-contributing--license)
+
+---
+
+## 1. What this is
+
+**Ghassan v1 Flash** is two things that fit together:
+
+| Layer | What it really is |
 |---|---|
-| `ops_cpu_dense.cpp` | the shared primitives: the GEMM, the linear ops, the elementwise ops, the embedding, the norms, the RoPE, the SwiGLU — plus the loss, the optimizer steps and the sampler helpers |
-| `ops_cpu_attention.cpp` | the attention family: the prefill, the backward, the incremental decode (the ring KV cache, fp32 and packed fp16) |
-| `ops_cpu_moe.cpp` | the mixture of experts: the routing, the expert GEMMs, the shared expert |
-| `ops_cpu_mamba.cpp` | the IBM Granite Mamba-2 layer |
-| `ops_cpu_simd.h` | the AVX2/FMA helpers shared by the above |
+| **The engine** (this repo) | A self-contained C++20 runtime: its own tensors, its own CUDA kernels, its own tokenizer, its own GGUF/safetensors codecs, its own trainer. **No PyTorch, no Python at inference time.** |
+| **The model** (the `.gguf`) | The weights of `ibm-granite/granite-4.0-h-tiny` (6.94 B params, MoE + Mamba-2 hybrid), re-published under the identity **Ghassan v1 Flash** by team **Ghassan AI**. |
 
-A **dense** model and a **MoE** model share the primitives: the dense model is
-the same path with the MoE block replaced by a plain MLP.
+The relationship is deliberately simple:
 
-## Build
+```mermaid
+flowchart LR
+    A["IBM Granite-4.0-H-Tiny<br/>safetensors (BF16)"] -->|"this engine reads"| B(("C++ engine"))
+    B -->|"re-encodes, keeps math<br/>identical, stamps identity"| C["Ghassan v1 Flash<br/>.gguf (FP16 / Q4_0)"]
+    C -->|"same engine serves it"| D["Fast chat on T4 / RTX"]
+    style B fill:#00599C,stroke:#003366,color:#fff
+    style C fill:#6E40C9,stroke:#3B2080,color:#fff
+```
 
-**Linux / Kaggle (with CUDA):**
+> **Honest statement:** without fine-tuning, the *knowledge* inside the GGUF is Granite's. What this project adds is the **body** (a fast, dependency-free engine), the **packaging** (self-contained GGUF with embedded tokenizer + chat template), and the **identity** (Ghassan v1 Flash, version 1.0, team Ghassan AI).
+
+---
+
+## 2. Design philosophy
+
+```mermaid
+mindmap
+  root((Ghassan v1 Flash))
+    Speed
+      Mamba scan on GPU
+      fp16 KV cache on device
+      No per-token host round-trips
+      cuBLAS tensor-core GEMMs
+    Independence
+      Zero Python at runtime
+      Own Tensor / Storage
+      Own BPE tokenizer
+      Own GGUF + safetensors codecs
+    Honesty
+      Architecture preserved bit-for-bit
+      No invented benchmarks
+      Clear roadmap, no fake claims
+    Portability
+      CPU fallback everywhere
+      CUDA 11.8+ / sm_75..sm_120
+      Kaggle T4 → local PC
+```
+
+Five rules drove every line of code:
+
+1. **No framework tax.** The engine owns its memory. A 6.94 B model runs on a 16 GB T4 because the big matrices live in FP16 (12.9 GiB) and the numerically fragile vectors stay FP32.
+2. **No silent corruption.** Every dtype boundary is explicit. `Tensor::f32()` is a reinterpretation, so half-stored weights go through dedicated `linear_backward_half` / `moe_backward_half` / `mamba2_backward_half` paths — never a mis-cast.
+3. **No hidden OOM.** Export streams one tensor at a time instead of staging 28 GB of FP32 in host RAM. Every allocation is guarded with a live-VRAM check and an actionable message.
+4. **No fake identity.** The exported artifact says *Ghassan v1 Flash*, version *1.0*, author *Ghassan AI*, with **no** `base_model` field — like any other standalone release.
+5. **No "fix" that breaks a working kernel.** Flash attention with WMMA would be faster on paper, but rewriting a verified GEMM path for a model that already answers correctly is a bad trade. Stability wins.
+
+---
+
+## 3. Architecture at a glance
+
+### 3.1 The engine layers
+
+```mermaid
+flowchart TB
+    subgraph APP["Applications"]
+        CLI["ghassan-ai<br/>inference / export / bench"]
+        TRAIN["gai_train<br/>training / dry-run"]
+    end
+
+    subgraph FRONT["Front-end"]
+        LOAD["model_loader<br/>GGUF vs HF detection"]
+        TOK["tokenizer<br/>byte-level BPE + pre-tokenizer"]
+        CHAT["chat_template<br/>ChatML / Granite"]
+    end
+
+    subgraph CORE["Core runtime"]
+        MODEL["model.cpp<br/>forward / backward / memory plan"]
+        GEN["generator.cpp<br/>prefill / decode / sampler"]
+        OPS["ops.cpp dispatch<br/>CPU ↔ CUDA"]
+        FORMAT["gguf_codec / hf_checkpoint / hf_writer"]
+    end
+
+    subgraph HW["Backends"]
+        CPU["CPU kernels<br/>OpenMP + AVX2/FMA"]
+        CUDA["CUDA kernels<br/>cuBLAS + custom scan/routing"]
+    end
+
+    CLI --> LOAD --> MODEL
+    TRAIN --> MODEL
+    CLI --> TOK --> CHAT --> GEN
+    GEN --> MODEL --> OPS
+    OPS --> CPU
+    OPS --> CUDA
+    MODEL --> FORMAT
+    style CORE fill:#1B3A5C,stroke:#0E1F33,color:#fff
+    style HW fill:#2D2D2D,stroke:#000,color:#fff
+```
+
+### 3.2 One decoder layer (Granite hybrid)
+
+Granite-4.0 alternates **Mamba-2** layers and **GQA attention** layers; both end in a **MoE + shared-expert** FFN with residual multipliers.
+
+```mermaid
+flowchart LR
+    X["hidden_states"] --> N1["RMSNorm (attn)"]
+    N1 --> SUB{{"layer type?"}}
+    SUB -->|"mamba"| M["Mamba-2<br/>conv → SSM scan → gated norm"]
+    SUB -->|"attention"| A["GQA attention<br/>RoPE-neox / NoPE"]
+    M --> R1["× residual_multiplier<br/>+ residual"]
+    A --> R1
+    R1 --> N2["RMSNorm (ffn)"]
+    N2 --> MOE["Top-k MoE (64 experts, k=6)<br/>+ shared expert"]
+    MOE --> R2["× residual_multiplier<br/>+ residual"]
+    R2 --> OUT["next layer"]
+    style SUB fill:#FF9800,stroke:#E65100,color:#fff
+    style MOE fill:#6E40C9,stroke:#3B2080,color:#fff
+```
+
+### 3.3 Data flow through the MoE kernel
+
+```mermaid
+sequenceDiagram
+    participant X as x [N,d]
+    participant R as Router
+    participant G as Grouping (device)
+    participant E as 64 experts (device)
+    participant S as Shared expert
+    participant O as out [N,d]
+
+    X->>R: logits = x @ W_routerᵀ
+    R->>R: softmax → top-k (k=6) → weights
+    R->>G: expert ids → histogram → offsets
+    G->>E: packed tokens (grouped GEMMs)
+    X->>S: gate/up → SwiGLU → down
+    E->>O: scatter-add weighted expert outputs
+    S->>O: add shared output
+```
+
+---
+
+## 4. The model artifact
+
+### 4.1 Identity stamped into every GGUF
+
+```text
+general.name         : Ghassan v1 Flash
+general.version      : 1.0
+general.author       : Ghassan AI
+general.description  : Ghassan v1 Flash - by team Ghassan AI
+general.architecture : ghassan
+general.file_type    : FP16 (profile name in metadata)
+tokenizer            : embedded, self-contained
+```
+
+There is intentionally **no `general.base_model.*`** key. The geometry (40 layers, 64 experts, top-6, d=1536, Mamba dims, multipliers) lives in `ghassan.*` metadata so this engine can reload it, but no upstream origin is advertised.
+
+### 4.2 What the two published files are
+
+| File | Size | What it is | When to use |
+|---|---|---|---|
+| `ghassan-v1-flash-FP16.gguf` | ~13.9 GB | Weights stored as FP16; sensitive vectors FP32 | Maximum fidelity, 16 GB GPUs (T4, 5060 Ti 16 GB) |
+| `ghassan-v1-flash-Q4_0.gguf` | ~4.69 GB | Same model, Q4_0 blocks on disk | Fast download / low disk, 16 GB GPUs |
+
+> ⚠️ Both files load to **12.93 GiB of FP16 weights on the GPU** in this engine. Q4 shrinks the *file*, not the *resident footprint* — Q4-native inference is on the roadmap.
+
+### 4.3 Verified output (real run on Kaggle T4 x2)
+
+```text
+name: Ghassan v1 Flash | version: 1.0 | author: Ghassan AI
+vocab=100352 d=1536 L=40 H=12 KV=4 hd=128 ctx=131072
+MoE(ne=64,k=6,E=512,shared)  RoPE-neox
+F16: 329 tensors 12.92 GiB   F32: 337 tensors 18.20 MiB
+parameters: 6.94 B (6939.04 M)
+```
+A sample prompt about mixture-of-experts produced coherent, well-structured English — EOS worked, no runaway token, no garbage.
+
+---
+
+## 5. Repository layout
+
+```text
+ghassan-ai/
+├── CMakeLists.txt            # build: C++20, optional CUDA/NCCL/OpenMP
+├── core/                     # foundation
+│   ├── tensor.* dtype.* device.*       # storage, conversions, allocation
+│   ├── ops.* ops_cpu_*.* ops_cpu_simd.h # dispatch + all CPU kernels
+│   ├── config.* json.* mmap.*          # YAML subset, JSON, zero-copy files
+│   ├── rng.h unicode.* signals.* common.*
+├── model/                    # model.h/.cpp — the heart (2658 lines)
+│                             #   forward, backward, memory plan, LoRA, MoE aux,
+│                             #   Granite hybrid layers, raw I/O
+├── cuda/                     # GPU kernels
+│   ├── attention.cu          # GEMM-based prefill/backward + ring decode
+│   ├── mamba.cu              # SSM forward, backward trajectory, single-token step
+│   ├── moe.cu                # routing, grouping, gather/scatter, expert GEMMs
+│   ├── kernels.cu            # GEMM, norms, RoPE, SCE, sampling, optimizers
+│   └── cuda_utils.* cuda_ops.h
+├── inference/                # generator, KV cache, sampler, chat session
+├── tokenizer/                # byte-level BPE, Granite/ChatML templates
+├── format/                   # gguf_codec, hf_checkpoint, hf_writer
+├── quantization/             # Q8_0 / Q4_0 / Q4_1 block codecs
+├── training/                 # trainer, optimizer (AdamW/Lion/Muon), checkpoints,
+│                             #   dataloader, shards, DDP, scheduler
+├── evaluation/               # perplexity
+├── tools/                    # ghassan-ai / gai_train CLIs, model loader
+└── tests/                    # gradient checks, CUDA parity, GGUF, Granite compat
+```
+
+---
+
+## 6. Quick start — build & export
+
+### 6.1 Build on Kaggle (T4)
+
+```python
+SRC = "/kaggle/working/ghassan-ai"
+!git clone --depth 1 https://github.com/mohammedaminerhassan-spec/jdm-Ghassan_v1_flach.git $SRC
+!cd $SRC && cmake -S . -B build -DGAI_ENABLE_CUDA=ON -DGAI_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+!cd $SRC && cmake --build build --parallel 4
+```
+
+### 6.2 Build on a weak PC (CPU only)
 
 ```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGAI_ENABLE_CUDA=ON
-cmake --build build -j 2
+cmake -S . -B build -DGAI_ENABLE_CUDA=OFF -DGAI_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 4
 ```
 
-**Windows (MSVC):**
+### 6.3 Export GGUF from the HuggingFace safetensors
 
-```powershell
-cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
+```python
+HF  = "/kaggle/input/datasets/<owner>/granite-4.0-h-tiny"
+OUT = "/kaggle/working/ghassan-v1-flash.gguf"
+!cd $SRC && ./build/bin/ghassan-ai quantize --model "$HF" --out "$OUT" \
+    --profile fp16 --model-name "Ghassan v1 Flash" \
+    --version "1.0" --team "Ghassan AI" --compat native
+!cd $SRC && ./build/bin/ghassan-ai info --model "$OUT"
 ```
 
-The build is warning-free (`-Wall -Wextra -Werror`).
-
-## Use
+### 6.4 Chat
 
 ```bash
-# what is this model?
-./build/bin/ghassan-ai info --model <hf-dir|model.gguf>
-
-# the logits of a prompt / of an explicit token sequence
-./build/bin/ghassan-ai logits --model <hf-dir> --prompt "hi" --out logits.f32
-./build/bin/ghassan-ai logits --model <hf-dir> --ids "82 17243"
-
-# a completion (greedy, with the token ids for verification)
-./build/bin/ghassan-ai generate --model <hf-dir> --prompt "hi" --max-tokens 64 \
-    --greedy --no-stream --raw --print-ids
-
-# the deliverable: a self-contained GGUF
-./build/bin/ghassan-ai quantize --model <hf-dir> --out ghassan-v1-flash.gguf \
-    --profile q8_k --model-name "Ghassan v1 Flash"
-
-# fine-tune (the LoRA path is verified end to end)
-./build/bin/gai_train --config <recipe.yaml>
+./build/bin/ghassan-ai generate --model ghassan-v1-flash.gguf \
+    --prompt "Explain in clear English how a mixture of experts model works." \
+    --max-tokens 200 --no-stream \
+    --device cuda --weight-f16 1 --gemm-fp16 1
 ```
 
-## Granite-4.0-H-Tiny
+---
 
-| piece | value |
+## 7. The 13-step pipeline
+
+```mermaid
+flowchart TD
+    S1["1 · detect input<br/>GGUF magic or HF dir"] --> S2["2 · read config<br/>40 layers, 64 experts, Mamba dims"]
+    S2 --> S3["3 · build Model<br/>allocate parameters (FP16 for big matrices)"]
+    S3 --> S4["4 · load safetensors<br/>mmap + dtype conversion"]
+    S4 --> S5["5 · dequantize per tensor<br/>streaming, ~one tensor in RAM"]
+    S5 --> S6["6 · llama-style mapping<br/>packed MoE split & transpose"]
+    S6 --> S7["7 · write metadata<br/>name / version / author / no base_model"]
+    S7 --> S8["8 · embed tokenizer<br/>vocab, merges, chat template"]
+    S8 --> S9["9 · write tensor infos<br/>reversed dims, offsets"]
+    S9 --> S10["10 · quantize & write<br/>progress every 64 tensors"]
+    S10 --> S11["11 · precision report<br/>worst relative RMSE"]
+    S11 --> S12["12 · atomic rename<br/>.tmp → final file"]
+    S12 --> S13["13 · reload with info<br/>self-consistency check"]
+    style S7 fill:#6E40C9,color:#fff
+    style S12 fill:#2E7D32,color:#fff
+```
+
+---
+
+## 8. Configuration reference
+
+### 8.1 Export profiles
+
+| `--profile` | Default dtype | Notes |
+|---|---|---|
+| `fp16` | `F16` | Sensible default; sensitive vectors stay `F32` |
+| `q8_k` | `Q8_0` | 8-bit blocks, GGML-compatible |
+| `q4_0` | `Q4_0` | 4-bit, smallest file; GGML-compatible block layout |
+| `q4_1` | `Q4_1` | 4-bit with min; adjacent-nibble layout fixed to GGML |
+
+Every profile promotes fragile tensors (`mamba.A_log`, `mamba.dt_bias`, `mamba.D`, `mamba.conv1d.*`, `moe_router`, norms) to `F32`/`F16` — a 4-bit `dt_bias` would shift the recurrence time step by a factor of `exp(1.49)` and the model would emit noise.
+
+### 8.2 Important CLI flags
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--device cuda\|cpu\|auto` | Backend selection | `auto` |
+| `--weight-f16 0\|1` | Store big weights in FP16 on device | `1` on GPU |
+| `--gemm-fp16 0\|1` | Tensor-core GEMMs | `1` |
+| `--ctx <n>` | KV-cache context | model max (cap for hybrids) |
+| `--temp`, `--top-k`, `--top-p`, `--min-p` | Sampling | 0.8 / 40 / 0.92 / 0.05 |
+| `--no-fast-sample` | Full-vocab sampling path | off |
+| `--top <n>` | Print top-n candidates (diagnosis) | 0 |
+
+---
+
+## 9. Performance & memory
+
+### 9.1 Where the speed comes from
+
+| Optimization | Effect |
 |---|---|
-| layers | 40 = **36 Mamba-2** + **4 attention** (at 5, 15, 25, 35) |
-| hidden | 1536, attention head 128 (12 heads / 4 KV) |
-| Mamba-2 | d_inner 3072 (expand 2), 48 heads, d_head 64, d_state 128, groups 1, conv k=4, chunk 256 |
-| MoE | 64 experts, top-6, expert width 512, **shared expert width 1024** |
-| positional | **NoPE** (no RoPE at all) |
-| multipliers | embeddings x12, residual x0.22, attention x1/128, logits /6 |
-| weights | bf16 on disk (the loader casts them to fp32 masters) |
-| vocab | 100352, tied embeddings |
+| Mamba single-token step on GPU | Removes ~72 host↔device syncs per token on Granite's 36 Mamba layers |
+| FP16 KV cache written by a device kernel | No D2H→convert→H2D per attention layer |
+| Fused batched cuBLAS attention | One grouped call per GEMM instead of Python-style loops |
+| Streaming GGUF export | Host RAM from ~28 GB → ~one tensor |
+| Persistent workspaces (64 MB rounding) | No per-step `cudaMalloc`/`cudaFree` |
+| Chunked cross-entropy | `[N,V]` logits shrink to `[Cc,V]` scratch |
 
-The engine implements it exactly: the multipliers, the NoPE path, the
-attention scale (`attention_multiplier`, not `1/sqrt(head_dim)`), the packed
-Granite MoE layout (`block_sparse_moe.input_linear` / `output_linear`) and the
-shared expert with its own width.
+### 9.2 Measured on Kaggle T4 x2
 
-`granite-documentation/granit filles confiques/` holds the **official
-HuggingFace files** of `ibm-granite/granite-4.0-h-tiny` (the config, the
-tokenizer and the tensor index). The weights themselves (13.9 GB, 3 shards) are
-not in the repository: they are attached to the Kaggle notebook as a dataset.
-
-## Verification
-
-The Granite path is checked three ways, not only against itself:
-
-**1. The official config, parsed by the engine == `transformers`' own parse**
-(29/29 fields: the vocabulary, the layer kinds, the multipliers, the Mamba-2
-geometry, the MoE, the shared expert width, NoPE).
-
-**2. The official tensor index.** The real safetensors headers (fetched from
-HuggingFace with a range request, without downloading 13.9 GB) hold **586
-tensors** and **6,939,037,248 parameters**; the engine expects exactly the
-same names and the same byte layouts, including the 3-D packed MoE experts
-(`[64, 1024, 1536]` and `[64, 1536, 512]`).
-
-**3. The forward pass, against independent reference implementations** (a
-separate implementation of the Mamba-2 and the attention blocks, written from
-the reference modelling code):
-
-* the Mamba-2 block (conv1d + selective scan + gated norm) matches to ~1e-8
-* the attention block (GQA + NoPE + the attention multiplier + the causal
-  mask) matches to ~1e-7
-* the **complete multi-layer Granite forward** (Mamba-2 + attention + the MoE
-  + the shared expert + the multipliers) matches to ~4.6e-7
-* the decode path (the KV cache + the Mamba-2 recurrent state) reproduces the
-  full-prefill greedy continuation
-* the LoRA path: init -> train -> checkpoint -> restore -> merge -> export
-* the GGUF round trip, the chat template (byte-exact against
-  `transformers.apply_chat_template`) and the tokenizer
-
-## Memory (Granite-4.0-H-Tiny, 6.939 B parameters)
-
-| block | size |
-|---|---|
-| weights, fp32 masters | **25.85 GiB** |
-| weights, fp16 (what a GGUF holds) | 12.92 GiB |
-| fp16 weight cache (on top of the masters) | 12.95 GiB |
-| mamba-2 recurrent state | 55 MiB |
-| KV cache, fp16, @131072 ctx | 1.00 GiB (only the 4 attention layers keep one) |
-
-A single 16 GB T4 cannot hold the fp32 masters: the engine says so up front
-instead of dying inside `cudaMalloc`. The **fp16 weight storage mode** (no fp32
-masters) is the next step to run Granite on a T4.
-
-## Documentation
-
-`granite-documentation/` holds the project documentation (the architecture
-notes, the adaptation plan, the state of the project and the official
-HuggingFace files of the checkpoint).
-
-The Kaggle runbook is a single cell:
-
-```bash
-!bash "kaggle configue/kaggle_granite_run.sh"
+```mermaid
+pie showData
+    title Inference footprint — 13.61 GiB of 14.56 GiB (T4)
+    "Weights FP16" : 12.93
+    "CUDA workspaces" : 0.60
+    "Mamba state" : 0.06
+    "KV cache" : 0.03
+    "Activations" : 0.001
 ```
 
-The verification suite (the reference implementations, the fixture generators
-and the comparisons against `transformers` and against the real safetensors
-headers) lives outside the repository, in
-`C:\Users\Ghassan PC\Documents\ghassan-verify\` — the engine itself stays
-C++ only.
+Real run: prefill 4806 tokens, decode 200 tokens, ~29 tok/s, 13.61 GiB of 14.56 GiB (93%).
 
-## License
+### 9.3 Memory plan guard
 
-MIT (see `LICENSE`).
+The engine computes a plan *before* allocating and refuses impossible configs with a readable message:
+
+```text
+[mem] GPU plan: weights 12.93 GiB | fp16 cache 0 | activations 468.38 KiB |
+      kv 32.00 MiB | mamba 55.37 MiB | workspaces 604.18 MiB
+      = 13.61 GiB of 14.56 GiB (93%)
+```
+
+---
+
+## 10. GPU compatibility
+
+```mermaid
+flowchart LR
+    A["sm_75<br/>T4"] --> OK["✅ tested, 93% VRAM"]
+    B["sm_80 / sm_90<br/>A100 / H100"] --> OK2["✅ SASS in binary"]
+    C["sm_120<br/>RTX 5060 (Blackwell)"] --> PTX["✅ JIT via PTX<br/>(CMake ≥ 12.8)"]
+    D["8 GB card"] --> FAIL["❌ 12.93 GiB weights<br/>need Q4-native inference"]
+    style FAIL fill:#C62828,color:#fff
+    style PTX fill:#2E7D32,color:#fff
+```
+
+> **RTX 5060 (8 GB)**: neither FP16 nor the current Q4 file will run — both become 12.93 GiB of FP16 weights on GPU. **RTX 5060 Ti 16 GB** runs both comfortably. True Q4-on-GPU inference (dequantize inside the kernel) is the roadmap item that unlocks 8 GB cards.
+
+---
+
+## 11. Training (roadmap)
+
+The training stack is **already written** (`training/`): AdamW / Lion / Muon, gradient accumulation, chunked CE, activation checkpointing, NCCL DDP, exact/migrate resume, tokenizer fingerprints, cli. It is not needed for the current GGUF workflow and has not been exercised on a long run yet.
+
+```mermaid
+gantt
+    title Ghassan v1 Flash — development plan
+    dateFormat YYYY-MM
+    axisFormat %Y-%m
+    section Done
+    GGUF FP16 + Q4 export        :done, a1, 2026-10, 2026-11
+    Identity metadata            :done, a2, 2026-11, 2026-11
+    GPU Mamba decode             :done, a3, 2026-11, 2026-11
+    section Next
+    Q4-native GPU inference      :b1, 2026-11, 2026-12
+    LoRA / QLoRA validation      :b2, 2026-12, 2027-01
+    section Later
+    Ghassan v1 Flash VL (projector) :c1, 2027-01, 2027-03
+    Long reasoning + thinking    :c2, 2027-03, 2027-04
+    Ghassan v1 Flash Pro (fine-tuned) :c3, 2027-04, 2027-06
+```
+
+```mermaid
+flowchart LR
+    V["Ghassan v1 Flash<br/>text base"] -->|"LoRA / QLoRA"| P["Ghassan v1 Flash Pro<br/>long thinking + reasoning"]
+    IMG["Vision encoder"] --> PROJ["Projector"]
+    AUD["Audio encoder"] --> PROJ
+    VID["Video frames"] --> PROJ
+    PROJ --> V
+    V --> VL["Ghassan v1 Flash VL<br/>one model, one space"]
+    style P fill:#6E40C9,color:#fff
+    style VL fill:#00838F,color:#fff
+```
+
+---
+
+## 12. Multimodal — Ghassan v1 Flash VL (roadmap)
+
+The engine already has the hook: `Model::forward(... embed_override, override_pos, n_override)` lets a caller replace token embeddings with external features at chosen positions. A projector can therefore feed image/audio/video features into the same residual stream **without changing the base weights**.
+
+```mermaid
+flowchart TB
+    I["image / video frames / audio"] --> E["frozen encoder"]
+    E --> F["feature tokens"]
+    F --> P["trainable projector<br/>(small MLP / cross-attn)"]
+    P --> O["embed_override hook"]
+    T["text tokens"] --> O
+    O --> M["Ghassan v1 Flash<br/>single transformer"]
+    M --> A["answer grounded in both"]
+    style P fill:#FF7043,color:#fff
+    style M fill:#6E40C9,color:#fff
+```
+
+The guiding idea from day one: **one model, with other tool models in the same space** — not two separate chat sessions.
+
+---
+
+## 13. Testing
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+| Test | What it proves |
+|---|---|
+| `test_half_backward` | Half-stored backward matches FP32 reference (worst diff 6e-6) |
+| `test_gradient_check` | Finite-difference gradients (dense + MoE + Granite) |
+| `test_cuda_parity` | CPU and CUDA gradients agree |
+| `test_mamba_backward` | All 9 Mamba parameters get correct gradients |
+| `test_granite_compat` | Architecture matches the official checkpoint (6,939,037,248 params) |
+| `test_gguf_eos` / `test_gguf_quant` | EOS handling and quant block layouts |
+| `test_safetensors_roundtrip` | Write → read → compare |
+
+---
+
+## 14. Known limitations — honest notes
+
+| Limitation | Why it's still there |
+|---|---|
+| Q4 files dequantize to FP16 on GPU | Q4-native kernels not written yet; 8 GB cards unsupported |
+| No true FlashAttention (WMMA) | Current GEMM path is verified; rewriting risks correctness |
+| Training not run to convergence | Stack exists and builds; long-run validation is a separate phase |
+| K-quant profile names map to Q8_0/Q4_0 | True K-quant writers are roadmap |
+| `dtype_from_name`, `Tensor::view`, some RoPE variants unused | Harmless dead API, kept for ABI stability |
+
+---
+
+## 15. Contributing & license
+
+- **Model card:** [ghassan-ai/Ghassan-v1-Flash-GGUF](https://huggingface.co/ghassan-ai/Ghassan-v1-Flash-GGUF)
+- **Engine:** `mohammedaminerhassan-spec/jdm-Ghassan_v1_flach`
+- **License:** MIT (the model card carries its own license file)
+
+Built with care by team **Ghassan AI**. The engine is a body; the base model is Granite-4.0-H; the artifact is **Ghassan v1 Flash**.
+
+> *"Al-perfection lillah wahdah."* — the work continues, honestly, one verified step at a time.

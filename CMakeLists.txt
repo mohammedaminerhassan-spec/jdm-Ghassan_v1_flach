@@ -78,9 +78,14 @@ if(GAI_ENABLE_CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
         if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-            # T4=75. Include 80/90 so the same binary JIT-runs on newer
-            # Kaggle GPUs without recompiling. 75 stays first (fastest on T4).
+            # sm_75 (T4) first, then Ampere/Hopper. The last target is built
+            # WITH PTX so newer Blackwell GPUs (RTX 5060 = sm_120) can JIT it.
             set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 90-real)
+            if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+                list(APPEND CMAKE_CUDA_ARCHITECTURES 120)
+            elseif(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.8)
+                list(APPEND CMAKE_CUDA_ARCHITECTURES 90)  # PTX fallback for newer cards
+            endif()
         endif()
         find_package(CUDAToolkit QUIET)
         if(NOT CUDAToolkit_FOUND)
