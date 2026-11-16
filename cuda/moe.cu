@@ -29,6 +29,17 @@ static inline void moe_linear(const float* x, const W* w, float* y, int M, int K
 // The weight-aware backward. dw is computed from the FP32 activations alone
 // (the weight pointer is not used for dw); dx needs the real weight values,
 // so the half branch must NOT reinterpret u16 as float.
+// C[M,N] = A[M,K] * B[K,N] with B in the caller's storage precision.
+template <typename W>
+static inline void moe_gemm_nn(const float* A, const W* B, float* C,
+                               int M, int N, int K) {
+    if constexpr (std::is_same<W, u16>::value) {
+        gemm_nn_half(A, B, C, M, N, K);
+    } else {
+        gemm(false, false, M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
+    }
+}
+
 template <typename W>
 static inline void moe_linear_bwd(const float* x, const W* w, const float* dy,
                                   float* dx, float* dw, int M, int K, int N) {
@@ -1028,9 +1039,8 @@ static void moe_backward_impl(const float* x, const float* router_w,
         if (ns == 0) continue;
         const W* de = downs + (size_t)e * d * E;
 
-        gemm(false, false, (int)ns, E, d, 1.0f,
-             Sblk + (size_t)h_off[e] * d, d, de, E, 0.0f,
-             Dblk + (size_t)h_off[e] * E, E);
+        moe_gemm_nn(Sblk + (size_t)h_off[e] * d, de,
+                    Dblk + (size_t)h_off[e] * E, (int)ns, E, d);
     }
     k_swiglu_bwd_assign<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Dblk,
                                                         Gblk, Ublk, NK * E);

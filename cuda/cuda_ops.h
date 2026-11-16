@@ -44,6 +44,7 @@ void linear_backward(const float* x, const float* w, const float* dy,
 // actual half bytes and converts only the small activation operand to half;
 // passing the half pointer to linear_backward() reinterpreted as float is a
 // correctness bug (garbage gradients).
+void gemm_nn_half(const float* A, const u16* B, float* C, int M, int N, int K);
 void linear_backward_half(const float* x, const u16* w, const float* dy,
                           float* dx, float* dw, int M, int K, int N);
 

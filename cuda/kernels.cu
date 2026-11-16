@@ -528,6 +528,32 @@ void linear_backward(const float* x, const float* w, const float* dy,
     if (dw) gemm(true,  false, N, K, M, 1.0f, dy, N, x, K, 1.0f, dw, K);
 }
 
+// C[M,N] = A[M,K] * B[K,N], with B stored in half as row-major [K,N]
+// (the dense down-projection layout). FP32 accumulate, beta = 0.
+void gemm_nn_half(const float* A, const u16* B, float* C, int M, int N, int K) {
+    if (M <= 0 || N <= 0) return;
+    if (K <= 0) { cudaMemset(C, 0, sizeof(float) * size_t(M) * N); return; }
+    __half* Ah = (__half*)workspace(sizeof(__half) * size_t(M) * K);
+    k_f32_to_f16_flat<<<grid_for((i64)M * K, 256), 256>>>(A, Ah, (i64)M * K);
+    CU_CHECK(cudaGetLastError());
+    cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
+    const float alpha = 1.0f, beta = 0.0f;
+    // Column-major: C[N,M] = B[N,K] * Ah[K,M]; B row-major [K,N] -> col [N,K].
+    cublasStatus_t s = cublasGemmEx(h,
+                                    CUBLAS_OP_N, CUBLAS_OP_N,
+                                    N, M, K,
+                                    &alpha,
+                                    B, CUDA_R_16F, N,
+                                    Ah, CUDA_R_16F, K,
+                                    &beta,
+                                    C, CUDA_R_32F, N,
+                                    CUBLAS_COMPUTE_32F,
+                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (s != CUBLAS_STATUS_SUCCESS)
+        GAI_FAIL(strfmt("cublasGemmEx nn-half failed (status=%d) | M=%d N=%d K=%d",
+                        static_cast<int>(s), M, N, K));
+}
+
 void linear_backward_half(const float* x, const u16* w, const float* dy,
                           float* dx, float* dw, int M, int K, int N) {
     if (M <= 0 || K <= 0 || N <= 0) return;

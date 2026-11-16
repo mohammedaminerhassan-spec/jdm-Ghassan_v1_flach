@@ -985,7 +985,6 @@ static void mamba_step_impl(const float* x,
 
     mamba_linear(x, w_in, proj, 1, d, proj_size);
 
-    const int win = k > 1 ? k - 1 : 1;
     {
         const int n = conv_dim;
         k_mamba_step_conv<<<(n + 127) / 128, 128>>>(proj, conv_w, conv_b,
