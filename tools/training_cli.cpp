@@ -10,6 +10,7 @@
 #include "training/jsonl_loader.h"
 
 #include <iostream>
+#include <fstream>
 #include <filesystem>
 #include <cstdlib>
 #include <cstdio>
@@ -61,6 +62,12 @@ static void usage() {
   "  --allow-recipe-drift   resume despite rope/eps/ctx recipe drift (research only)\n"
     "  --resume-mode exact|migrate   # exact: fail closed on any recipe/state drift\n"
     "  --gemm-fp16 0|1           # force CUDA fp16 GEMMs off/on\n"
+    "  --weight-f16 0|1         # the big weights in half precision on the device\n"
+    "                           # (12.9 GB instead of 27.7 GB for the Granite; the\n"
+    "                           #  trainable parameters keep their fp32 masters)\n"
+    "  --weight-q4 0|1|2        # QLoRA: 0=Q4_0, 1=Q4_1, 2=Q8_0 packed on device\n"
+    "                           # (~4.7 GB instead of 12.9 GB; needs a GGUF --model,\n"
+    "                           #  dequantized to FP16 scratch per op)\n"
     "  --device auto|cpu|cuda   --threads <n>\n"
     "  --export <path> --export-profile q8_k|q4_0 --tokenizer <hf-dir|tokenizer.json>\n"
     "      # GGUF-only export (self-contained). --compat native (ghassan-ai) |\n"
@@ -95,9 +102,10 @@ int main(int argc, char** argv) {
         // safetensors + tokenizer.json) with no conversion step. The
         // architecture comes from the checkpoint, not from the recipe.
         std::unique_ptr<HFCheckpoint> hf;
+        std::unique_ptr<GGUFReader> gguf;
         bool weights_loaded_by_cli = false;
+        const std::string mdir = args.str("model");
         {
-            const std::string mdir = args.str("model");
             if (!mdir.empty() && fs::is_directory(mdir)) {
                 hf = std::make_unique<HFCheckpoint>();
                 // A dry run is an arithmetic estimate: it must not map the
@@ -115,6 +123,28 @@ int main(int argc, char** argv) {
                                 mdir.c_str(), mcfg.num_layers, mcfg.hidden_size,
                                 mcfg.num_heads, mcfg.num_kv_heads, mcfg.vocab_size,
                                 mcfg.use_moe ? ", MoE" : "",
+                                mcfg.lora_rank > 0
+                                    ? strfmt(", LoRA r=%d", mcfg.lora_rank).c_str() : ""));
+            }
+        }
+
+        // --model <file.gguf>: fine-tune a GGUF artifact. This is the QLoRA
+        // path - the packed Q4 weights stay on the device and only the LoRA
+        // adapters train. The architecture comes from the GGUF metadata while
+        // the recipe still owns the adapter settings.
+        if (!hf && !mdir.empty() && fs::is_regular_file(mdir)) {
+            std::ifstream probe(mdir, std::ios::binary);
+            u32 magic = 0;
+            if (probe) probe.read(reinterpret_cast<char*>(&magic), 4);
+            if (magic == GGUF_MAGIC) {
+                gguf = std::make_unique<GGUFReader>();
+                GAI_CHECK(gguf->open(mdir), "not a valid .gguf model file: " + mdir);
+                mcfg = gguf->model_config();
+                mcfg.take_adapter_settings_from(recipe_mcfg);
+                weights_loaded_by_cli = true;
+                log_info(strfmt("[mod ] GGUF %s: %d layers, d=%d, H=%d/%d, V=%d%s",
+                                mdir.c_str(), mcfg.num_layers, mcfg.hidden_size,
+                                mcfg.num_heads, mcfg.num_kv_heads, mcfg.vocab_size,
                                 mcfg.lora_rank > 0
                                     ? strfmt(", LoRA r=%d", mcfg.lora_rank).c_str() : ""));
             }
@@ -502,10 +532,34 @@ print_device_report();
             return 0;
         }
 
-        Model model(mcfg, dev);
+        // The half weight storage: the big matrices live in half precision on
+        // the device (12.9 GB instead of 27.7 GB for the 6.94B Granite). The
+        // training path accepts it as long as every TRAINABLE parameter keeps
+        // an fp32 master - the LoRA adapters do, the frozen base does not
+        // need one.
+        const int wf = args.num_int("weight-f16", -1);
+        const bool weight_f16 = (wf >= 0) ? (wf != 0)
+                                           : cfg.get_bool("model.weight_f16", false);
+        int quant_kind = -1;
+        if (args.has("weight-q4")) {
+            quant_kind = static_cast<int>(args.num("weight-q4", 0));
+            GAI_CHECK(quant_kind >= 0 && quant_kind <= 2,
+                      "--weight-q4 must be 0 (Q4_0), 1 (Q4_1) or 2 (Q8_0)");
+            GAI_CHECK(gguf != nullptr,
+                      "--weight-q4 (QLoRA) requires --model <file.gguf>");
+            log_info(strfmt("[prec] QLoRA: %s packed on device, adapters train in FP32",
+                            quant_kind == 0 ? "Q4_0" : quant_kind == 1 ? "Q4_1" : "Q8_0"));
+        }
+
+        Model model(mcfg, dev, weight_f16, quant_kind);
         model.print_parameter_report();
 
-        if (weights_loaded_by_cli) {
+        if (gguf) {
+            GAI_CHECK(load_model_from_gguf(gguf->path(), model, quant_kind),
+                      "cannot load the weights of the GGUF model");
+            log_info("[mod ] the GGUF weights are loaded");
+            tcfg.pretrained_loaded = true;
+        } else if (weights_loaded_by_cli) {
             // Fine-tuning a real checkpoint: the weights come from the
             // checkpoint, not from a random init.
             GAI_CHECK(hf->load_model(model),
@@ -530,9 +584,20 @@ print_device_report();
             // A LoRA run trains adapters; the exported model must be a plain
             // dense checkpoint, so the adapters are folded into the base
             // weights first.
+            //
+            // With the half weight storage the base weights have no fp32
+            // master to merge into (that is the point: 12.9 GB instead of
+            // 27.7 GB). The adapters are then exported as they are, next to
+            // the half base: a PEFT-style checkpoint.
             if (model.has_lora()) {
-                log_info("[expt] merging the LoRA adapters into the base weights");
-                model.merge_lora();
+                if (model.fp16_weight_storage_enabled()) {
+                    log_info("[expt] the base weights are in half precision: the "
+                             "adapters are exported as they are (no merge) - a "
+                             "PEFT-style checkpoint (base + adapters)");
+                } else {
+                    log_info("[expt] merging the LoRA adapters into the base weights");
+                    model.merge_lora();
+                }
             }
             int my_rank = 0;
             if (const char* rank_env = std::getenv("RANK")) {

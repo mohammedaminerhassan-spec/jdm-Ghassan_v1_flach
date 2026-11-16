@@ -27,12 +27,13 @@
 7. [The 13-step pipeline](#7-the-13-step-pipeline)
 8. [Configuration reference](#8-configuration-reference)
 9. [Performance & memory](#9-performance--memory)
-10. [GPU compatibility](#10-gpu-compatibility)
-11. [Training (roadmap)](#11-training-roadmap)
-12. [Multimodal — Ghassan v1 Flash VL (roadmap)](#12-multimodal--ghassan-v1-flash-vl-roadmap)
-13. [Testing](#13-testing)
-14. [Known limitations — honest notes](#14-known-limitations--honest-notes)
-15. [Contributing & license](#15-contributing--license)
+10. [Native Q4 & QLoRA](#10-native-q4--qlora)
+11. [GPU compatibility](#11-gpu-compatibility)
+12. [Training](#12-training)
+13. [Multimodal — Ghassan v1 Flash VL (roadmap)](#13-multimodal--ghassan-v1-flash-vl-roadmap)
+14. [Testing](#14-testing)
+15. [Known limitations — honest notes](#15-known-limitations--honest-notes)
+16. [Contributing & license](#16-contributing--license)
 
 ---
 
@@ -200,7 +201,7 @@ There is intentionally **no `general.base_model.*`** key. The geometry (40 layer
 | `ghassan-v1-flash-FP16.gguf` | ~13.9 GB | Weights stored as FP16; sensitive vectors FP32 | Maximum fidelity, 16 GB GPUs (T4, 5060 Ti 16 GB) |
 | `ghassan-v1-flash-Q4_0.gguf` | ~4.69 GB | Same model, Q4_0 blocks on disk | Fast download / low disk, 16 GB GPUs |
 
-> ⚠️ Both files load to **12.93 GiB of FP16 weights on the GPU** in this engine. Q4 shrinks the *file*, not the *resident footprint* — Q4-native inference is on the roadmap.
+> ℹ️ By default both files load as **12.93 GiB of FP16 weights**. To actually keep the Q4 compressed on the GPU (≈4.7 GiB, fits an 8 GB card), pass `--weight-q4 0` — see [Native Q4 & QLoRA](#10-native-q4--qlora).
 
 ### 4.3 Verified output (real run on Kaggle T4 x2)
 
@@ -375,23 +376,69 @@ The engine computes a plan *before* allocating and refuses impossible configs wi
 
 ---
 
-## 10. GPU compatibility
+## 10. Native Q4 & QLoRA
+
+The engine now supports **native quantized weight storage**. The big matrices stay packed as Q4_0 / Q4_1 / Q8_0 **on the GPU** and are dequantized into a small shared FP16 scratch bank right before each GEMM. This is what turns a 13 GB model into a ~5 GB resident footprint.
+
+```mermaid
+flowchart LR
+    F["Q4 GGUF<br/>4.7 GB on disk"] -->|"read blocks verbatim"| G["Packed Q4<br/>on GPU"]
+    G -->|"dequant kernel"| S["FP16 scratch<br/>(~350 MB/layer)"]
+    S --> C["cuBLAS GEMM<br/>fp16 tensor cores"]
+    C --> O["fp32 accumulate"]
+    style G fill:#6E40C9,color:#fff
+    style S fill:#2E7D32,color:#fff
+```
+
+- Only weights used by the **same kernel** get separate scratch slots (the six MoE expert matrices); sequential ops reuse one slot thanks to stream ordering.
+- Fragile vectors (router, `dt_bias`, `A_log`, `D`, conv1d, norms) and the embedding stay FP16/FP32 — quantizing them would change the model's decisions.
+- Load-time quantization: an FP16 GGUF can be served as Q4 without re-exporting.
+
+### Inference on an 8 GB card (RTX 5060)
+
+```bash
+./build/bin/ghassan-ai generate --model ghassan-v1-flash-Q4_0.gguf \
+    --prompt "Explain mixture of experts in clear English." \
+    --max-tokens 200 --no-stream \
+    --device cuda --weight-q4 0 --gemm-fp16 1
+```
+
+| Mode | Resident weights | RTX 5060 8 GB | RTX 5060 Ti 16 GB |
+|---|---|---|---|
+| `--weight-f16 1` (default) | 12.93 GiB | ❌ | ✅ |
+| `--weight-q4 0` (Q4_0) | ~4.7 GiB + scratch | ✅ | ✅ |
+| `--weight-q4 2` (Q8_0) | ~6.5 GiB + scratch | ✅ (tight) | ✅ |
+
+### QLoRA fine-tuning (Q4 base + trainable adapters)
+
+```bash
+./build/bin/gai_train --config configs/granite_4_0_h_lora.yaml \
+    --model ghassan-v1-flash-Q4_0.gguf \
+    --weight-q4 0 --device cuda \
+    --export trained.gguf --export-profile fp16
+```
+
+The base stays packed and frozen; only the LoRA adapters (FP32) train and receive gradients. `merge_lora()` folds them back into the Q4 base by dequantizing → merging → re-quantizing one adapter at a time. Verified by `test_quant` (dequantizer matches the reference to FP16 rounding) and `test_lora` (merge preserves the forward output exactly).
+
+---
+
+## 11. GPU compatibility
 
 ```mermaid
 flowchart LR
     A["sm_75<br/>T4"] --> OK["✅ tested, 93% VRAM"]
     B["sm_80 / sm_90<br/>A100 / H100"] --> OK2["✅ SASS in binary"]
     C["sm_120<br/>RTX 5060 (Blackwell)"] --> PTX["✅ JIT via PTX<br/>(CMake ≥ 12.8)"]
-    D["8 GB card"] --> FAIL["❌ 12.93 GiB weights<br/>need Q4-native inference"]
-    style FAIL fill:#C62828,color:#fff
+    D["8 GB card + --weight-q4"] --> Q4["✅ ~5 GiB, fits"]
+    style Q4 fill:#2E7D32,color:#fff
     style PTX fill:#2E7D32,color:#fff
 ```
 
-> **RTX 5060 (8 GB)**: neither FP16 nor the current Q4 file will run — both become 12.93 GiB of FP16 weights on GPU. **RTX 5060 Ti 16 GB** runs both comfortably. True Q4-on-GPU inference (dequantize inside the kernel) is the roadmap item that unlocks 8 GB cards.
+> **RTX 5060 (8 GB)**: use `--weight-q4 0`. The default `--weight-f16 1` needs 12.93 GiB and will not fit; **RTX 5060 Ti 16 GB** runs every mode. The older Q4 *file* (without `--weight-q4`) only compressed the disk copy and still loaded 12.93 GiB of FP16.
 
 ---
 
-## 11. Training (roadmap)
+## 12. Training
 
 The training stack is **already written** (`training/`): AdamW / Lion / Muon, gradient accumulation, chunked CE, activation checkpointing, NCCL DDP, exact/migrate resume, tokenizer fingerprints, cli. It is not needed for the current GGUF workflow and has not been exercised on a long run yet.
 
@@ -404,9 +451,11 @@ gantt
     GGUF FP16 + Q4 export        :done, a1, 2026-10, 2026-11
     Identity metadata            :done, a2, 2026-11, 2026-11
     GPU Mamba decode             :done, a3, 2026-11, 2026-11
+    Native Q4 (Q4_0/Q4_1/Q8_0)   :done, a4, 2026-11, 2026-11
+    LoRA + QLoRA                 :done, a5, 2026-11, 2026-11
     section Next
-    Q4-native GPU inference      :b1, 2026-11, 2026-12
-    LoRA / QLoRA validation      :b2, 2026-12, 2027-01
+    Fused dequant-GEMM kernels   :b1, 2026-11, 2026-12
+    Long-run SFT validation      :b2, 2026-12, 2027-01
     section Later
     Ghassan v1 Flash VL (projector) :c1, 2027-01, 2027-03
     Long reasoning + thinking    :c2, 2027-03, 2027-04
@@ -427,7 +476,7 @@ flowchart LR
 
 ---
 
-## 12. Multimodal — Ghassan v1 Flash VL (roadmap)
+## 13. Multimodal — Ghassan v1 Flash VL (roadmap)
 
 The engine already has the hook: `Model::forward(... embed_override, override_pos, n_override)` lets a caller replace token embeddings with external features at chosen positions. A projector can therefore feed image/audio/video features into the same residual stream **without changing the base weights**.
 
@@ -448,7 +497,7 @@ The guiding idea from day one: **one model, with other tool models in the same s
 
 ---
 
-## 13. Testing
+## 14. Testing
 
 ```bash
 ctest --test-dir build --output-on-failure
@@ -466,11 +515,11 @@ ctest --test-dir build --output-on-failure
 
 ---
 
-## 14. Known limitations — honest notes
+## 15. Known limitations — honest notes
 
 | Limitation | Why it's still there |
 |---|---|
-| Q4 files dequantize to FP16 on GPU | Q4-native kernels not written yet; 8 GB cards unsupported |
+| Q4 default load still expands to FP16 | Pass `--weight-q4 0` for packed native Q4 (~5 GiB, fits 8 GB) |
 | No true FlashAttention (WMMA) | Current GEMM path is verified; rewriting risks correctness |
 | Training not run to convergence | Stack exists and builds; long-run validation is a separate phase |
 | K-quant profile names map to Q8_0/Q4_0 | True K-quant writers are roadmap |
@@ -478,7 +527,7 @@ ctest --test-dir build --output-on-failure
 
 ---
 
-## 15. Contributing & license
+## 16. Contributing & license
 
 - **Model card:** [ghassan-ai/Ghassan-v1-Flash-GGUF](https://huggingface.co/ghassan-ai/Ghassan-v1-Flash-GGUF)
 - **Engine:** `mohammedaminerhassan-spec/jdm-Ghassan_v1_flach`

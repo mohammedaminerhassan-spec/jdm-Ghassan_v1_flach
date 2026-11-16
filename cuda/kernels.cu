@@ -66,6 +66,7 @@ void free_workspace() {
     moe_free_workspace();
     mamba_free_workspace();
     attn_free_pool();
+    free_quant_scratch();
 }
 
 void free_workspaces() { free_workspace(); }
@@ -460,6 +461,73 @@ void convert_f16_to_f32(const u16* src, float* dst, i64 n) {
     if (n <= 0) return;
     k_f16_to_f32_flat<<<grid_for(n, 256), 256>>>(reinterpret_cast<const __half*>(src), dst, n);
     CU_CHECK(cudaGetLastError());
+}
+
+// ---- native quantized weight dequantization ------------------------------
+// GGML block layouts (32 values per block), identical to the GGUF codec:
+//   Q4_0: [f16 scale][16 bytes; low nibble = v[j], high = v[j+16]]  = (q-8)*d
+//   Q4_1: [f16 scale][f16 min][16 bytes; low = v[2j], high = v[2j+1]] = q*d+m
+//   Q8_0: [f16 scale][32 x i8]                                     = q*d
+// One thread per output element, grid-stride loop so even the 50M-element
+// MoE expert matrices are covered without exceeding the launch grid limit.
+__global__ void k_dequant_quant(const u16* __restrict__ src, __half* __restrict__ dst,
+                                i64 n, int kind) {
+    i64 i = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 stride = (i64)gridDim.x * blockDim.x;
+    const i64 blocks_per_row = (kind == 0) ? 9 : (kind == 1) ? 10 : 17; // u16 per 32-val block
+    for (; i < n; i += stride) {
+        const i64 b = i >> 5;
+        const int j = static_cast<int>(i & 31);
+        const u8* blk = reinterpret_cast<const u8*>(src + b * blocks_per_row);
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        float v;
+        if (kind == 0) {
+            const u8 byte = blk[2 + (j & 15)];
+            const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+            v = static_cast<float>(q - 8) * d;
+        } else if (kind == 1) {
+            const float m = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+            const u8 byte = blk[4 + (j >> 1)];
+            const int q = (j & 1) ? (byte >> 4) : (byte & 0x0F);
+            v = static_cast<float>(q) * d + m;
+        } else {
+            v = static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[j]) * d;
+        }
+        dst[i] = __float2half(v);
+    }
+}
+
+void dequantize_quant(const u16* src, u16* dst, i64 n, int kind) {
+    if (n <= 0) return;
+    k_dequant_quant<<<grid_for(n, 256), 256>>>(src, reinterpret_cast<__half*>(dst), n, kind);
+    CU_CHECK(cudaGetLastError());
+}
+
+static constexpr int kQuantSlots = 16;
+static u16* g_qscratch[kQuantSlots] = {};
+static size_t g_qscratch_cap[kQuantSlots] = {}; // in u16 elements
+
+u16* quant_scratch(int slot, i64 n) {
+    if (slot < 0 || slot >= kQuantSlots) slot = 0;
+    const size_t need = static_cast<size_t>(n);
+    if (need > g_qscratch_cap[slot]) {
+        if (g_qscratch[slot]) CU_CHECK(cudaFree(g_qscratch[slot]));
+        g_qscratch[slot] = nullptr;
+        g_qscratch_cap[slot] = 0;
+        const size_t want = round_ws(need * sizeof(u16));
+        gai::cuda::check_free_vram(want, "quant scratch");
+        CU_CHECK(cudaMalloc(&g_qscratch[slot], want));
+        g_qscratch_cap[slot] = want / sizeof(u16);
+    }
+    return g_qscratch[slot];
+}
+
+void free_quant_scratch() {
+    for (int i = 0; i < kQuantSlots; ++i) {
+        if (g_qscratch[i]) cudaFree(g_qscratch[i]);
+        g_qscratch[i] = nullptr;
+        g_qscratch_cap[i] = 0;
+    }
 }
 
 void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, int N) {

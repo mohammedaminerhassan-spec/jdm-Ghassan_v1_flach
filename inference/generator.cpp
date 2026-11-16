@@ -1,5 +1,6 @@
 #include "inference/generator.h"
 #include "core/ops.h"
+#include "core/quant.h"
 #include "core/device.h"
 #ifdef GAI_CUDA
 #include "cuda/cuda_utils.h"
@@ -25,6 +26,8 @@ inline void linear_param(Device dev, const Tensor& w, const float* x, float* y,
                          int M, int K, int N) {
     if (w.dtype() == DType::F16)
         ops::linear_forward_fp16(dev, x, w.ptr<u16>(), y, M, K, N);
+    else if (is_quant(w))
+        ops::linear_forward_fp16(dev, x, weight16(dev, w, 0), y, M, K, N);
     else
         ops::linear_forward(dev, x, w.f32(), y, M, K, N);
 }
@@ -228,8 +231,8 @@ float* Generator::decode_step_logits(i32 token, int position) {
     Device dev = model_.device();
 
     device_copy(tok_dev_.data_ptr(), dev, &token, Device::CPU, sizeof(i32));
-    if (model_.tok_embeddings().is_half())
-        ops::embedding_forward_half(dev, tok_dev_.i32p(), model_.tok_embeddings().w.ptr<u16>(),
+    if (is_half_or_quant(model_.tok_embeddings().w))
+        ops::embedding_forward_half(dev, tok_dev_.i32p(), weight16(dev, model_.tok_embeddings().w, 0),
                                     x_.f32(), 1, d, V);
     else
         ops::embedding_forward(dev, tok_dev_.i32p(), model_.tok_embeddings().w.f32(), x_.f32(), 1, d, V);
@@ -260,13 +263,14 @@ float* Generator::decode_step_logits(i32 token, int position) {
             ops::rmsnorm_forward(dev, x_.f32(), L.ffn_norm.w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
             if (L.has_moe()) {
                 const float* bias = model_.moe_bias_ptr(l);
-                if (L.moe_gate.is_half()) {
+                if (is_half_or_quant(L.moe_gate.w)) {
                     ops::moe_forward_bias_half(dev, xb_.f32(), L.router.w.f32(), bias,
-                                               L.moe_gate.w.ptr<u16>(), L.moe_up.w.ptr<u16>(),
-                                               L.moe_down.w.ptr<u16>(),
-                                               L.sh_gate.w.defined() ? L.sh_gate.w.ptr<u16>() : nullptr,
-                                               L.sh_up.w.defined()   ? L.sh_up.w.ptr<u16>()   : nullptr,
-                                               L.sh_down.w.defined() ? L.sh_down.w.ptr<u16>() : nullptr,
+                                               weight16(dev, L.moe_gate.w, 0),
+                                               weight16(dev, L.moe_up.w, 1),
+                                               weight16(dev, L.moe_down.w, 2),
+                                               L.sh_gate.w.defined() ? weight16(dev, L.sh_gate.w, 3) : nullptr,
+                                               L.sh_up.w.defined()   ? weight16(dev, L.sh_up.w, 4)   : nullptr,
+                                               L.sh_down.w.defined() ? weight16(dev, L.sh_down.w, 5) : nullptr,
                                                proj_.f32(), nullptr, nullptr, nullptr,
                                                moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
                                                1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
@@ -382,13 +386,14 @@ float* Generator::decode_step_logits(i32 token, int position) {
         ops::rmsnorm_forward(dev, x_.f32(), L.ffn_norm.w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
         if (L.has_moe()) {
             const float* bias = model_.moe_bias_ptr(l);
-            if (L.moe_gate.is_half()) {
+            if (is_half_or_quant(L.moe_gate.w)) {
                 ops::moe_forward_bias_half(dev, xb_.f32(), L.router.w.f32(), bias,
-                                           L.moe_gate.w.ptr<u16>(), L.moe_up.w.ptr<u16>(),
-                                           L.moe_down.w.ptr<u16>(),
-                                           L.sh_gate.w.defined() ? L.sh_gate.w.ptr<u16>() : nullptr,
-                                           L.sh_up.w.defined()   ? L.sh_up.w.ptr<u16>()   : nullptr,
-                                           L.sh_down.w.defined() ? L.sh_down.w.ptr<u16>() : nullptr,
+                                           weight16(dev, L.moe_gate.w, 0),
+                                           weight16(dev, L.moe_up.w, 1),
+                                           weight16(dev, L.moe_down.w, 2),
+                                           L.sh_gate.w.defined() ? weight16(dev, L.sh_gate.w, 3) : nullptr,
+                                           L.sh_up.w.defined()   ? weight16(dev, L.sh_up.w, 4)   : nullptr,
+                                           L.sh_down.w.defined() ? weight16(dev, L.sh_down.w, 5) : nullptr,
                                            proj_.f32(), nullptr, nullptr, nullptr,
                                            moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
                                            1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
@@ -462,12 +467,12 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
     // two synchronous copies per Mamba layer per token (72 per token on
     // Granite) and runs the small recurrence on the GPU instead of the host.
     if (dev == Device::CUDA && st.ssm_dev.defined()) {
-        if (L.mamba_in_proj.is_half()) {
+        if (is_half_or_quant(L.mamba_in_proj.w)) {
             ops::mamba2_step_half(dev, x_in,
-                L.mamba_in_proj.w.ptr<u16>(), L.mamba_conv_w.w.f32(),
+                weight16(dev, L.mamba_in_proj.w, 0), L.mamba_conv_w.w.f32(),
                 L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32() : nullptr,
                 L.mamba_dt_bias.w.f32(), L.mamba_A_log.w.f32(), L.mamba_D.w.f32(),
-                L.mamba_norm.w.f32(), L.mamba_out_proj.w.ptr<u16>(),
+                L.mamba_norm.w.f32(), weight16(dev, L.mamba_out_proj.w, 1),
                 st.conv_dev.f32(), st.ssm_dev.f32(), out,
                 d, d_inner, conv_dim, n_heads, d_head, d_state, conv_k, c.rms_eps);
         } else {
@@ -663,8 +668,8 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     Tensor utmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
     Tensor atmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
 
-    if (model_.tok_embeddings().is_half())
-        ops::embedding_forward_half(dev, d_ids.i32p(), model_.tok_embeddings().w.ptr<u16>(),
+    if (is_half_or_quant(model_.tok_embeddings().w))
+        ops::embedding_forward_half(dev, d_ids.i32p(), weight16(dev, model_.tok_embeddings().w, 0),
                                     x.f32(), P, d, c.vocab_size);
     else
         ops::embedding_forward(dev, d_ids.i32p(), model_.tok_embeddings().w.f32(),
@@ -744,12 +749,13 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
         ops::rmsnorm_forward(dev, x.f32(), L.ffn_norm.w.f32(), xb.f32(), nullptr, P, d, c.rms_eps);
         if (L.has_moe()) {
             const float* bias = model_.moe_bias_ptr(l);
-            if (L.moe_gate.is_half()) {
+            if (is_half_or_quant(L.moe_gate.w)) {
                 ops::moe_forward_bias_half(dev, xb.f32(), L.router.w.f32(), bias,
-                                  L.moe_gate.w.ptr<u16>(), L.moe_up.w.ptr<u16>(), L.moe_down.w.ptr<u16>(),
-                                  L.sh_gate.w.defined() ? L.sh_gate.w.ptr<u16>() : nullptr,
-                                  L.sh_up.w.defined()   ? L.sh_up.w.ptr<u16>()   : nullptr,
-                                  L.sh_down.w.defined() ? L.sh_down.w.ptr<u16>() : nullptr,
+                                  weight16(dev, L.moe_gate.w, 0), weight16(dev, L.moe_up.w, 1),
+                                  weight16(dev, L.moe_down.w, 2),
+                                  L.sh_gate.w.defined() ? weight16(dev, L.sh_gate.w, 3) : nullptr,
+                                  L.sh_up.w.defined()   ? weight16(dev, L.sh_up.w, 4)   : nullptr,
+                                  L.sh_down.w.defined() ? weight16(dev, L.sh_down.w, 5) : nullptr,
                                   proj.f32(), nullptr, nullptr, nullptr,
                                   mg.f32(), mu.f32(), ma.f32(),
                                   P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,

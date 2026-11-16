@@ -180,6 +180,11 @@ public:
 
     Tensor read_tensor_f32(const std::string& name) const;
     Tensor read_tensor_raw(const std::string& name) const;
+    // Read a weight already in a quantized target dtype. If the file stores
+    // the matching GGML block layout the packed bytes are copied verbatim;
+    // otherwise the tensor is decoded to FP32 and quantized to `target`
+    // (load-time quantization, e.g. an FP16 GGUF loaded as native Q4_0).
+    Tensor read_tensor_quant(const std::string& name, DType target) const;
 
     const std::string& path() const { return path_; }
     uint64_t file_size() const { return file_size_; }
@@ -203,7 +208,9 @@ private:
     template<typename T> static bool read_pod(std::istream& is, T& v);
 };
 
-bool load_model_from_gguf(const std::string& path, Model& model);
+// quant_kind: -1 = dequantize everything to FP32/F16 (legacy path),
+//  0 = Q4_0, 1 = Q4_1, 2 = Q8_0 (native quantized storage).
+bool load_model_from_gguf(const std::string& path, Model& model, int quant_kind = -1);
 
 // 8-bit is the maximum precision this engine exports at (the model ships to
 // Kaggle T4s, which have no spare VRAM for fp16 weights at load time and

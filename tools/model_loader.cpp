@@ -19,7 +19,7 @@ namespace {
 // a model that does not fit the GPU dies inside cudaMalloc with a cryptic
 // "out of memory". This pre-flight turns that into an actionable message.
 void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_cache_on,
-                       bool fp16_weights = false) {
+                       bool fp16_weights = false, int quant_kind = -1) {
     if (dev != Device::CUDA) return;
     const DeviceInfo& di = device_info();
     if (!di.cuda_available || di.total_mem == 0) return;
@@ -41,10 +41,14 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
     const bool hybrid = (cfg.arch == ModelConfig::ArchGranite);
     const int act_T = hybrid ? 1 : (ctx > 0 ? ctx : 512);
     const Model::MemoryPlan plan2 =
-        Model::plan_memory(cfg, 1, act_T, false, 1, fp16_cache_on, fp16_weights);
+        Model::plan_memory(cfg, 1, act_T, false, 1, fp16_cache_on, fp16_weights, quant_kind);
     const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, act_T);
+    // Native Q4 keeps a shared FP16 scratch bank: one layer's worth of
+    // dequantized weights is live at a time (~350 MB for Granite tiny),
+    // rounded up with headroom.
+    const size_t qscratch = quant_kind >= 0 ? (512ull << 20) : 0;
     const size_t need = plan2.weights + plan2.fp16_cache + plan2.activations +
-                        kv + mam + wsp.gemm_bytes + wsp.moe_bytes;
+                        kv + mam + wsp.gemm_bytes + wsp.moe_bytes + qscratch;
 
     log_info(strfmt("[mem ] GPU plan: weights %s | fp16 cache %s | activations %s | "
                     "kv %s | mamba %s | workspaces %s = %s of %s (%.0f%%)%s",
@@ -191,7 +195,21 @@ LoadedModel load_model(const Args& args) {
     // the device. It is ON by default on the GPU (it is what makes a 6.94B
     // model fit on a 16 GB card) and OFF on the CPU (the reference path stays
     // bit-identical).
-    const bool fp16_weights = args.flag("weight-f16", dev == Device::CUDA);
+    bool fp16_weights = args.flag("weight-f16", dev == Device::CUDA);
+    // Native quantized storage: 0 = Q4_0, 1 = Q4_1, 2 = Q8_0. The packed
+    // weights stay on the GPU and are dequantized into FP16 scratch per op,
+    // which is what makes a 6.9B model fit an 8 GB card (~4.7 GiB + scratch).
+    int quant_kind = -1;
+    if (args.has("weight-q4")) {
+        quant_kind = static_cast<int>(args.num("weight-q4", 0));
+        GAI_CHECK(quant_kind >= 0 && quant_kind <= 2,
+                  "--weight-q4 must be 0 (Q4_0), 1 (Q4_1) or 2 (Q8_0)");
+        if (fp16_weights && !args.has("weight-f16")) fp16_weights = false;
+        GAI_CHECK(!fp16_weights, "--weight-q4 and --weight-f16 are mutually exclusive; "
+                                 "pass --weight-f16 0 explicitly");
+        log_info(strfmt("[prec] native quantized weights: %s (packed on device)",
+                        quant_kind == 0 ? "Q4_0" : quant_kind == 1 ? "Q4_1" : "Q8_0"));
+    }
     if (args.has("weight-f16"))
         log_info(strfmt("[prec] fp16 weight storage: %s (explicit --weight-f16)",
                         fp16_weights ? "on" : "off"));
@@ -230,10 +248,12 @@ LoadedModel load_model(const Args& args) {
 
         Timer t;
         const bool fp16_cache_on = (dev == Device::CUDA) && ops::gemm_fp16_enabled() &&
-                                   !args.flag("no-fp16-cache", false) && !fp16_weights;
-        check_vram_budget(lm.cfg, dev, args.num_int("ctx", 0), fp16_cache_on, fp16_weights);
-        lm.model = std::make_unique<Model>(lm.cfg, dev, fp16_weights);
-        GAI_CHECK(load_model_from_gguf(path, *lm.model),
+                                   !args.flag("no-fp16-cache", false) && !fp16_weights &&
+                                   quant_kind < 0;
+        check_vram_budget(lm.cfg, dev, args.num_int("ctx", 0), fp16_cache_on, fp16_weights,
+                          quant_kind);
+        lm.model = std::make_unique<Model>(lm.cfg, dev, fp16_weights, quant_kind);
+        GAI_CHECK(load_model_from_gguf(path, *lm.model, quant_kind),
                   "failed to load weights from: " + path);
         if (fp16_cache_on) {
             lm.model->enable_fp16_weight_cache(true);
@@ -249,6 +269,11 @@ LoadedModel load_model(const Args& args) {
     // A HuggingFace checkpoint directory: the engine serves it as it is,
     // with no conversion step.
     if (fs::is_directory(path)) {
+        if (quant_kind >= 0) {
+            log_warn("[prec] --weight-q4 applies to GGUF inputs only; export a GGUF "
+                     "first (ghassan-ai quantize --profile q4_0) to use native Q4");
+            quant_kind = -1;
+        }
         HFCheckpoint hf;
         GAI_CHECK(hf.open(path), "not a usable HuggingFace checkpoint: " + path);
         lm.cfg = hf.config();

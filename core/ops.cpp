@@ -275,6 +275,68 @@ void convert_f16_to_f32(Device dev, const u16* src, float* dst, i64 n) {
 #endif
 }
 
+// ---- native quantized weight materialization -----------------------------
+// Q4/Q8 weights stay packed on the device. On demand they are dequantized
+// into a small FP16 scratch bank and consumed by the existing *_half ops.
+// Only weights used by the SAME kernel need distinct slots; sequential ops
+// reuse slot 0 safely because CUDA stream ordering serializes the GEMMs.
+static constexpr int kQuantSlots = 16;
+static std::vector<u16> g_qcpu[kQuantSlots];   // host scratch (CPU path / tests)
+static std::mutex g_qcpu_mutex;
+
+const u16* quant_materialize(Device dev, const void* packed, int kind, i64 n, int slot) {
+    GAI_CHECK(packed != nullptr && n > 0, "quant_materialize: bad arguments");
+    if (slot < 0 || slot >= kQuantSlots) slot = 0;
+
+    if (dev == Device::CPU) {
+        std::lock_guard<std::mutex> lock(g_qcpu_mutex);
+        auto& buf = g_qcpu[static_cast<size_t>(slot)];
+        buf.resize(static_cast<size_t>(n));
+        const u8* p = reinterpret_cast<const u8*>(packed);
+        for (i64 i = 0; i < n; ++i) {
+            const i64 b = i >> 5;
+            const int j = static_cast<int>(i & 31);
+            float v;
+            if (kind == 0) { // Q4_0
+                const u8* blk = p + b * 18;
+                const float sc = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                const u8 byte = blk[2 + (j & 15)];
+                const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+                v = static_cast<float>(q - 8) * sc;
+            } else if (kind == 1) { // Q4_1
+                const u8* blk = p + b * 20;
+                const float sc = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                const float mn = fp16_to_fp32(*reinterpret_cast<const u16*>(blk + 2));
+                const u8 byte = blk[4 + (j >> 1)];
+                const int q = (j & 1) ? (byte >> 4) : (byte & 0x0F);
+                v = static_cast<float>(q) * sc + mn;
+            } else { // Q8_0
+                const u8* blk = p + b * 34;
+                const float sc = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                v = static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[j]) * sc;
+            }
+            buf[static_cast<size_t>(i)] = fp32_to_fp16(v);
+        }
+        return buf.data();
+    }
+
+#ifdef GAI_CUDA
+    u16* dst = cuda_ops::quant_scratch(slot, n);
+    cuda_ops::dequantize_quant(static_cast<const u16*>(packed), dst, n, kind);
+    return dst;
+#else
+    GAI_FAIL("quant_materialize: CUDA device requested but the build has no CUDA support");
+#endif
+}
+
+void quant_scratch_free() {
+#ifdef GAI_CUDA
+    cuda_ops::free_quant_scratch();
+#endif
+    std::lock_guard<std::mutex> lock(g_qcpu_mutex);
+    for (int i = 0; i < kQuantSlots; ++i) g_qcpu[static_cast<size_t>(i)].clear();
+}
+
 void register_fp16_weight(const float* master, const u16* half, i64 n) {
     GAI_CHECK(master != nullptr && half != nullptr && n > 0, "invalid fp16 weight registration");
     std::lock_guard<std::mutex> lock(g_fp16_weights_mutex);

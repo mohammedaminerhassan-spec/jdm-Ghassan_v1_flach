@@ -1,5 +1,6 @@
 #include "format/gguf_codec.h"
 #include "quantization/quantize.h"
+#include "core/quant.h"
 #include "core/common.h"
 #include "core/rng.h"
 #include "core/dtype.h"
@@ -1418,11 +1419,64 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
     return out;
 }
 
+Tensor GGUFReader::read_tensor_quant(const std::string& name, DType target) const {
+    const GGUFTensorInfo* ti = find_tensor(name);
+    GAI_CHECK(ti != nullptr, "gguf_format: tensor not found: " + name);
+
+    // The GGML type that corresponds to the requested target dtype.
+    GGMLType want = GGMLType::Q4_0;
+    if (target == DType::Q4_1) want = GGMLType::Q4_1;
+    else if (target == DType::Q8_0) want = GGMLType::Q8_0;
+    else GAI_CHECK(target == DType::Q4_0, "read_tensor_quant: unsupported target dtype");
+
+    u64 nelems64 = 1;
+    for (uint64_t d : ti->dimensions) {
+        GAI_CHECK(d <= (1ull << 40), "gguf_format: absurd tensor dim for " + name);
+        GAI_CHECK(nelems64 <= ((1ull << 40) / (d == 0 ? 1 : d)),
+                  "gguf_format: tensor element overflow for " + name);
+        nelems64 *= d;
+    }
+    const size_t nelems = static_cast<size_t>(nelems64);
+    std::vector<i64> shape;
+    for (auto it = ti->dimensions.rbegin(); it != ti->dimensions.rend(); ++it)
+        shape.push_back(static_cast<i64>(*it));
+
+    if (ti->type == want) {
+        // Fast path: the file already stores this exact block layout. Copy
+        // the packed bytes verbatim - no FP32 staging, no requantization.
+        const size_t nbytes = ggml_nbytes(ti->type, nelems);
+        GAI_CHECK(data_start_ <= file_size_, "gguf_format: bad data section for " + name);
+        GAI_CHECK(ti->offset <= file_size_ - data_start_, "gguf_format: tensor offset outside file: " + name);
+        const uint64_t abs_offset = data_start_ + ti->offset;
+        GAI_CHECK(nbytes <= file_size_ - abs_offset, "gguf_format: tensor overruns file: " + name);
+        std::ifstream f(path_, std::ios::binary);
+        GAI_CHECK(f.good(), "gguf_format: cannot reopen: " + path_);
+        f.seekg(static_cast<std::streamoff>(abs_offset));
+        GAI_CHECK(f.good(), "gguf_format: seek failed for tensor " + name);
+        std::vector<uint8_t> raw(nbytes);
+        GAI_CHECK(static_cast<bool>(f.read(reinterpret_cast<char*>(raw.data()),
+                                           static_cast<std::streamsize>(nbytes))),
+                  "gguf_format: short read for tensor " + name);
+        Tensor out(shape, target, Device::CPU);
+        GAI_CHECK(out.nbytes() == nbytes, "gguf_format: quant byte-size mismatch for " + name);
+        std::memcpy(out.data_ptr(), raw.data(), nbytes);
+        out.set_name(name);
+        return out;
+    }
+
+    // Slow path: decode whatever the file uses to FP32, then quantize to the
+    // requested layout. This lets an FP16 GGUF be served as native Q4.
+    Tensor f32 = read_tensor_f32(name);
+    Tensor out = quant::quantize(f32, target);
+    out.set_name(name);
+    return out;
+}
+
 Tensor GGUFReader::read_tensor_f32(const std::string& name) const {
     return read_tensor_raw(name);
 }
 
-bool load_model_from_gguf(const std::string& path, Model& model) {
+bool load_model_from_gguf(const std::string& path, Model& model, int quant_kind) {
     GGUFReader r;
     if (!r.open(path)) {
         log_error("gguf_format: cannot open: " + path);
@@ -1443,7 +1497,12 @@ bool load_model_from_gguf(const std::string& path, Model& model) {
             log_error("gguf_format: missing tensor: " + p->name);
             return false;
         }
-        Tensor t = r.read_tensor_f32(ti->name);
+        // In native quantized mode the big matrices are stored packed in the
+        // Parameter; copy the file's blocks (or quantize on load) directly.
+        // Fragile vectors stay FP32 and keep the legacy F32 decode path.
+        Tensor t = (quant_kind >= 0 && is_quant(p->w))
+                       ? r.read_tensor_quant(ti->name, p->w.dtype())
+                       : r.read_tensor_f32(ti->name);
         if (t.numel() != p->numel()) {
             log_error(strfmt("gguf tensor size mismatch %s: file=%lld model=%lld",
                              p->name.c_str(),
@@ -1451,7 +1510,8 @@ bool load_model_from_gguf(const std::string& path, Model& model) {
                              static_cast<long long>(p->numel())));
             return false;
         }
-        p->w.copy_from_f32(t);
+        if (t.dtype() == p->w.dtype()) p->w.copy_from(t);   // packed Q4/Q8 bytes
+        else                           p->w.copy_from_f32(t); // F32 -> storage dtype
     }
     if (lm_head_from_emb) {
         log_info("[gguf] no output.weight in the file: the token embedding is used "

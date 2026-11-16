@@ -25,6 +25,13 @@ void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, i
 void split_qkv(const float* qkv, float* q, float* k, float* v, i64 n, int qd, int kvd);
 void convert_f32_to_f16(const float* src, u16* dst, i64 n);
 void convert_f16_to_f32(const u16* src, float* dst, i64 n);
+// native quantized weights: 0 = Q4_0, 1 = Q4_1, 2 = Q8_0
+void dequantize_quant(const u16* src, u16* dst, i64 n, int kind);
+// Reusable FP16 scratch bank for materialized quantized weights. The bank is
+// shared across the default stream; a slot may be overwritten once the GEMM
+// that consumed it has been enqueued.
+u16* quant_scratch(int slot, i64 n);
+void free_quant_scratch();
 // Declared near the top so the half-stored backward entry point is visible
 // to every kernel that needs it (MoE, Mamba, dense).
 void moe_backward_half(const float* x, const float* router_w,

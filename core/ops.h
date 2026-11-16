@@ -81,6 +81,16 @@ void split_qkv(Device dev, const float* qkv, float* q, float* k, float* v,
 void linear_forward_fp16(Device dev, const float* x, const u16* w, float* y, int M, int K, int N);
 void convert_f32_to_f16(Device dev, const float* src, u16* dst, i64 n);
 void convert_f16_to_f32(Device dev, const u16* src, float* dst, i64 n);
+
+// ---- native quantized weight storage ----
+// Dequantize a packed Q4_0 / Q4_1 / Q8_0 weight into a reusable FP16 scratch
+// slot and return the device pointer. `kind`: 0=Q4_0, 1=Q4_1, 2=Q8_0.
+// `slot`: scratch slot; distinct slots are needed only for weights that are
+// live at the same time (the 6 MoE matrices). The scratch is freed by
+// quant_scratch_free() (also called from free_workspace()).
+const u16* quant_materialize(Device dev, const void* packed, int kind, i64 n, int slot);
+void       quant_scratch_free();
+
 void register_fp16_weight(const float* master, const u16* half, i64 n);
 void unregister_fp16_weight(const float* master);
 

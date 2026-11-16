@@ -171,7 +171,8 @@ struct Parameter {
 struct LoraAdapter {
     Parameter A;  // [rank, in_dim]
     Parameter B;  // [out_dim, rank]
-    Tensor   r_buf;
+    Tensor   r_buf;    // forward: [M, rank]
+    Tensor   dR_buf;   // backward scratch: [M, rank] (reused, no per-step alloc)
     int   rank = 0;
     int   in_dim = 0;
     int   out_dim = 0;
@@ -315,7 +316,12 @@ struct Activations {
 
 class Model {
 public:
-    explicit Model(ModelConfig cfg, Device dev = Device::CPU, bool fp16_weights = false);
+    // quant_kind: -1 = off, 0 = Q4_0, 1 = Q4_1, 2 = Q8_0. When set, the big
+    // matrices are stored packed on the device and dequantized into FP16
+    // scratch on demand (native quantization). Mutually exclusive with
+    // fp16_weights.
+    explicit Model(ModelConfig cfg, Device dev = Device::CPU, bool fp16_weights = false,
+                   int quant_kind = -1);
     ~Model();
 
     const ModelConfig& config() const { return cfg_; }
@@ -350,6 +356,10 @@ public:
     // The mode is chosen when the model is built (the storage dtype of a
     // parameter cannot change afterwards).
     bool fp16_weight_storage_enabled() const { return weight_f16_; }
+    // Native quantized weight storage: packed Q4/Q8 weights stay resident and
+    // are dequantized into a shared FP16 scratch buffer per op.
+    bool quant_weight_storage_enabled() const { return weight_q4_; }
+    int  quant_kind() const { return q4_kind_; }
     void enable_grad(bool on);
     bool grad_enabled() const { return grad_enabled_; }
     void zero_grad();
@@ -398,7 +408,8 @@ public:
     static MemoryPlan plan_memory(const ModelConfig& cfg, int B, int T,
                                   bool with_grad, int ce_chunks,
                                   bool fp16_weight_cache,
-                                  bool fp16_weights = false);
+                                  bool fp16_weights = false,
+                                  int quant_kind = -1);
     static size_t estimate_activation_bytes_for(const ModelConfig& cfg,
                                                 bool fp16_weight_cache_on,
                                                 int B, int T, bool with_grad,
@@ -498,6 +509,8 @@ private:
     bool        fp16_weight_cache_ = false;
     bool        fp16_weights_dirty_ = false;
     bool        weight_f16_ = false;
+    bool        weight_q4_ = false;
+    int         q4_kind_ = 0;   // 0 = Q4_0, 1 = Q4_1, 2 = Q8_0
     Tensor      rope_inv_freq_;
 
     Parameter                tok_emb_;
