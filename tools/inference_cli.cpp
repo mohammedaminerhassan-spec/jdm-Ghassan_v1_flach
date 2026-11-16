@@ -212,9 +212,6 @@ static int cmd_info(const Args& args) {
         std::cout << "  name        : " << r.get_string("general.name", "(unset)") << "\n";
         std::cout << "  version     : " << r.get_string("general.version", "?") << "\n";
         std::cout << "  author      : " << r.get_string("general.author", "?") << "\n";
-        const std::string base = r.get_string("general.base_model.0.name", "");
-        if (!base.empty())
-            std::cout << "  base model  : " << base << "\n";
         const std::string desc = r.get_string("general.description", "");
         if (!desc.empty())
             std::cout << "  description : " << desc << "\n";
@@ -352,7 +349,6 @@ static int cmd_quantize(const Args& args) {
     meta["model_name"] = args.str("model-name", "Ghassan v1 Flash");
     meta["version"]    = args.str("version", "1.0");
     meta["author"]     = args.str("team", args.str("author", "Ghassan AI"));
-    meta["base_model"] = args.str("base-model", "Ghassan v1 Flash");
 
     const ExportProfileGGUF profile = gguf_profile_for(prof);
     if (have_embedded) {

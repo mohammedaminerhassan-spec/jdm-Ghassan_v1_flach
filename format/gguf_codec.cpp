@@ -1628,14 +1628,10 @@ void export_model_gguf(const std::string& path, Model& model,
     w.add_custom_metadata("general.author", meta_str("author", "Ghassan AI"));
     w.set_description(meta_str("description", "Ghassan v1 Flash - by team Ghassan AI"));
     w.set_general_type("model");
-    {
-        const std::string base = meta_str("base_model", cfg.base_model.empty()
-                                            ? std::string("Ghassan v1 Flash") : cfg.base_model);
-        w.add_custom_metadata("general.base_model.0.name", base);
-        const std::string base_org = meta_str("base_org", cfg.base_org);
-        if (!base_org.empty())
-            w.add_custom_metadata("general.base_model.0.organization", base_org);
-    }
+    // No base_model / base_org field is written at all: the artifact is a
+    // standalone "Ghassan v1 Flash" from team Ghassan AI, like any other
+    // release. The geometry stays in ghassan.* metadata so the engine can
+    // still reload and run it, but no upstream origin is advertised.
     {
         u64 n = static_cast<u64>(model.num_parameters());
         std::string label = n >= 1000000000ull
@@ -1815,7 +1811,7 @@ void export_model_gguf(const std::string& path, Model& model,
     for (const auto& [k, v] : extra_meta) {
         // Already emitted above as dedicated identity fields.
         if (k == "model_name" || k == "version" || k == "author" ||
-            k == "base_model" || k == "base_org" || k == "description") continue;
+            k == "description") continue;
         w.add_custom_metadata(k, v);
     }
 
