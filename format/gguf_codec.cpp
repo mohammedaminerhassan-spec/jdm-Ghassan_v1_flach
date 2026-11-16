@@ -871,6 +871,21 @@ bool GGUFReader::read_tensor_info(std::istream& is, uint64_t count) {
         if (!read_pod(is, type_u32)) return false;
         ti.type = static_cast<GGMLType>(type_u32);
         if (!read_pod(is, ti.offset)) return false;
+        // Fill the byte count (the header declared it but never populated it):
+        // numel = product of dimensions, bytes depend on the GGML dtype.
+        i64 numel = 1;
+        for (uint64_t d : ti.dimensions) numel *= static_cast<i64>(d);
+        size_t type_size = 0, block = 1;
+        switch (ti.type) {
+            case GGMLType::F32: type_size = 4; break;
+            case GGMLType::F16: type_size = 2; break;
+            case GGMLType::Q8_0: type_size = 34; block = 32; break;
+            case GGMLType::Q4_0: type_size = 18; block = 32; break;
+            case GGMLType::Q4_1: type_size = 20; block = 32; break;
+            default: type_size = 0; break;
+        }
+        if (type_size && numel > 0)
+            ti.nbytes = static_cast<uint64_t>((numel + block - 1) / block) * type_size;
         tensor_infos_.push_back(std::move(ti));
     }
     return true;

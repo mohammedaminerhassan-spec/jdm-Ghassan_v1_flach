@@ -17,7 +17,7 @@ public:
           layer_to_cache_(std::move(o.layer_to_cache_)),
           max_len_(o.max_len_), kv_dim_(o.kv_dim_),
           layers_(o.layers_), len_(o.len_),
-          pinned_(o.pinned_), start_(o.start_) {
+          pinned_(o.pinned_), start_(o.start_), fp16_(o.fp16_) {
         o.len_ = 0;
         o.pinned_ = 0;
         o.start_ = 0;
@@ -33,6 +33,7 @@ public:
             len_ = o.len_;
             pinned_ = o.pinned_;
             start_ = o.start_;
+            fp16_ = o.fp16_;
             o.len_ = 0;
             o.pinned_ = 0;
             o.start_ = 0;
