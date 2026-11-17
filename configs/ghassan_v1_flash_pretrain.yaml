@@ -1,0 +1,68 @@
+# Ghassan v1 Flash - the pretraining recipe (from scratch).
+#
+# The ARCHITECTURE comes from a reference checkpoint's config.json:
+#
+#   gai_train --config configs/ghassan_v1_flash_pretrain.yaml \
+#             --config-from /kaggle/working/hf          # the geometry
+#             --tokenizer   /kaggle/working/hf/tokenizer.json
+#
+# --config-from reads the config.json WITHOUT the weights, so the model is
+# the same FUNCTION as the reference (the Granite-4.0-H hybrid: the Mamba-2
+# layers, the attention layers, the MoE, the multipliers, the NoPE positions)
+# with a FRESH set of weights trained on English.
+#
+# The model block below therefore only carries what the reference config
+# does NOT define (the LoRA knobs, which stay off for a pretraining run).
+
+model:
+  lora_rank: 0
+  lora_alpha: 16.0
+  lora_target_q: true
+  lora_target_k: false
+  lora_target_v: true
+  lora_target_o: true
+
+tokenizer:
+  path: /kaggle/working/hf/tokenizer.json
+
+training:
+  data_dir: artifacts/shards
+  # One micro-batch of 512 tokens on a T4 (16 GB): the activation memory
+  # scales with B*T*T and the Granite hybrid keeps a recurrent state per
+  # Mamba layer. The throughput comes from grad_accum, not from the batch.
+  batch_size: 1
+  seq_len: 512
+  grad_accum: 32
+  max_steps: 20000
+  learning_rate: 3.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 500
+  # Lion instead of AdamW: the moments are 4 bytes per parameter instead
+  # of 8, and the hybrid model is too big for AdamW on a 16 GB card.
+  optimizer: lion
+  scheduler: cosine
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.99
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: fp32
+  gemm_fp16: true
+  loss_scale_init: 65536.0
+  loss_scale_max: 0.0
+  loss_scale_window: 2000
+  # The chunked cross-entropy: the [B,T,V] logits are the biggest single
+  # block of the VRAM budget (4 bytes x T x 49152).
+  ce_chunks: 4
+  log_every: 10
+  eval_every: 500
+  eval_batches: 20
+  save_every: 1000
+  checkpoint_dir: artifacts/checkpoints/ghassan_v1_flash
+  resume: auto
+  seed: 42
+  device: auto
+  stage: pretrain
+  resume_mode: exact
+  # The quota of the saved output (the shards + the checkpoints + the export).
+  output_budget_mb: 0

@@ -1,0 +1,75 @@
+# Granite-4.0-H - the LoRA fine-tuning recipe.
+#
+# The architecture AND the weights come from the reference checkpoint:
+#
+#   gai_train --config configs/granite_4_0_h_lora.yaml \
+#             --model /kaggle/working/hf        # the checkpoint (config + weights)
+#             --tokenizer /kaggle/working/hf/tokenizer.json
+#
+# Only the ADAPTER is trained: the base weights are frozen, so the optimizer
+# state is the size of the adapter and not of the model.
+#
+# The memory plan (the T4 has 16 GB):
+#   * the base weights in fp32: the hybrid is ~6.9B parameters -> 27 GB.
+#     That does NOT fit. Use --weight-f16 1 (the half storage mode: 12.9 GB)
+#     for the INFERENCE, and for a TRAINING run use a smaller reference
+#     checkpoint (the H-Tiny tier) or the LoRA recipe with the gradients
+#     only on the adapter.
+#   * the gradient buffers: with the LoRA the base gradients are not needed
+#     at all (the engine skips the frozen parameters).
+#
+# The T4 recipe: B=1, T=512, accum=32.
+
+model:
+  lora_rank: 16
+  lora_alpha: 32.0
+  lora_target_q: true
+  lora_target_k: true
+  lora_target_v: true
+  lora_target_o: true
+  lora_target_gate: false
+  lora_target_up: false
+  lora_target_down: false
+
+tokenizer:
+  path: /kaggle/working/hf/tokenizer.json
+
+training:
+  data_dir: artifacts/shards
+  stage: sft
+  batch_size: 1
+  seq_len: 512
+  grad_accum: 32
+  max_steps: 2000
+  learning_rate: 2.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.0
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: fp32
+  gemm_fp16: true
+  loss_scale_init: 65536.0
+  loss_scale_max: 0.0
+  loss_scale_window: 2000
+  ce_chunks: 4
+  # The embeddings stay frozen in an SFT run: the vocabulary is the one the
+  # reference was trained with.
+  freeze_embeddings: true
+  log_every: 10
+  eval_every: 200
+  eval_batches: 20
+  save_every: 500
+  checkpoint_dir: artifacts/checkpoints/granite_lora
+  resume: auto
+  seed: 42
+  device: auto
+  resume_mode: exact
+  # The SFT run needs the instruction data: the .jsonl files in data_dir are
+  # converted into the .gbin shards (with the assistant-span loss mask) by
+  # the engine itself.
+  allow_no_pretrained: false
