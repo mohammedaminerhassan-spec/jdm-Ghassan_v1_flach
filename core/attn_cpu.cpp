@@ -12,7 +12,7 @@
 // implementation that nothing could ever reach).
 
 #include "core/ops_cpu.h"
-#include "core/ops_cpu_simd.h"
+#include "core/simd_cpu.h"
 
 #include <algorithm>
 #include <cmath>

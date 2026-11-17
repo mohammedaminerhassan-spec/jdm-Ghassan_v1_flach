@@ -1,6 +1,6 @@
 #include "core/ops_cpu.h"
 #include "core/dtype.h"
-#include "core/ops_cpu_simd.h"
+#include "core/simd_cpu.h"
 
 #include <cmath>
 #include <cstdlib>
