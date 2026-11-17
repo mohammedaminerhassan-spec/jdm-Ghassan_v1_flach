@@ -403,11 +403,13 @@ flowchart LR
     --device cuda --weight-q4 0 --gemm-fp16 1
 ```
 
-| Mode | Resident weights | RTX 5060 8 GB | RTX 5060 Ti 16 GB |
-|---|---|---|---|
-| `--weight-f16 1` (default) | 12.93 GiB | ❌ | ✅ |
-| `--weight-q4 0` (Q4_0) | ~4.7 GiB + scratch | ✅ | ✅ |
-| `--weight-q4 2` (Q8_0) | ~6.5 GiB + scratch | ✅ (tight) | ✅ |
+| Mode | Resident weights | Total (T4 plan) | RTX 5060 8 GB | RTX 5060 Ti 16 GB |
+|---|---|---|---|---|
+| `--weight-f16 1` (default) | 12.93 GiB | 13.61 GiB (93%) | ❌ | ✅ |
+| `--weight-q4 0` (Q4_0) | 3.86 GiB | **5.03 GiB (35%)** | ✅ | ✅ |
+| `--weight-q4 2` (Q8_0) | ~6.5 GiB | ~7.6 GiB | ✅ (tight) | ✅ |
+
+> ✅ **Verified on Kaggle T4** (Nov 2026): `--weight-q4 0` loads a 4.37 GiB GGUF, plans **5.03 GiB of 14.56 GiB (35%)**, logs `[prec] native quantized weights: Q4_0 (packed on device)`, and generates coherent, correctly-structured English about mixture-of-experts. Compare the default FP16 plan: **13.61 GiB (93%)**. The 5.03 GiB figure leaves ~2.5 GiB of headroom on an 8 GB RTX 5060.
 
 ### QLoRA fine-tuning (Q4 base + trainable adapters)
 
