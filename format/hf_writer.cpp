@@ -242,8 +242,12 @@ std::vector<ExportTensor> plan_safetensors_export(Model& model, SafeDType dtype)
                     t.shape = {2LL * SH, d};
                     t.dtype = dtype;
                     t.nbytes = static_cast<size_t>(2 * SH * d) * safe_dtype_size(dtype);
-                    const Parameter* pg = p;
-                    const Parameter* pu = other;
+                    // Resolve by NAME, not by table order: if `up` was
+                    // allocated before `gate`, `p` would be up and `other`
+                    // gate, silently swapping the two halves of the packed
+                    // shared-expert weight.
+                    const Parameter* pg = (leaf == "moe_sh_gate") ? p : other;
+                    const Parameter* pu = (leaf == "moe_sh_gate") ? other : p;
                     t.fill = [pg, pu, SH, d, dtype](uint8_t* dst) {
                         std::vector<float> g = host_f32(pg->w);
                         std::vector<float> u = host_f32(pu->w);

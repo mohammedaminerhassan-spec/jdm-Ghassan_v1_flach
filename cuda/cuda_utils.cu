@@ -254,9 +254,20 @@ std::string phase_report() {
     double ms[5] = {};
     for (auto& sl : g_slots) {
         if (!sl.used || sl.ph < 0 || sl.ph > 4) continue;
+        // The GPU stream is asynchronous: the end event may not have been
+        // recorded yet when the trainer prints the report. Query first and
+        // skip pending events instead of aborting on cudaErrorNotReady.
+        cudaError_t q = cudaEventQuery(sl.e);
+        if (q == cudaErrorNotReady) continue;   // still running; report later
+        if (q != cudaSuccess) {
+            cudaGetLastError();                  // clear the sticky error
+            continue;
+        }
         float d = 0.0f;
-        if (cudaEventElapsedTime(&d, sl.s, sl.e) != cudaSuccess)
-            GAI_FAIL("phase_report: cudaEventElapsedTime failed");
+        if (cudaEventElapsedTime(&d, sl.s, sl.e) != cudaSuccess) {
+            cudaGetLastError();
+            continue;
+        }
         ms[sl.ph] += static_cast<double>(d);
         sl.used = false;
     }

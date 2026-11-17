@@ -486,9 +486,10 @@ __global__ void k_dequant_quant(const u16* __restrict__ src, __half* __restrict_
             const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
             v = static_cast<float>(q - 8) * d;
         } else if (kind == 1) {
+            // GGML: low nibble = v[j] (j<16), high = v[j+16] (j>=16).
             const float m = __half2float(*reinterpret_cast<const __half*>(blk + 2));
-            const u8 byte = blk[4 + (j >> 1)];
-            const int q = (j & 1) ? (byte >> 4) : (byte & 0x0F);
+            const u8 byte = blk[4 + (j & 15)];
+            const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
             v = static_cast<float>(q) * d + m;
         } else {
             v = static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[j]) * d;
@@ -542,10 +543,10 @@ __device__ __forceinline__ float q4_val(const u8* blk, int j, int kind) {
         const u8 b = blk[2 + (j & 15)];
         const int q = (j < 16) ? (b & 0x0F) : (b >> 4);
         return static_cast<float>(q - 8) * d;
-    } else if (kind == 1) { // Q4_1: low -> v[2j], high -> v[2j+1]
+    } else if (kind == 1) { // Q4_1: low -> v[j] (j<16), high -> v[j+16]
         const float m = __half2float(*reinterpret_cast<const __half*>(blk + 2));
-        const u8 b = blk[4 + (j >> 1)];
-        const int q = (j & 1) ? (b >> 4) : (b & 0x0F);
+        const u8 b = blk[4 + (j & 15)];
+        const int q = (j < 16) ? (b & 0x0F) : (b >> 4);
         return static_cast<float>(q) * d + m;
     }
     return static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[j]) * d; // Q8_0

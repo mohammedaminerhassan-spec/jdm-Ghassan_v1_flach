@@ -582,7 +582,7 @@ std::vector<i32> Tokenizer::encode(const std::string& text, bool add_bos, bool a
     // a literal "<|im_start|>" in the input becomes the control id. Mirror
     // that semantics exactly: split the input on special strings (longest
     // match wins), BPE the remaining segments.
-    if (special_vec_.empty()) {
+    if (special_vec_.empty() && added_vec_.empty()) {
         if (pretok_ == PreTokKind::Qwen) {
             for (const Chunk& c : pre_tokenize_qwen(text, 1)) bpe_chunk(c.text, out);
         } else if (pretok_ == PreTokKind::Granite) {
@@ -592,8 +592,12 @@ std::vector<i32> Tokenizer::encode(const std::string& text, bool add_bos, bool a
         }
     } else {
         std::vector<std::pair<std::string, i32>> sp;
-        sp.reserve(special_vec_.size());
-        for (i32 id : special_vec_) {
+        // Match BOTH special tokens and non-special added tokens (e.g. <think>,
+        // FIM tags): HuggingFace keeps every added token atomic in plain text.
+        // added_vec_ already includes the special ones, so it is a superset.
+        const std::vector<i32>* match_ids = added_vec_.empty() ? &special_vec_ : &added_vec_;
+        sp.reserve(match_ids->size());
+        for (i32 id : *match_ids) {
             const std::string& s = token_text(id);
             if (!s.empty()) sp.emplace_back(s, id);
         }

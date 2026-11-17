@@ -633,7 +633,11 @@ print_device_report();
                     GAI_CHECK(export_model_safetensors(args.str("export"), model, effective_tok,
                                                         name, name, sd),
                               "the safetensors export failed");
-                    copy_tokenizer_files(tok_path, args.str("export"));
+                    // When weights came from --model <hf-dir> directly, the
+                    // tokenizer lives there even if --tokenizer was not given.
+                    const std::string tok_src = !tok_path.empty() ? tok_path
+                        : (hf ? mdir : std::string());
+                    copy_tokenizer_files(tok_src, args.str("export"));
                 } else {
                     GAI_CHECK(fmt == "gguf", "unknown --export-format '" + fmt +
                                            "' (gguf|safetensors)");

@@ -308,8 +308,8 @@ const u16* quant_materialize(Device dev, const void* packed, int kind, i64 n, in
                 const u8* blk = p + b * 20;
                 const float sc = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
                 const float mn = fp16_to_fp32(*reinterpret_cast<const u16*>(blk + 2));
-                const u8 byte = blk[4 + (j >> 1)];
-                const int q = (j & 1) ? (byte >> 4) : (byte & 0x0F);
+                const u8 byte = blk[4 + (j & 15)];
+                const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
                 v = static_cast<float>(q) * sc + mn;
             } else { // Q8_0
                 const u8* blk = p + b * 34;
@@ -364,8 +364,8 @@ void linear_forward_q4(Device dev, const float* x, const void* w, float* y,
                 } else if (kind == 1) {
                     const float d = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
                     const float mn = fp16_to_fp32(*reinterpret_cast<const u16*>(blk + 2));
-                    const u8 b = blk[4 + ((k & 31) >> 1)];
-                    const int q = ((k & 31) & 1) ? (b >> 4) : (b & 0x0F);
+                    const u8 b = blk[4 + ((k & 31) & 15)];
+                    const int q = ((k & 31) < 16) ? (b & 0x0F) : (b >> 4);
                     v = static_cast<float>(q) * d + mn;
                 } else {
                     const float d = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
@@ -899,6 +899,7 @@ void moe_forward_half(Device dev,
         cpu::moe_forward_half(x, router_w, g0, u0, d0, sg, su, sd,
                               out, probs_cache, idx_cache, w_cache,
                               s_gate, s_up, s_act, N, d, E, ne, K, SH);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
     (void)dev;

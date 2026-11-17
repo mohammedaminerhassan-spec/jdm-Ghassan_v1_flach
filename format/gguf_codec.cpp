@@ -461,9 +461,11 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
 
     if (target == GGMLType::Q4_1) {
 
-        // GGML's block_q4_1: f16 d, f16 m, then 16 bytes of nibbles. Unlike
-        // Q4_0, GGML stores ADJACENT elements: low nibble = 2*j, high nibble
-        // = 2*j+1, value = d*q + m. (quantize.cpp uses the same layout.)
+        // GGML's block_q4_1: f16 d, f16 m, then 16 bytes of nibbles. Like
+        // Q4_0, GGML stores the FIRST half in the low nibbles and the SECOND
+        // half in the high nibbles: low = v[j], high = v[j+16], value = d*q+m.
+        // (llama.cpp quantize_row_q4_1_ref: qs[j] = xi0 | (xi1 << 4) where
+        // xi0 = x[j], xi1 = x[j+16].) quantize.cpp uses the same layout.
         size_t nblocks = (n + 31) / 32;
         std::vector<uint8_t> out(nblocks * 20);
         for (size_t b = 0; b < nblocks; ++b) {
@@ -493,10 +495,9 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
             std::memcpy(block, &sh_d, 2);
             std::memcpy(block + 2, &sh_m, 2);
             for (int j = 0; j < 16; ++j) {
-                const size_t i0 = static_cast<size_t>(2 * j);
-                const size_t i1 = i0 + 1;
-                const float f0 = (start + i0 < end) ? src[start + i0] : mn;
-                const float f1 = (start + i1 < end) ? src[start + i1] : mn;
+                // GGML: low nibble = v[j], high nibble = v[j+16].
+                const float f0 = (start + j      < end) ? src[start + j]      : mn;
+                const float f1 = (start + j + 16 < end) ? src[start + j + 16] : mn;
                 const int xi0 = std::max(0, std::min(15, static_cast<int>(std::lround((f0 - mn) * inv))));
                 const int xi1 = std::max(0, std::min(15, static_cast<int>(std::lround((f1 - mn) * inv))));
                 block[4 + j] = static_cast<uint8_t>((xi1 << 4) | xi0);
@@ -1377,8 +1378,9 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
             const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
             const float m = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block + 2));
             for (int j = 0; j < 16; ++j) {
-                const size_t i0 = b * 32 + static_cast<size_t>(2 * j);
-                const size_t i1 = i0 + 1;
+                // GGML: low nibble = v[j], high nibble = v[j+16].
+                const size_t i0 = b * 32 + static_cast<size_t>(j);
+                const size_t i1 = i0 + 16;
                 const uint8_t byte = block[4 + j];
                 if (i0 < nelems) { dst[i0] = d * static_cast<float>(byte & 0x0F) + m; acc(dst[i0]); }
                 if (i1 < nelems) { dst[i1] = d * static_cast<float>(byte >> 4) + m; acc(dst[i1]); }

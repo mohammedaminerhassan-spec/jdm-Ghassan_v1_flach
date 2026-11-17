@@ -1917,7 +1917,9 @@ void Trainer::sync_moe_bias(bool opt_step_applied) {
         device_copy(acc.data(), Device::CPU, acc_dev.data_ptr(), Device::CUDA,
                     n * sizeof(float));
     } else if (dist_ && dist_->world_size() > 1 && !acc.empty()) {
-
+        // CPU DDP (or no device buffer): all-reduce the host-side accumulator
+        // so every rank steers the MoE bias with the same global counts.
+        dist_->all_reduce_sum(acc.data(), acc.size());
     }
     if (!dist_ || dist_->world_size() <= 1) {
         if (acc_dev.defined() && acc.empty()) {
@@ -1952,7 +1954,10 @@ bool Trainer::sync_eval_best(bool is_main, bool is_best) {
     }
     broadcast_from_main(payload, 2, static_cast<int>(sizeof(i64)));
     const bool agreed_is_best = payload[0] != 0;
-    if (is_main) {
+    // The main rank already holds best_val; the NON-main ranks must adopt the
+    // value broadcast from main (otherwise they keep their initial 1e30 and
+    // the checkpoints disagree across DDP ranks).
+    if (!is_main) {
         double bv = 0.0;
         std::memcpy(&bv, &payload[1], sizeof(double));
         state_.best_val = bv;

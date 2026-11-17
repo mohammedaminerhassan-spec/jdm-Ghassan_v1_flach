@@ -195,8 +195,9 @@ void quantize_q4_1(const float* src, void* dst, i64 n) {
         out[b].scale = fp32_to_fp16(scale);
         out[b].min   = fp32_to_fp16(mn);
         for (int i = 0; i < Q4_BLOCK / 2; ++i) {
-            int q0 = std::clamp(static_cast<int>(std::lround((x[2 * i]     - mn) * inv)), 0, 15);
-            int q1 = std::clamp(static_cast<int>(std::lround((x[2 * i + 1] - mn) * inv)), 0, 15);
+            // GGML: low nibble = v[i], high nibble = v[i+16] (NOT adjacent).
+            int q0 = std::clamp(static_cast<int>(std::lround((x[i]        - mn) * inv)), 0, 15);
+            int q1 = std::clamp(static_cast<int>(std::lround((x[i + 16]   - mn) * inv)), 0, 15);
             out[b].q[i] = static_cast<u8>((q1 << 4) | q0);
         }
     }
@@ -221,7 +222,7 @@ void quantize_q4_1(const float* src, void* dst, i64 n) {
         out[full].min   = fp32_to_fp16(mn);
         const int qz = std::clamp(static_cast<int>(std::lround((0.0f - mn) * inv)), 0, 15);
         for (int i = 0; i < Q4_BLOCK / 2; ++i) {
-            const i64 i0 = static_cast<i64>(2 * i), i1 = i0 + 1;
+            const i64 i0 = static_cast<i64>(i), i1 = i0 + Q4_BLOCK / 2;
             int q0 = (i0 < rem ? std::clamp(static_cast<int>(std::lround((x[i0] - mn) * inv)), 0, 15) : qz);
             int q1 = (i1 < rem ? std::clamp(static_cast<int>(std::lround((x[i1] - mn) * inv)), 0, 15) : qz);
             out[full].q[i] = static_cast<u8>((q1 << 4) | q0);
@@ -239,8 +240,8 @@ void dequantize_q4_1(const void* src, float* dst, i64 n) {
         float* o = dst + b * Q4_BLOCK;
         for (int i = 0; i < Q4_BLOCK / 2; ++i) {
             u8 byte = in[b].q[i];
-            o[2 * i]     = static_cast<float>(byte & 0x0F) * s + m;
-            o[2 * i + 1] = static_cast<float>(byte >> 4)   * s + m;
+            o[i]         = static_cast<float>(byte & 0x0F) * s + m;
+            o[i + Q4_BLOCK / 2] = static_cast<float>(byte >> 4) * s + m;
         }
     }
     const i64 rem = n % Q4_BLOCK;
@@ -250,8 +251,8 @@ void dequantize_q4_1(const void* src, float* dst, i64 n) {
         float m = fp16_to_fp32(in[full].min);
         for (int i = 0; i < Q4_BLOCK / 2; ++i) {
             u8 byte = in[full].q[i];
-            tmp[2 * i]     = static_cast<float>(byte & 0x0F) * s + m;
-            tmp[2 * i + 1] = static_cast<float>(byte >> 4)   * s + m;
+            tmp[i]         = static_cast<float>(byte & 0x0F) * s + m;
+            tmp[i + Q4_BLOCK / 2] = static_cast<float>(byte >> 4) * s + m;
         }
         for (i64 i = 0; i < rem; ++i) dst[full * Q4_BLOCK + i] = tmp[i];
     }

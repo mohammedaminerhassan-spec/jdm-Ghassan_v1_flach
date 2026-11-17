@@ -175,11 +175,9 @@ bool is_unicode_letter(u32 cp) {
         {0xFB13, 0xFB17}, {0xFF21, 0xFF3A}, {0xFF41, 0xFF5A}, {0xFF66, 0xFFDC},
         {0x10000, 0x1000B}, {0x1D400, 0x1D7CB}, {0x20000, 0x2A6DF},
     };
-    for (const auto& r : ranges) {
-        if (cp >= r[0] && cp <= r[1]) return true;
-    }
-
-    // Explicit non-letters inside the blocks above.
+    // Explicit non-letters inside the blocks above. Check these BEFORE the
+    // ranges: otherwise a codepoint inside a range returns true early and
+    // these exclusions are unreachable dead code.
     static const u32 not_letter[] = {
         0x00B7, 0x0387, 0x0559, 0x058A, 0x05BE, 0x05C0, 0x05C3, 0x05C6, 0x05F3,
         0x05F4, 0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605, 0x0606, 0x0607,
@@ -193,6 +191,9 @@ bool is_unicode_letter(u32 cp) {
         0x301B, 0x301C, 0x301D, 0x301E, 0x301F, 0x3020, 0x3030, 0xFEFF,
     };
     for (u32 e : not_letter) if (cp == e) return false;
+    for (const auto& r : ranges) {
+        if (cp >= r[0] && cp <= r[1]) return true;
+    }
     return false;
 }
 

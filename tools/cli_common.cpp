@@ -99,13 +99,21 @@ int Args::num_int(const std::string& k, int def) const {
 }
 
 u64 Args::num_u64(const std::string& k, u64 def) const {
-    if (!has(k)) return def;
-    const i64 v = num(k, 0);
-    if (v < 0) {
+    auto it = kv_.find(k);
+    if (it == kv_.end()) return def;
+    // Parse as UNSIGNED: stoll() rejects values above INT64_MAX (large seeds,
+    // fingerprints) and silently falls back to the default.
+    try {
+        size_t pos = 0;
+        const unsigned long long v = std::stoull(it->second, &pos, 0);
+        if (pos != it->second.size()) {
+            log_warn("args: trailing characters in '--" + k + "', using parsed value");
+        }
+        return static_cast<u64>(v);
+    } catch (const std::exception&) {
         log_warn("args: ignoring out-of-range integer for '--" + k + "'");
         return def;
     }
-    return static_cast<u64>(v);
 }
 
 double Args::real(const std::string& k, double def) const {
