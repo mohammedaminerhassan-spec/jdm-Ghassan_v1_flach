@@ -594,16 +594,25 @@ void mamba2_forward_half(Device dev,
                     float* state,
                     float* out,
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
-                    int d_head, int d_state, int k, float eps) {
+                    int d_head, int d_state, int k, float eps, int qkind) {
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
         cuda_ops::mamba2_forward_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
                                       norm_w, w_out, state, out,
                                       B, T, d, d_inner, conv_dim, n_heads,
-                                      d_head, d_state, k, eps);
+                                      d_head, d_state, k, eps, qkind);
         return;
     }
 #endif
+    if (qkind >= 0) {
+        const int proj = d_inner + conv_dim + n_heads;
+        const u16* wi = quant_materialize(dev, w_in, qkind, (i64)proj * d, 0);
+        const u16* wo = quant_materialize(dev, w_out, qkind, (i64)d * d_inner, 1);
+        cpu::mamba2_forward_half(x, wi, conv_w, conv_b, dt_bias, a_log, D, norm_w, wo,
+                                 state, out, B, T, d, d_inner, conv_dim, n_heads,
+                                 d_head, d_state, k, eps);
+        return;
+    }
     (void)dev;
     cpu::mamba2_forward_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
                              state, out, B, T, d, d_inner, conv_dim, n_heads,
@@ -639,17 +648,17 @@ void mamba2_step_half(Device dev,
                  const float* norm_w, const u16* w_out,
                  float* conv_state, float* ssm_state, float* out,
                  int d, int d_inner, int conv_dim, int n_heads,
-                 int d_head, int d_state, int k, float eps) {
+                 int d_head, int d_state, int k, float eps, int qkind) {
 #ifdef GAI_CUDA
     GAI_CHECK(dev == Device::CUDA, "mamba2_step_half is a CUDA-only decode kernel");
     cuda_ops::mamba2_step_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
                                conv_state, ssm_state, out, d, d_inner, conv_dim, n_heads,
-                               d_head, d_state, k, eps);
+                               d_head, d_state, k, eps, qkind);
 #else
     (void)x; (void)w_in; (void)conv_w; (void)conv_b; (void)dt_bias; (void)a_log;
     (void)D; (void)norm_w; (void)w_out; (void)conv_state; (void)ssm_state; (void)out;
     (void)d; (void)d_inner; (void)conv_dim; (void)n_heads; (void)d_head;
-    (void)d_state; (void)k; (void)eps; (void)dev;
+    (void)d_state; (void)k; (void)eps; (void)dev; (void)qkind;
     GAI_FAIL("mamba2_step_half: CUDA support not compiled in");
 #endif
 }
@@ -868,17 +877,30 @@ void moe_forward_half(Device dev,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K, int SH) {
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind) {
     Timer t;
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
         cuda_ops::moe_forward_half(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
                                    out, probs_cache, idx_cache, w_cache,
-                                   s_gate, s_up, s_act, N, d, E, ne, K, SH);
+                                   s_gate, s_up, s_act, N, d, E, ne, K, SH, qkind);
         perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
 #endif
+    // CPU: never see packed weights — materialize first, then the fp16 path.
+    if (qkind >= 0) {
+        const u16* g0 = quant_materialize(dev, gates, qkind, (i64)ne * E * d, 0);
+        const u16* u0 = quant_materialize(dev, ups,   qkind, (i64)ne * E * d, 1);
+        const u16* d0 = quant_materialize(dev, downs, qkind, (i64)ne * E * d, 2);
+        const u16* sg = sh_g ? quant_materialize(dev, sh_g, qkind, (i64)SH * d, 3) : nullptr;
+        const u16* su = sh_u ? quant_materialize(dev, sh_u, qkind, (i64)SH * d, 4) : nullptr;
+        const u16* sd = sh_d ? quant_materialize(dev, sh_d, qkind, (i64)d * SH, 5) : nullptr;
+        cpu::moe_forward_half(x, router_w, g0, u0, d0, sg, su, sd,
+                              out, probs_cache, idx_cache, w_cache,
+                              s_gate, s_up, s_act, N, d, E, ne, K, SH);
+        return;
+    }
     (void)dev;
     cpu::moe_forward_half(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
                           out, probs_cache, idx_cache, w_cache,
@@ -893,12 +915,12 @@ void moe_forward_bias_half(Device dev,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K, int SH) {
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind) {
     if (!router_bias) {
         // No routing bias: the plain (bias-free) MoE, in half precision.
         moe_forward_half(dev, x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
                          probs_cache, idx_cache, w_cache, s_gate, s_up, s_act,
-                         N, d, E, ne, K, SH);
+                         N, d, E, ne, K, SH, qkind);
         return;
     }
     Timer t;
@@ -907,11 +929,24 @@ void moe_forward_bias_half(Device dev,
         cuda_ops::moe_forward_bias_half(x, router_w, router_bias, gates, ups, downs,
                                         sh_g, sh_u, sh_d,
                                         out, probs_cache, idx_cache, w_cache,
-                                        s_gate, s_up, s_act, N, d, E, ne, K, SH);
+                                        s_gate, s_up, s_act, N, d, E, ne, K, SH, qkind);
         perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
 #endif
+    // CPU: materialize packed weights into scratch, then the fp16 path.
+    if (qkind >= 0) {
+        const u16* g0 = quant_materialize(dev, gates, qkind, (i64)ne * E * d, 0);
+        const u16* u0 = quant_materialize(dev, ups,   qkind, (i64)ne * E * d, 1);
+        const u16* d0 = quant_materialize(dev, downs, qkind, (i64)ne * E * d, 2);
+        const u16* sg = sh_g ? quant_materialize(dev, sh_g, qkind, (i64)SH * d, 3) : nullptr;
+        const u16* su = sh_u ? quant_materialize(dev, sh_u, qkind, (i64)SH * d, 4) : nullptr;
+        const u16* sd = sh_d ? quant_materialize(dev, sh_d, qkind, (i64)d * SH, 5) : nullptr;
+        cpu::moe_forward_bias_half(x, router_w, router_bias, g0, u0, d0, sg, su, sd,
+                                   out, probs_cache, idx_cache, w_cache,
+                                   s_gate, s_up, s_act, N, d, E, ne, K, SH);
+        return;
+    }
     (void)dev;
     cpu::moe_forward_bias_half(x, router_w, router_bias, gates, ups, downs,
                                sh_g, sh_u, sh_d,

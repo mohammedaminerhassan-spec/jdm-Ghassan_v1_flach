@@ -254,7 +254,14 @@ __global__ void k_mamba_gated_norm(const float* __restrict__ y,
 // for the reference path, half for the fp16 storage mode (the tensor cores
 // multiply, the accumulator stays fp32).
 template <typename W>
-static inline void mamba_linear(const float* x, const W* w, float* y, int M, int K, int N) {
+static inline void mamba_linear(const float* x, const W* w, float* y, int M, int K, int N,
+                                int qkind = -1) {
+    if (qkind >= 0) {
+        // The weight is a PACKED Q4/Q8 matrix [N, K]: read the blocks directly
+        // into the GEMM (no FP16 scratch). w is reinterpreted as a byte pointer.
+        linear_forward_q4(x, reinterpret_cast<const u16*>(w), y, M, K, N, qkind);
+        return;
+    }
     if constexpr (std::is_same<W, u16>::value) {
         linear_forward_fp16(x, w, y, M, K, N);
     } else {
@@ -285,7 +292,7 @@ static void mamba2_forward_impl(const float* x,          // [B, T, d]
                     float* state,            // [B, n_heads, d_head, d_state]
                     float* out,              // [B, T, d]
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
-                    int d_head, int d_state, int k, float eps) {
+                    int d_head, int d_state, int k, float eps, int qkind = -1) {
     if (B <= 0 || T <= 0) return;
     const int proj_size = d_inner + conv_dim + n_heads;
     const size_t n_tok = size_t(B) * T;
@@ -298,7 +305,7 @@ static void mamba2_forward_impl(const float* x,          // [B, T, d]
     float* y    = bc   + n_tok * size_t(conv_dim);
 
     // 1) in_proj
-    mamba_linear(x, w_in, proj, B * T, d, proj_size);
+    mamba_linear(x, w_in, proj, B * T, d, proj_size, qkind);
 
     // 2) causal depthwise conv1d + SiLU over the bc part
     {
@@ -328,7 +335,7 @@ static void mamba2_forward_impl(const float* x,          // [B, T, d]
                                              y, B * T, d_inner, proj_size, eps);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
-    mamba_linear(y, w_out, out, B * T, d_inner, d);
+    mamba_linear(y, w_out, out, B * T, d_inner, d, qkind);
 }
 
 void mamba2_forward(const float* x,          // [B, T, d]
@@ -362,11 +369,11 @@ void mamba2_forward_half(const float* x,          // [B, T, d]
                     float* state,            // [B, n_heads, d_head, d_state]
                     float* out,              // [B, T, d]
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
-                    int d_head, int d_state, int k, float eps) {
+                    int d_head, int d_state, int k, float eps, int qkind) {
     mamba2_forward_impl<u16>(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
                              norm_w, w_out, state, out,
                              B, T, d, d_inner, conv_dim, n_heads,
-                             d_head, d_state, k, eps);
+                             d_head, d_state, k, eps, qkind);
 }
 
 // ---------------------------------------------------------------- backward kernels
@@ -974,7 +981,7 @@ static void mamba_step_impl(const float* x,
                             float* conv_state, float* ssm_state,
                             float* out,
                             int d, int d_inner, int conv_dim, int n_heads,
-                            int d_head, int d_state, int k, float eps) {
+                            int d_head, int d_state, int k, float eps, int qkind = -1) {
     const int proj_size = d_inner + conv_dim + n_heads;
     float* ws = mamba_workspace((size_t)proj_size + (size_t)conv_dim +
                                 (size_t)d_inner * 2 + 64);
@@ -983,7 +990,7 @@ static void mamba_step_impl(const float* x,
     float* y = bc + conv_dim;
     float* normed = y + d_inner;
 
-    mamba_linear(x, w_in, proj, 1, d, proj_size);
+    mamba_linear(x, w_in, proj, 1, d, proj_size, qkind);
 
     {
         const int n = conv_dim;
@@ -1005,7 +1012,7 @@ static void mamba_step_impl(const float* x,
                                                           d_inner, eps);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
-    mamba_linear(normed, w_out, out, 1, d_inner, d);
+    mamba_linear(normed, w_out, out, 1, d_inner, d, qkind);
 }
 
 void mamba2_step(const float* x,
@@ -1026,10 +1033,10 @@ void mamba2_step_half(const float* x,
                  const float* norm_w, const u16* w_out,
                  float* conv_state, float* ssm_state, float* out,
                  int d, int d_inner, int conv_dim, int n_heads,
-                 int d_head, int d_state, int k, float eps) {
+                 int d_head, int d_state, int k, float eps, int qkind) {
     mamba_step_impl<u16>(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
                          conv_state, ssm_state, out, d, d_inner, conv_dim, n_heads,
-                         d_head, d_state, k, eps);
+                         d_head, d_state, k, eps, qkind);
 }
 
 void mamba2_backward_half(const float* x,

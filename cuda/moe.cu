@@ -17,8 +17,27 @@ namespace cuda_ops {
 // reference path, half for the fp16 storage mode: the tensor cores do the
 // multiply and the accumulator stays fp32, so the half path is as accurate
 // as the storage allows (the activations are fp32 either way).
+// Byte offset into a packed/typed weight stream for an expert (or any row
+// set) starting at element `elems`. For fp16/fp32 that's elems elements;
+// for packed Q4/Q8 it's (elems/32) blocks (elems is always a multiple of 32
+// for expert matrices).
 template <typename W>
-static inline void moe_linear(const float* x, const W* w, float* y, int M, int K, int N) {
+static inline const W* expert_offset(const W* base, i64 elems, int qkind) {
+    if (qkind < 0) return base + elems;
+    const int bpb = (qkind == 0) ? 9 : (qkind == 1) ? 10 : 17; // u16 per 32-val block
+    return reinterpret_cast<const W*>(reinterpret_cast<const u16*>(base) +
+                                      (elems / 32) * bpb);
+}
+
+template <typename W>
+static inline void moe_linear(const float* x, const W* w, float* y, int M, int K, int N,
+                              int qkind = -1) {
+    if (qkind >= 0) {
+        // The weight is a PACKED Q4/Q8 matrix [N, K]: read the blocks directly
+        // into the GEMM (no FP16 scratch). w is reinterpreted as a byte pointer.
+        linear_forward_q4(x, reinterpret_cast<const u16*>(w), y, M, K, N, qkind);
+        return;
+    }
     if constexpr (std::is_same<W, u16>::value) {
         linear_forward_fp16(x, w, y, M, K, N);
     } else {
@@ -733,7 +752,7 @@ static void moe_forward_impl(const float* x, const float* router_w,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                  i64 N, int d, int E, int ne, int K, int SH) {
+                  i64 N, int d, int E, int ne, int K, int SH, int qkind = -1) {
     if (N <= 0) return;
 
     GAI_CHECK(N <= 2147483647LL, "moe forward: N exceeds INT_MAX (B*T too large)");
@@ -774,11 +793,11 @@ static void moe_forward_impl(const float* x, const float* router_w,
     moe_build_groups_launch(idx_use, N, K, ne, &grouped);
 
     if (sh_g && sh_u && sh_d) {
-        moe_linear(x, sh_g, Sg, (int)N, d, SH);
-        moe_linear(x, sh_u, Su, (int)N, d, SH);
+        moe_linear(x, sh_g, Sg, (int)N, d, SH, qkind);
+        moe_linear(x, sh_u, Su, (int)N, d, SH, qkind);
         k_swiglu<<<grid_for(N * SH, 256), 256>>>(Sg, Su, Sa, N * SH);
         CU_CHECK(cudaGetLastError());
-        moe_linear(Sa, sh_d, out, (int)N, SH, d);
+        moe_linear(Sa, sh_d, out, (int)N, SH, d, qkind);
     } else {
         CU_CHECK(cudaMemset(out, 0, sizeof(float) * (size_t)N * d));
     }
@@ -791,10 +810,10 @@ static void moe_forward_impl(const float* x, const float* router_w,
     for (int e = 0; e < ne; ++e) {
         i64 ns = (i64)h_cnt[e];
         if (ns == 0) continue;
-        const W* ge = gates + (size_t)e * E * d;
-        const W* ue = ups   + (size_t)e * E * d;
-        moe_linear(Xblk + (size_t)h_off[e] * d, ge, Gblk + (size_t)h_off[e] * E, (int)ns, d, E);
-        moe_linear(Xblk + (size_t)h_off[e] * d, ue, Ublk + (size_t)h_off[e] * E, (int)ns, d, E);
+        const W* ge = expert_offset(gates, (i64)e * E * d, qkind);
+        const W* ue = expert_offset(ups,   (i64)e * E * d, qkind);
+        moe_linear(Xblk + (size_t)h_off[e] * d, ge, Gblk + (size_t)h_off[e] * E, (int)ns, d, E, qkind);
+        moe_linear(Xblk + (size_t)h_off[e] * d, ue, Ublk + (size_t)h_off[e] * E, (int)ns, d, E, qkind);
     }
     k_swiglu<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Ablk, NK * E);
     CU_CHECK(cudaGetLastError());
@@ -803,8 +822,8 @@ static void moe_forward_impl(const float* x, const float* router_w,
     for (int e = 0; e < ne; ++e) {
         i64 ns = (i64)h_cnt[e];
         if (ns == 0) continue;
-        const W* de = downs + (size_t)e * d * E;
-        moe_linear(Ablk + (size_t)h_off[e] * E, de, Xblk + (size_t)h_off[e] * d, (int)ns, E, d);
+        const W* de = expert_offset(downs, (i64)e * d * E, qkind);
+        moe_linear(Ablk + (size_t)h_off[e] * E, de, Xblk + (size_t)h_off[e] * d, (int)ns, E, d, qkind);
     }
     k_scatter_add_all<<<grid_for(NK, 256), 256>>>(out, Xblk, grouped, w_use, NK, d, K);
     CU_CHECK(cudaGetLastError());
@@ -817,7 +836,7 @@ static void moe_forward_bias_impl(const float* x, const float* router_w, const f
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K, int SH) {
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind = -1) {
     if (N <= 0) return;
     if (!router_bias) {
         moe_forward_impl<W>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
@@ -865,11 +884,11 @@ static void moe_forward_bias_impl(const float* x, const float* router_w, const f
 
     if (sh_g && sh_u && sh_d) {
         // The shared expert has its own width (SH), not the routed width E.
-        moe_linear(x, sh_g, Sg, (int)N, d, SH);
-        moe_linear(x, sh_u, Su, (int)N, d, SH);
+        moe_linear(x, sh_g, Sg, (int)N, d, SH, qkind);
+        moe_linear(x, sh_u, Su, (int)N, d, SH, qkind);
         k_swiglu<<<grid_for(N * SH, 256), 256>>>(Sg, Su, Sa, N * SH);
         CU_CHECK(cudaGetLastError());
-        moe_linear(Sa, sh_d, out, (int)N, SH, d);
+        moe_linear(Sa, sh_d, out, (int)N, SH, d, qkind);
     } else {
         CU_CHECK(cudaMemset(out, 0, sizeof(float) * (size_t)N * d));
     }
@@ -882,10 +901,10 @@ static void moe_forward_bias_impl(const float* x, const float* router_w, const f
     for (int e = 0; e < ne; ++e) {
         i64 ns = (i64)h_cnt[e];
         if (ns == 0) continue;
-        const W* ge = gates + (size_t)e * E * d;
-        const W* ue = ups   + (size_t)e * E * d;
-        moe_linear(Xblk + (size_t)h_off[e] * d, ge, Gblk + (size_t)h_off[e] * E, (int)ns, d, E);
-        moe_linear(Xblk + (size_t)h_off[e] * d, ue, Ublk + (size_t)h_off[e] * E, (int)ns, d, E);
+        const W* ge = expert_offset(gates, (i64)e * E * d, qkind);
+        const W* ue = expert_offset(ups,   (i64)e * E * d, qkind);
+        moe_linear(Xblk + (size_t)h_off[e] * d, ge, Gblk + (size_t)h_off[e] * E, (int)ns, d, E, qkind);
+        moe_linear(Xblk + (size_t)h_off[e] * d, ue, Ublk + (size_t)h_off[e] * E, (int)ns, d, E, qkind);
     }
     k_swiglu<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Ablk, NK * E);
     CU_CHECK(cudaGetLastError());
@@ -894,8 +913,8 @@ static void moe_forward_bias_impl(const float* x, const float* router_w, const f
     for (int e = 0; e < ne; ++e) {
         i64 ns = (i64)h_cnt[e];
         if (ns == 0) continue;
-        const W* de = downs + (size_t)e * d * E;
-        moe_linear(Ablk + (size_t)h_off[e] * E, de, Xblk + (size_t)h_off[e] * d, (int)ns, E, d);
+        const W* de = expert_offset(downs, (i64)e * d * E, qkind);
+        moe_linear(Ablk + (size_t)h_off[e] * E, de, Xblk + (size_t)h_off[e] * d, (int)ns, E, d, qkind);
     }
     k_scatter_add_all<<<grid_for(NK, 256), 256>>>(out, Xblk, grouped, w_use, NK, d, K);
     CU_CHECK(cudaGetLastError());
@@ -908,7 +927,7 @@ void moe_forward(const float* x, const float* router_w,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                 i64 N, int d, int E, int ne, int K, int SH) {
+                  i64 N, int d, int E, int ne, int K, int SH) {
     moe_forward_impl<float>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
                             probs_cache, idx_cache, w_cache, s_gate, s_up, s_act,
                             N, d, E, ne, K, SH);
@@ -920,10 +939,10 @@ void moe_forward_half(const float* x, const float* router_w,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                 i64 N, int d, int E, int ne, int K, int SH) {
+                  i64 N, int d, int E, int ne, int K, int SH, int qkind = -1) {
     moe_forward_impl<u16>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
                           probs_cache, idx_cache, w_cache, s_gate, s_up, s_act,
-                          N, d, E, ne, K, SH);
+                          N, d, E, ne, K, SH, qkind);
 }
 
 void moe_forward_bias(const float* x, const float* router_w, const float* router_bias,
@@ -945,11 +964,11 @@ void moe_forward_bias_half(const float* x, const float* router_w, const float* r
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K, int SH) {
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind = -1) {
     moe_forward_bias_impl<u16>(x, router_w, router_bias, gates, ups, downs,
                                sh_g, sh_u, sh_d, out,
                                probs_cache, idx_cache, w_cache,
-                               s_gate, s_up, s_act, N, d, E, ne, K, SH);
+                               s_gate, s_up, s_act, N, d, E, ne, K, SH, qkind);
 }
 
 template <typename W>

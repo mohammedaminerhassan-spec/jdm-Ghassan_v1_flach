@@ -890,20 +890,22 @@ void Model::forward_mamba_layer(Device dev, int l, Activations& act, i64 N) {
     }
 
     if (is_half_or_quant(L.mamba_in_proj.w)) {
+        const WeightRef wi = weight_ref(dev, L.mamba_in_proj.w, 0);
+        const WeightRef wo = weight_ref(dev, L.mamba_out_proj.w, 1);
         ops::mamba2_forward_half(dev,
                                  act.xb.f32(),
-                                 weight16(dev, L.mamba_in_proj.w, 0),
+                                 wi.ptr,
                                  L.mamba_conv_w.w.f32(),
                                  L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32() : nullptr,
                                  L.mamba_dt_bias.w.f32(),
                                  L.mamba_A_log.w.f32(),
                                  L.mamba_D.w.f32(),
                                  L.mamba_norm.w.f32(),
-                                 weight16(dev, L.mamba_out_proj.w, 1),
+                                 wo.ptr,
                                  st.f32(),
                                  act.proj.f32(),
                                  B, T, d, d_inner, conv_dim, n_heads, d_head, d_state,
-                                 cfg_.mamba_d_conv, cfg_.rms_eps);
+                                 cfg_.mamba_d_conv, cfg_.rms_eps, wi.qkind);
     } else {
     ops::mamba2_forward(dev,
                         act.xb.f32(),
@@ -2407,16 +2409,17 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             const float* bias = (cfg_.moe_aux_free && !moe_bias_.empty())
                 ? moe_bias_ptr(l) : nullptr;
             if (is_half_or_quant(L.moe_gate.w)) {
+                const WeightRef mg = weight_ref(dev, L.moe_gate.w, 0);
+                const WeightRef mu = weight_ref(dev, L.moe_up.w, 1);
+                const WeightRef md = weight_ref(dev, L.moe_down.w, 2);
+                const WeightRef msg = L.sh_gate.w.defined() ? weight_ref(dev, L.sh_gate.w, 3) : WeightRef{};
+                const WeightRef msu = L.sh_up.w.defined()   ? weight_ref(dev, L.sh_up.w, 4)   : WeightRef{};
+                const WeightRef msd = L.sh_down.w.defined() ? weight_ref(dev, L.sh_down.w, 5) : WeightRef{};
                 ops::moe_forward_bias_half(dev, act.xb2.f32(), L.router.w.f32(), bias,
-                                           weight16(dev, L.moe_gate.w, 0),
-                                           weight16(dev, L.moe_up.w, 1),
-                                           weight16(dev, L.moe_down.w, 2),
-                                           L.sh_gate.w.defined() ? weight16(dev, L.sh_gate.w, 3) : nullptr,
-                                           L.sh_up.w.defined()   ? weight16(dev, L.sh_up.w, 4)   : nullptr,
-                                           L.sh_down.w.defined() ? weight16(dev, L.sh_down.w, 5) : nullptr,
+                                           mg.ptr, mu.ptr, md.ptr, msg.ptr, msu.ptr, msd.ptr,
                                            act.ffn_out.f32(), probs, ridx, rw,
                                            act.moe_gate.f32(), act.moe_up.f32(), act.moe_act.f32(),
-                                           N, d, E, ne, K, cfg_.shared_width());
+                                           N, d, E, ne, K, cfg_.shared_width(), mg.qkind);
             } else {
                 ops::moe_forward_bias(dev, act.xb2.f32(), L.router.w.f32(), bias,
                                       L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),

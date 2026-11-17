@@ -119,14 +119,14 @@ void moe_forward_half(const float* x, const float* router_w,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K, int SH);
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind = -1);
 void moe_forward_bias_half(const float* x, const float* router_w, const float* router_bias,
                       const u16* gates, const u16* ups, const u16* downs,
                       const u16* sh_g, const u16* sh_u, const u16* sh_d,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K, int SH);
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind = -1);
 
 // IBM Granite-4.0: one Mamba-2 layer over a whole sequence.
 //   x      [B, T, d]        the layer input
@@ -168,7 +168,7 @@ void mamba2_forward_half(const float* x,
                     float* state,
                     float* out,
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
-                    int d_head, int d_state, int k, float eps);
+                    int d_head, int d_state, int k, float eps, int qkind = -1);
 
 // Single-token decode: conv window + SSM state are carried on the device,
 // so no host<->device sync is needed per Mamba layer per token.
@@ -185,7 +185,7 @@ void mamba2_step_half(const float* x,
                  const float* norm_w, const u16* w_out,
                  float* conv_state, float* ssm_state, float* out,
                  int d, int d_inner, int conv_dim, int n_heads,
-                 int d_head, int d_state, int k, float eps);
+                 int d_head, int d_state, int k, float eps, int qkind = -1);
 
 void mamba2_backward_half(const float* x,
                      const u16* w_in,

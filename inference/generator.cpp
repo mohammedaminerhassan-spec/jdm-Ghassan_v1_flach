@@ -268,17 +268,18 @@ float* Generator::decode_step_logits(i32 token, int position) {
             if (L.has_moe()) {
                 const float* bias = model_.moe_bias_ptr(l);
                 if (is_half_or_quant(L.moe_gate.w)) {
+                    const WeightRef mg = weight_ref(dev, L.moe_gate.w, 0);
+                    const WeightRef mu = weight_ref(dev, L.moe_up.w, 1);
+                    const WeightRef md = weight_ref(dev, L.moe_down.w, 2);
+                    const WeightRef msg = L.sh_gate.w.defined() ? weight_ref(dev, L.sh_gate.w, 3) : WeightRef{};
+                    const WeightRef msu = L.sh_up.w.defined()   ? weight_ref(dev, L.sh_up.w, 4)   : WeightRef{};
+                    const WeightRef msd = L.sh_down.w.defined() ? weight_ref(dev, L.sh_down.w, 5) : WeightRef{};
                     ops::moe_forward_bias_half(dev, xb_.f32(), L.router.w.f32(), bias,
-                                               weight16(dev, L.moe_gate.w, 0),
-                                               weight16(dev, L.moe_up.w, 1),
-                                               weight16(dev, L.moe_down.w, 2),
-                                               L.sh_gate.w.defined() ? weight16(dev, L.sh_gate.w, 3) : nullptr,
-                                               L.sh_up.w.defined()   ? weight16(dev, L.sh_up.w, 4)   : nullptr,
-                                               L.sh_down.w.defined() ? weight16(dev, L.sh_down.w, 5) : nullptr,
+                                               mg.ptr, mu.ptr, md.ptr, msg.ptr, msu.ptr, msd.ptr,
                                                proj_.f32(), nullptr, nullptr, nullptr,
                                                moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
                                                1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
-                                               c.shared_width());
+                                               c.shared_width(), mg.qkind);
                 } else {
                     ops::moe_forward_bias(dev, xb_.f32(), L.router.w.f32(), bias,
                                           L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
@@ -397,17 +398,18 @@ float* Generator::decode_step_logits(i32 token, int position) {
         if (L.has_moe()) {
             const float* bias = model_.moe_bias_ptr(l);
             if (is_half_or_quant(L.moe_gate.w)) {
+                const WeightRef mg = weight_ref(dev, L.moe_gate.w, 0);
+                const WeightRef mu = weight_ref(dev, L.moe_up.w, 1);
+                const WeightRef md = weight_ref(dev, L.moe_down.w, 2);
+                const WeightRef msg = L.sh_gate.w.defined() ? weight_ref(dev, L.sh_gate.w, 3) : WeightRef{};
+                const WeightRef msu = L.sh_up.w.defined()   ? weight_ref(dev, L.sh_up.w, 4)   : WeightRef{};
+                const WeightRef msd = L.sh_down.w.defined() ? weight_ref(dev, L.sh_down.w, 5) : WeightRef{};
                 ops::moe_forward_bias_half(dev, xb_.f32(), L.router.w.f32(), bias,
-                                           weight16(dev, L.moe_gate.w, 0),
-                                           weight16(dev, L.moe_up.w, 1),
-                                           weight16(dev, L.moe_down.w, 2),
-                                           L.sh_gate.w.defined() ? weight16(dev, L.sh_gate.w, 3) : nullptr,
-                                           L.sh_up.w.defined()   ? weight16(dev, L.sh_up.w, 4)   : nullptr,
-                                           L.sh_down.w.defined() ? weight16(dev, L.sh_down.w, 5) : nullptr,
+                                           mg.ptr, mu.ptr, md.ptr, msg.ptr, msu.ptr, msd.ptr,
                                            proj_.f32(), nullptr, nullptr, nullptr,
                                            moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
                                            1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
-                                           c.shared_width());
+                                           c.shared_width(), mg.qkind);
             } else {
                 ops::moe_forward_bias(dev, xb_.f32(), L.router.w.f32(), bias,
                                       L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
@@ -478,13 +480,15 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
     // Granite) and runs the small recurrence on the GPU instead of the host.
     if (dev == Device::CUDA && st.ssm_dev.defined()) {
         if (is_half_or_quant(L.mamba_in_proj.w)) {
+            const WeightRef wi = weight_ref(dev, L.mamba_in_proj.w, 0);
+            const WeightRef wo = weight_ref(dev, L.mamba_out_proj.w, 1);
             ops::mamba2_step_half(dev, x_in,
-                weight16(dev, L.mamba_in_proj.w, 0), L.mamba_conv_w.w.f32(),
+                wi.ptr, L.mamba_conv_w.w.f32(),
                 L.mamba_conv_b.w.defined() ? L.mamba_conv_b.w.f32() : nullptr,
                 L.mamba_dt_bias.w.f32(), L.mamba_A_log.w.f32(), L.mamba_D.w.f32(),
-                L.mamba_norm.w.f32(), weight16(dev, L.mamba_out_proj.w, 1),
+                L.mamba_norm.w.f32(), wo.ptr,
                 st.conv_dev.f32(), st.ssm_dev.f32(), out,
-                d, d_inner, conv_dim, n_heads, d_head, d_state, conv_k, c.rms_eps);
+                d, d_inner, conv_dim, n_heads, d_head, d_state, conv_k, c.rms_eps, wi.qkind);
         } else {
             ops::mamba2_step(dev, x_in,
                 L.mamba_in_proj.w.f32(), L.mamba_conv_w.w.f32(),
@@ -760,16 +764,18 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
         if (L.has_moe()) {
             const float* bias = model_.moe_bias_ptr(l);
             if (is_half_or_quant(L.moe_gate.w)) {
+                const WeightRef mgg = weight_ref(dev, L.moe_gate.w, 0);
+                const WeightRef muu = weight_ref(dev, L.moe_up.w, 1);
+                const WeightRef mdd = weight_ref(dev, L.moe_down.w, 2);
+                const WeightRef msg = L.sh_gate.w.defined() ? weight_ref(dev, L.sh_gate.w, 3) : WeightRef{};
+                const WeightRef msu = L.sh_up.w.defined()   ? weight_ref(dev, L.sh_up.w, 4)   : WeightRef{};
+                const WeightRef msd = L.sh_down.w.defined() ? weight_ref(dev, L.sh_down.w, 5) : WeightRef{};
                 ops::moe_forward_bias_half(dev, xb.f32(), L.router.w.f32(), bias,
-                                  weight16(dev, L.moe_gate.w, 0), weight16(dev, L.moe_up.w, 1),
-                                  weight16(dev, L.moe_down.w, 2),
-                                  L.sh_gate.w.defined() ? weight16(dev, L.sh_gate.w, 3) : nullptr,
-                                  L.sh_up.w.defined()   ? weight16(dev, L.sh_up.w, 4)   : nullptr,
-                                  L.sh_down.w.defined() ? weight16(dev, L.sh_down.w, 5) : nullptr,
-                                  proj.f32(), nullptr, nullptr, nullptr,
-                                  mg.f32(), mu.f32(), ma.f32(),
-                                  P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
-                                  c.shared_width());
+                                   mgg.ptr, muu.ptr, mdd.ptr, msg.ptr, msu.ptr, msd.ptr,
+                                   proj.f32(), nullptr, nullptr, nullptr,
+                                   mg.f32(), mu.f32(), ma.f32(),
+                                   P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k,
+                                   c.shared_width(), mgg.qkind);
             } else {
                 ops::moe_forward_bias(dev, xb.f32(), L.router.w.f32(), bias,
                                   L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),

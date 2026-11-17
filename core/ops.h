@@ -188,7 +188,7 @@ void moe_forward_half(Device dev,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K, int SH);
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind = -1);
 void moe_forward_bias_half(Device dev,
                       const float* x, const float* router_w, const float* router_bias,
                       const u16* gates, const u16* ups, const u16* downs,
@@ -196,7 +196,7 @@ void moe_forward_bias_half(Device dev,
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K, int SH);
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind = -1);
 // FP16-stored expert matrices: no float reinterpretation of the weights.
 void moe_backward_half(Device dev,
                    const float* x, const float* router_w,
@@ -251,6 +251,10 @@ void mamba2_forward(Device dev,
 
 // The fp16 storage mode: the two projections are half, the fragile vectors
 // (conv1d, dt_bias, A_log, D, the gated norm) stay fp32.
+// qkind: -1 = fp16 (or fp32) weights; 0/1/2 = packed Q4_0/Q4_1/Q8_0 weights.
+// When qkind >= 0 the u16* arguments are PACKED bytes (the FP16 storage mode is
+// skipped and the op reads the blocks directly via a fused dequant-GEMM).
+// CPU builds fall back to dequantize -> fp16, so results stay identical.
 void mamba2_forward_half(Device dev,
                     const float* x,
                     const u16* w_in,
@@ -264,7 +268,7 @@ void mamba2_forward_half(Device dev,
                     float* state,
                     float* out,
                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
-                    int d_head, int d_state, int k, float eps);
+                    int d_head, int d_state, int k, float eps, int qkind = -1);
 
 // Single-token Mamba decode step. The recurrent/conv state stays on the
 // device; used only by the CUDA inference path.
@@ -283,7 +287,7 @@ void mamba2_step_half(Device dev,
                  const float* norm_w, const u16* w_out,
                  float* conv_state, float* ssm_state, float* out,
                  int d, int d_inner, int conv_dim, int n_heads,
-                 int d_head, int d_state, int k, float eps);
+                 int d_head, int d_state, int k, float eps, int qkind = -1);
 
 // FP16-stored Mamba projections: reads the real half bytes.
 void mamba2_backward_half(Device dev,

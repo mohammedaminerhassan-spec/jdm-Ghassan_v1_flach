@@ -46,4 +46,21 @@ inline const u16* weight16(Device dev, const Tensor& w, int slot = 0) {
     return nullptr;
 }
 
+// A weight ready to feed the fused dequant-GEMM path: when the engine runs
+// native Q4 on CUDA with --fused-q4, the PACKED bytes are passed straight to
+// the kernel (no FP16 scratch, no 13 GB write); otherwise `ptr` is the same
+// FP16 view `weight16()` produces and `qkind` is -1.
+struct WeightRef {
+    const u16* ptr = nullptr; // nullptr => caller must use w.f32() instead
+    int        qkind = -1;    // -1 => fp16 values via ptr; 0/1/2 => packed Q4_0/Q4_1/Q8_0
+};
+
+inline WeightRef weight_ref(Device dev, const Tensor& w, int slot = 0) {
+    if (!w.defined()) return {};
+    const int k = quant_kind(w.dtype());
+    if (k >= 0 && dev == Device::CUDA && ops::fused_q4_enabled())
+        return { reinterpret_cast<const u16*>(w.data_ptr()), k };
+    return { weight16(dev, w, slot), -1 };
+}
+
 } // namespace gai
