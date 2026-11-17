@@ -65,6 +65,21 @@ int main() {
                     dtype_name(kinds[k]), rel, limits[k]);
         if (rel > limits[k]) ok = false;
     }
+    // Fused path: linear_forward_q4 must match dequant+fp16 GEMM exactly
+    // (both reduce to the same FP16 weights here).
+    {
+        Tensor q = quant::quantize(wf, DType::Q4_0);
+        Tensor yf({static_cast<i64>(M), static_cast<i64>(N)}, DType::F32, Device::CPU);
+        Tensor yr({static_cast<i64>(M), static_cast<i64>(N)}, DType::F32, Device::CPU);
+        const u16* hw = ops::quant_materialize(Device::CPU, q.data_ptr(), 0, q.numel(), 0);
+        ops::linear_forward_fp16(Device::CPU, x.f32(), hw, yr.f32(), M, K, N);
+        ops::linear_forward_q4(Device::CPU, x.f32(), q.data_ptr(), yf.f32(), M, K, N, 0);
+        float worst = 0.0f;
+        for (i64 i = 0; i < yr.numel(); ++i)
+            worst = std::max(worst, std::fabs(yf.f32()[i] - yr.f32()[i]));
+        std::printf("[quant] fused Q4 GEMM worst |diff| = %.6f\n", worst);
+        if (worst > 1e-4f) ok = false;
+    }
     ops::quant_scratch_free();
     if (!ok) {
         std::printf("FAIL: native Q4 dequantized GEMM deviates from FP32 reference\n");

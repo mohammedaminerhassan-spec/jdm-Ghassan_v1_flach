@@ -32,6 +32,7 @@ namespace gai {
 namespace ops {
 
 static std::atomic<bool> g_gemm_fp16{true};
+static std::atomic<bool> g_fused_q4{true};
 
 static std::atomic<bool> g_gemm_bf16{false};
 static std::atomic<float> g_moe_jitter{0.0f};
@@ -335,6 +336,57 @@ void quant_scratch_free() {
 #endif
     std::lock_guard<std::mutex> lock(g_qcpu_mutex);
     for (int i = 0; i < kQuantSlots; ++i) g_qcpu[static_cast<size_t>(i)].clear();
+}
+
+void set_fused_q4(bool on) { g_fused_q4.store(on, std::memory_order_relaxed); }
+bool fused_q4_enabled() { return g_fused_q4.load(std::memory_order_relaxed); }
+
+void linear_forward_q4(Device dev, const float* x, const void* w, float* y,
+                       int M, int K, int N, int kind) {
+    if (M <= 0 || N <= 0) return;
+    if (dev == Device::CPU) {
+        // CPU mirror of the CUDA fused kernel (used by the parity test and by
+        // CPU inference): dequantize the needed row into a host tile, then dot.
+        std::vector<u16> row(static_cast<size_t>(K));
+        const u8* p = reinterpret_cast<const u8*>(w);
+        const int bpb = (kind == 0) ? 18 : (kind == 1) ? 20 : 34; // bytes per 32-val block
+        for (int n = 0; n < N; ++n) {
+            const u8* wr = p + static_cast<size_t>(n) * (static_cast<size_t>(K) / 32) * bpb;
+            for (int k = 0; k < K; ++k) {
+                const u8* blk = wr + static_cast<size_t>(k >> 5) * bpb;
+                float v;
+                if (kind == 0) {
+                    const float d = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                    const int j = k & 31;
+                    const u8 b = blk[2 + (j & 15)];
+                    const int q = (j < 16) ? (b & 0x0F) : (b >> 4);
+                    v = static_cast<float>(q - 8) * d;
+                } else if (kind == 1) {
+                    const float d = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                    const float mn = fp16_to_fp32(*reinterpret_cast<const u16*>(blk + 2));
+                    const u8 b = blk[4 + ((k & 31) >> 1)];
+                    const int q = ((k & 31) & 1) ? (b >> 4) : (b & 0x0F);
+                    v = static_cast<float>(q) * d + mn;
+                } else {
+                    const float d = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                    v = static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[k & 31]) * d;
+                }
+                row[static_cast<size_t>(k)] = fp32_to_fp16(v);
+            }
+            for (int m = 0; m < M; ++m) {
+                const float* xa = x + static_cast<size_t>(m) * K;
+                float acc = 0.0f;
+                for (int k = 0; k < K; ++k) acc += xa[k] * fp16_to_fp32(row[static_cast<size_t>(k)]);
+                y[static_cast<size_t>(m) * N + n] = acc;
+            }
+        }
+        return;
+    }
+#ifdef GAI_CUDA
+    cuda_ops::linear_forward_q4(x, static_cast<const u16*>(w), y, M, K, N, kind);
+#else
+    GAI_FAIL("linear_forward_q4: CUDA device requested but the build has no CUDA support");
+#endif
 }
 
 void register_fp16_weight(const float* master, const u16* half, i64 n) {

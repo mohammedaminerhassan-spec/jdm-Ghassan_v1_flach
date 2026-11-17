@@ -530,6 +530,55 @@ void free_quant_scratch() {
     }
 }
 
+// ---- fused Q4 GEMM ----------------------------------------------------------
+// C[M,N] = A[M,K] * W^T, with W stored PACKED as Q4/Q8 blocks [N,K].
+// No FP16 scratch: every thread owns one output (m,n), walks K and dequantizes
+// the needed block on the fly from registers/warp broadcasts. This is the
+// decode path (M is tiny), where cuBLAS would otherwise read a full materialized
+// FP16 copy of the weights; here it reads only the packed Q4 bytes.
+__device__ __forceinline__ float q4_val(const u8* blk, int j, int kind) {
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    if (kind == 0) { // Q4_0: low nibble -> v[j], high -> v[j+16]
+        const u8 b = blk[2 + (j & 15)];
+        const int q = (j < 16) ? (b & 0x0F) : (b >> 4);
+        return static_cast<float>(q - 8) * d;
+    } else if (kind == 1) { // Q4_1: low -> v[2j], high -> v[2j+1]
+        const float m = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+        const u8 b = blk[4 + (j >> 1)];
+        const int q = (j & 1) ? (b >> 4) : (b & 0x0F);
+        return static_cast<float>(q) * d + m;
+    }
+    return static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[j]) * d; // Q8_0
+}
+
+__global__ void k_linear_q4_fused(const float* __restrict__ A, const u16* __restrict__ W,
+                                  float* __restrict__ C, int M, int K, int N, int kind) {
+    // One block per output row m; threads tile over the N columns.
+    const int m = blockIdx.y;
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M || n >= N) return;
+    const int bpb = (kind == 0) ? 9 : (kind == 1) ? 10 : 17; // u16 per 32-value block
+    const u8* wrow = reinterpret_cast<const u8*>(W + static_cast<size_t>(n) *
+                                                 ((static_cast<size_t>(K) / 32) * bpb));
+    const float* a = A + static_cast<size_t>(m) * K;
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        const u8* blk = wrow + static_cast<size_t>(k >> 5) * bpb * 2;
+        acc += a[k] * q4_val(blk, k & 31, kind);
+    }
+    C[static_cast<size_t>(m) * N + n] = acc;
+}
+
+void linear_forward_q4(const float* x, const u16* w, float* y,
+                       int M, int K, int N, int kind) {
+    if (M <= 0 || N <= 0) return;
+    if (K <= 0) { CU_CHECK(cudaMemset(y, 0, sizeof(float) * static_cast<size_t>(M) * N)); return; }
+    const int block = 128;
+    dim3 grid(grid_for(N, block), M);
+    k_linear_q4_fused<<<grid, block>>>(x, w, y, M, K, N, kind);
+    CU_CHECK(cudaGetLastError());
+}
+
 void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, int N) {
     if (M <= 0 || N <= 0) return;
     if (K <= 0) {

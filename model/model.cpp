@@ -29,8 +29,12 @@ inline void linear_param(Device dev, const Tensor& w, const float* x, float* y,
                          int M, int K, int N) {
     if (w.dtype() == DType::F16)
         ops::linear_forward_fp16(dev, x, w.ptr<u16>(), y, M, K, N);
-    else if (is_quant(w))
-        ops::linear_forward_fp16(dev, x, weight16(dev, w, 0), y, M, K, N);
+    else if (is_quant(w)) {
+        if (ops::fused_q4_enabled())
+            ops::linear_forward_q4(dev, x, w.data_ptr(), y, M, K, N, quant_kind(w.dtype()));
+        else
+            ops::linear_forward_fp16(dev, x, weight16(dev, w, 0), y, M, K, N);
+    }
     else
         ops::linear_forward(dev, x, w.f32(), y, M, K, N);
 }

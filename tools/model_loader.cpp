@@ -207,6 +207,12 @@ LoadedModel load_model(const Args& args) {
         if (fp16_weights && !args.has("weight-f16")) fp16_weights = false;
         GAI_CHECK(!fp16_weights, "--weight-q4 and --weight-f16 are mutually exclusive; "
                                  "pass --weight-f16 0 explicitly");
+        // Fused dequant-GEMM reads packed Q4 blocks straight into the GEMM,
+        // removing the FP16 scratch round-trip. On by default; --fused-q4 0
+        // falls back to dequantize-to-scratch + cuBLAS.
+        const bool fused = args.flag("fused-q4", true);
+        ops::set_fused_q4(fused);
+        log_info(strfmt("[prec] fused Q4 GEMM: %s", fused ? "on" : "off (scratch path)"));
         log_info(strfmt("[prec] native quantized weights: %s (packed on device)",
                         quant_kind == 0 ? "Q4_0" : quant_kind == 1 ? "Q4_1" : "Q8_0"));
     }

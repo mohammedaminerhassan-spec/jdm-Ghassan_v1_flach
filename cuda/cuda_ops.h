@@ -27,6 +27,9 @@ void convert_f32_to_f16(const float* src, u16* dst, i64 n);
 void convert_f16_to_f32(const u16* src, float* dst, i64 n);
 // native quantized weights: 0 = Q4_0, 1 = Q4_1, 2 = Q8_0
 void dequantize_quant(const u16* src, u16* dst, i64 n, int kind);
+// fused dequant-GEMM: C[M,N] = A[M,K] * W^T with W packed Q4/Q8 [N,K], no scratch
+void linear_forward_q4(const float* x, const u16* w, float* y,
+                       int M, int K, int N, int kind);
 // Reusable FP16 scratch bank for materialized quantized weights. The bank is
 // shared across the default stream; a slot may be overwritten once the GEMM
 // that consumed it has been enqueued.

@@ -91,6 +91,13 @@ void convert_f16_to_f32(Device dev, const u16* src, float* dst, i64 n);
 const u16* quant_materialize(Device dev, const void* packed, int kind, i64 n, int slot);
 void       quant_scratch_free();
 
+// Fused dequant-GEMM: reads the packed Q4/Q8 weight directly (no FP16 scratch).
+// Enabled by set_fused_q4(true); the caller passes the PACKED weight data_ptr.
+void set_fused_q4(bool on);
+bool fused_q4_enabled();
+void linear_forward_q4(Device dev, const float* x, const void* w, float* y,
+                       int M, int K, int N, int kind);
+
 void register_fp16_weight(const float* master, const u16* half, i64 n);
 void unregister_fp16_weight(const float* master);
 
