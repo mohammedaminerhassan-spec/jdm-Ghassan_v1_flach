@@ -1012,7 +1012,14 @@ static void moe_backward_impl(const float* x, const float* router_w,
         k_swiglu<<<grid_for(N * SH, 256), 256>>>(shg, shu, sha, N * SH);
         CU_CHECK(cudaGetLastError());
 
-    moe_linear(dout, sh_d, shda, (int)N, d, SH);
+    // BUG: dSa = dout @ sh_d, where sh_d is stored [d, SH] (down projection
+    // out=d, in=SH). moe_linear() applies the weight TRANSPOSED (it treats w
+    // as [out,in] = [SH,d] and computes x @ w^T), so passing (M=N,K=d,N=SH)
+    // reinterpreted the [d,SH] buffer as [SH,d] and produced garbage dSa.
+    // That fed swiglu_bwd -> dsh_g/dsh_u -> dx -> ffn_norm etc.
+    // The CPU path uses linear_backward(sa, sh_d, dt, dsa, ..., SH, d), i.e.
+    // a NON-transposed gemm dout[N,d] @ sh_d[d,SH] -> shda[N,SH].
+    moe_gemm_nn(dout, sh_d, shda, (int)N, SH, d);
     k_swiglu_bwd_assign<<<grid_for(N * SH, 256), 256>>>(shg, shu, shda, shdg, shdu, N * SH);
         CU_CHECK(cudaGetLastError());
         moe_linear_bwd(sha, sh_d, dout, nullptr, dsh_d, (int)N, SH, d);
