@@ -370,17 +370,10 @@ public:
     Tensor& forward(const i32* ids, int B, int T, Activations& act,
                     const i32* segment_ids = nullptr);
 
-    // Same as forward(), but some positions take their embedding from the
-    // caller instead of the token embedding table. This is how external feature injectors work: the prompt carries
-    // a placeholder token and the features are written over that position.
-    //
-    // embed_override : [n_override, hidden] features
-    // override_pos   : [n_override] absolute positions in [0, B*T)
-    Tensor& forward(const i32* ids, int B, int T, Activations& act,
-                    const i32* segment_ids,
-                    const float* embed_override,
-                    const int* override_pos,
-                    int n_override);
+    // NOTE: an `embed_override` overload used to be declared here but was
+    // never defined (and never called): Generator::forward_prefill applies
+    // the overrides to the activation tensor itself, so it was dead API that
+    // would only produce a linker error if someone tried to use it.
 
     double  forward_backward(const i32* ids, const i32* targets, int B, int T,
                               Activations& act, i64* out_ntok = nullptr,
@@ -485,12 +478,7 @@ private:
 
     void forward_body(const i32* ids, int B, int T, Activations& act,
                       const i32* segment_ids);
-
-    void forward_body(const i32* ids, int B, int T, Activations& act,
-                      const i32* segment_ids,
-                      const float* embed_override,
-                      const int* override_pos,
-                      int n_override);
+    // (The embed_override overload was removed: see the note at forward().)
 
     ModelConfig cfg_;
 

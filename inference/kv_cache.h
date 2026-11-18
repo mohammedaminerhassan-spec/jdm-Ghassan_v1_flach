@@ -111,7 +111,15 @@ public:
     // When true the cache keeps fp32 values (used by the training path and
     // by the CPU reference kernels).
     bool fp16() const { return fp16_; }
-    void set_fp16(bool on) { fp16_ = on; }
+    // The storage dtype is fixed at construction (the tensors are already
+    // allocated). Flipping the flag later would make k()/k_f16() reinterpret
+    // the same bytes with the wrong dtype. Reject a late change instead of
+    // silently corrupting the cache.
+    void set_fp16(bool on) {
+        GAI_CHECK(on == fp16_,
+                  "KVCache::set_fp16 cannot change the dtype after "
+                  "construction (the storage is already allocated)");
+    }
 
     size_t bytes() const;
 
