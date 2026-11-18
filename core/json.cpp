@@ -1,6 +1,7 @@
 #include "core/json.h"
 
 #include <cmath>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -238,29 +239,46 @@ struct Parser {
 
     bool parse_number(Json& out) {
         const size_t start = i;
-        if (i < s.size() && (s[i] == '-' || s[i] == '+')) ++i;
-        bool any = false;
-        while (i < s.size() && s[i] >= '0' && s[i] <= '9') { ++i; any = true; }
+        // JSON grammar: optional '-' only (no '+'), then either a single '0'
+        // or [1-9][0-9]* (no leading zeros).
+        if (i < s.size() && s[i] == '-') ++i;
+        if (i >= s.size() || s[i] < '0' || s[i] > '9') return fail("bad number");
+        if (s[i] == '0') {
+            ++i;
+            if (i < s.size() && s[i] >= '0' && s[i] <= '9')
+                return fail("leading zero in number");
+        } else {
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+        }
         bool is_int = true;
         if (i < s.size() && s[i] == '.') {
             is_int = false;
             ++i;
-            while (i < s.size() && s[i] >= '0' && s[i] <= '9') { ++i; any = true; }
+            if (i >= s.size() || s[i] < '0' || s[i] > '9')
+                return fail("bad number (want digits after '.')");
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
         }
         if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
             is_int = false;
             ++i;
             if (i < s.size() && (s[i] == '-' || s[i] == '+')) ++i;
-            bool exp_digits = false;
-            while (i < s.size() && s[i] >= '0' && s[i] <= '9') { ++i; exp_digits = true; }
-            if (!exp_digits) return fail("bad exponent (want digits after e/E)");
+            if (i >= s.size() || s[i] < '0' || s[i] > '9')
+                return fail("bad exponent (want digits after e/E)");
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
         }
-        if (!any) return fail("bad number");
         const std::string num = s.substr(start, i - start);
+        errno = 0;
+        char* end = nullptr;
         if (is_int) {
-            out = Json::integer(std::strtoll(num.c_str(), nullptr, 10));
+            const long long v = std::strtoll(num.c_str(), &end, 10);
+            if (errno == ERANGE || end != num.c_str() + num.size())
+                return fail("integer out of range");
+            out = Json::integer(v);
         } else {
-            out = Json::number(std::strtod(num.c_str(), nullptr));
+            const double v = std::strtod(num.c_str(), &end);
+            if (end != num.c_str() + num.size() || !std::isfinite(v))
+                return fail("number out of range");
+            out = Json::number(v);
         }
         return true;
     }

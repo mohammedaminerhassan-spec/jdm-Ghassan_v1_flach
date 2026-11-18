@@ -636,8 +636,9 @@ void GGUFWriter::write() {
                         const float m = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(blk + 2));
                         for (int j = 0; j < 16; ++j) {
                             const uint8_t byte = blk[4 + j];
-                            const size_t i0 = b * 32 + static_cast<size_t>(2 * j);
-                            const size_t i1 = i0 + 1;
+                            // GGML: low nibble = v[j], high nibble = v[j+16].
+                            const size_t i0 = b * 32 + static_cast<size_t>(j);
+                            const size_t i1 = i0 + 16;
                             if (i0 < n) back[i0] = d * static_cast<float>(byte & 0x0F) + m;
                             if (i1 < n) back[i1] = d * static_cast<float>(byte >> 4) + m;
                         }
@@ -1145,10 +1146,16 @@ ModelConfig GGUFReader::model_config() const {
                 size_t i = 0;
                 while (i < lt.size()) {
                     size_t comma = lt.find(',', i);
-                    c.layer_types.push_back(lt[i] == '1' ? 1 : 0);
+                    const char ch = lt[i];
+                    GAI_CHECK(ch == '0' || ch == '1',
+                              "GGUF ghassan.layer_types: expected '0' or '1', got '" +
+                              std::string(1, ch) + "'");
+                    c.layer_types.push_back(ch == '1' ? 1 : 0);
                     if (comma == std::string::npos) break;
                     i = comma + 1;
                 }
+                GAI_CHECK(c.layer_types.empty() || c.layer_types.size() == static_cast<size_t>(c.num_layers),
+                          "GGUF ghassan.layer_types: length does not match num_layers");
             }
         }
     } else {

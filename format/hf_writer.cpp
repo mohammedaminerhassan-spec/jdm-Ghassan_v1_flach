@@ -589,7 +589,11 @@ bool export_model_safetensors(const std::string& dir, Model& model,
         g.set("eos_token_id", Json::integer(tokenizer.eos_id()));
         g.set("pad_token_id", Json::integer(tokenizer.pad_id()));
         if (!model_name.empty()) g.set("name_or_path", Json::string(model_name));
-        write_file((fs::path(dir) / "generation_config.json").string(), g.dump_pretty());
+        const std::string gc_path = (fs::path(dir) / "generation_config.json").string();
+        if (!write_file(gc_path, g.dump_pretty())) {
+            log_error("[hf ] failed to write " + gc_path);
+            return false;
+        }
     }
 
     log_info(strfmt("[hf ] exported %s | %zu tensors | %zu shard(s) | %s | dtype=%s",

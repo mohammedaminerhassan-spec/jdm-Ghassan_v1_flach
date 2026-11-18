@@ -606,7 +606,14 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
                 // The official checkpoint says "mamba" / "attention";
                 // transformers also emits "linear_attention" /
                 // "full_attention" for the same layers.
-                const std::string kind = el.as_string("mamba");
+                const std::string kind = el.as_string("");
+                // Documented mapping: attention/full_attention -> GQA,
+                // mamba/linear_attention -> Mamba-2. Reject anything else
+                // instead of silently turning a typo into a Mamba layer.
+                GAI_CHECK(kind == "attention" || kind == "full_attention" ||
+                          kind == "mamba" || kind == "linear_attention",
+                          "config.json layer_types: unknown layer kind '" + kind +
+                          "' (expected attention/full_attention/mamba/linear_attention)");
                 const bool attn = (kind == "attention" || kind == "full_attention");
                 cfg_.layer_types.push_back(attn ? 1 : 0);
             }

@@ -49,7 +49,12 @@ void ChatSession::trim_history() {
 
     std::vector<Message> trimmed;
     if (sys) trimmed.push_back(history_.front());
-    const size_t keep_from = history_.size() - static_cast<size_t>(2 * opts_.max_history_turns);
+    const size_t keep = static_cast<size_t>(2 * opts_.max_history_turns);
+    // Always keep at least the latest user turn (the one just sent): with
+    // max_history_turns=0, 2*0 = 0 would otherwise drop the current question
+    // and the model would answer an empty/system-only history.
+    const size_t want = std::max<size_t>(1, keep);
+    const size_t keep_from = history_.size() - std::min(want, history_.size() - sys);
     for (size_t i = keep_from; i < history_.size(); ++i) trimmed.push_back(history_[i]);
     history_ = std::move(trimmed);
 }

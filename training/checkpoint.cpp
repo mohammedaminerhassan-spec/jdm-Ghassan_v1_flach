@@ -276,8 +276,20 @@ static bool arch_match(const ModelConfig& a, const ModelConfig& b) {
           a.moe_expert_dim == b.moe_expert_dim && a.moe_shared == b.moe_shared &&
           a.use_qk_norm == b.use_qk_norm && a.use_qkv_bias == b.use_qkv_bias))
         return false;
+    // These change the forward function without changing weight shapes/names:
+    // a checkpoint with the same tensors but different multipliers/geometry
+    // would silently compute a different model. Compare them strictly.
     if (a.arch != b.arch || a.shared_expert_intermediate_size != b.shared_expert_intermediate_size ||
-        a.position_embedding != b.position_embedding || a.head_dim_override != b.head_dim_override)
+        a.position_embedding != b.position_embedding || a.head_dim_override != b.head_dim_override ||
+        a.embedding_multiplier != b.embedding_multiplier ||
+        a.residual_multiplier != b.residual_multiplier ||
+        a.attention_multiplier != b.attention_multiplier ||
+        a.logits_scaling != b.logits_scaling ||
+        (a.arch == ModelConfig::ArchGranite &&
+         (a.mamba_n_heads != b.mamba_n_heads || a.mamba_d_head != b.mamba_d_head ||
+          a.mamba_d_state != b.mamba_d_state || a.mamba_n_groups != b.mamba_n_groups ||
+          a.mamba_d_conv != b.mamba_d_conv || a.mamba_expand != b.mamba_expand ||
+          a.mamba_conv_bias != b.mamba_conv_bias || a.mamba_proj_bias != b.mamba_proj_bias)))
         return false;
     if (a.max_seq_len != b.max_seq_len || a.rope_theta != b.rope_theta ||
         a.rope_scale != b.rope_scale || a.rope_yarn_mscale != b.rope_yarn_mscale ||
@@ -542,8 +554,11 @@ void Checkpoint::save(const CheckpointSnapshot& snapshot, const std::string& pat
             wr(f, kind);
             write_optimizer_snapshot(f, snapshot.optimizer);
         }
-        GAI_CHECK(f.good(), "checkpoint write failed");
         f.flush();
+        // Check AFTER flushing: a disk-full / I/O error can surface only at
+        // flush time, and publishing a truncated checkpoint would corrupt
+        // resume state.
+        GAI_CHECK(f.good(), "checkpoint write/flush failed");
     }
     publish_file(path, tmp);
     guard.keep = true;

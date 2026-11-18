@@ -524,7 +524,13 @@ ModelConfig ModelConfig::from_config(const Config& c, const std::string& p) {
                 size_t b = tok.find_first_not_of(" \t");
                 size_t e = tok.find_last_not_of(" \t");
                 if (b != std::string::npos) tok = tok.substr(b, e - b + 1);
-                m.layer_types.push_back(tok == "attention" ? 1 : 0);
+                // Fail closed on an unknown layer type: silently mapping it to
+                // Mamba would build a different architecture from the one the
+                // recipe/checkpoint intended.
+                if (tok == "attention") m.layer_types.push_back(1);
+                else if (tok == "mamba") m.layer_types.push_back(0);
+                else GAI_CHECK(false, "model.layer_types: unknown layer kind '" + tok +
+                                      "' (expected 'attention' or 'mamba')");
                 if (cpos == std::string::npos) break;
                 i = cpos + 1;
             }
@@ -1198,26 +1204,45 @@ ParamReport Model::parameter_report() const {
 
     add(cfg_.tie_embeddings ? "tok_embeddings (tied with lm_head)" : "tok_embeddings",
         cfg_.vocab_size * d, 1);
-    add("attn.wq   [q_dim, d]",  qd * d,  L);
-    add("attn.wk   [kv_dim, d]", kvd * d, L);
-    add("attn.wv   [kv_dim, d]", kvd * d, L);
-    add("attn.wo   [d, q_dim]",  d * qd,  L);
+    // Granite is hybrid: only attention layers own Q/K/V/O; Mamba layers own
+    // the in_proj/out_proj + conv/A_log/D/norm. Count them per real layer kind.
+    int n_attn = L, n_mamba = 0;
+    bool hybrid = (cfg_.arch == ModelConfig::ArchGranite) &&
+                  static_cast<int>(cfg_.layer_types.size()) == L;
+    if (hybrid) {
+        n_attn = 0;
+        for (int lt : cfg_.layer_types) if (lt == 1) ++n_attn;
+        n_mamba = L - n_attn;
+    }
+    add("attn.wq   [q_dim, d]",  qd * d,  n_attn);
+    add("attn.wk   [kv_dim, d]", kvd * d, n_attn);
+    add("attn.wv   [kv_dim, d]", kvd * d, n_attn);
+    add("attn.wo   [d, q_dim]",  d * qd,  n_attn);
+    if (n_mamba > 0) {
+        const i64 proj = static_cast<i64>(cfg_.mamba_expand) * d + 2 * cfg_.mamba_n_groups * cfg_.mamba_d_state + cfg_.mamba_n_heads;
+        add("mamba.in_proj [proj, d]", proj * d, n_mamba);
+        add("mamba.out_proj [d, inner]", d * (static_cast<i64>(cfg_.mamba_expand) * d), n_mamba);
+        add("mamba.conv1d", (static_cast<i64>(cfg_.mamba_expand) * d + 2 * cfg_.mamba_n_groups * cfg_.mamba_d_state) * cfg_.mamba_d_conv, n_mamba);
+        add("mamba.A_log/dt_bias/D", 3 * cfg_.mamba_n_heads, n_mamba);
+        add("mamba.norm", static_cast<i64>(cfg_.mamba_expand) * d, n_mamba);
+    }
     if (cfg_.use_moe) {
+        const i64 SH = cfg_.shared_width();
         add("moe.router [ne, d]",      ne * d,     L);
         add("moe.gate   [ne*E, d]",    ne * E * d, L);
         add("moe.up     [ne*E, d]",    ne * E * d, L);
         add("moe.down   [ne*d, E]",    ne * d * E, L);
         if (cfg_.moe_shared) {
-            add("moe.shared.gate [E, d]", E * d,   L);
-            add("moe.shared.up   [E, d]", E * d,   L);
-            add("moe.shared.down [d, E]", d * E,   L);
+            add("moe.shared.gate [SH, d]", SH * d, L);
+            add("moe.shared.up   [SH, d]", SH * d, L);
+            add("moe.shared.down [d, SH]", d * SH, L);
         }
     } else {
-        add("ffn.gate  [ffn, d]",    F * d,   L);
-        add("ffn.up    [ffn, d]",    F * d,   L);
-        add("ffn.down  [d, ffn]",    d * F,   L);
+        add("ffn.gate  [ffn, d]",    F * d,   n_attn);
+        add("ffn.up    [ffn, d]",    F * d,   n_attn);
+        add("ffn.down  [d, ffn]",    d * F,   n_attn);
     }
-    add("attn_norm [d]",         d,       L);
+    add("attn_norm [d]",         d,       n_attn);
     add("ffn_norm  [d]",         d,       L);
     if (cfg_.use_qk_norm) {
         const i64 hd = cfg_.head_dim();

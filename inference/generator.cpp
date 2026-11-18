@@ -923,6 +923,10 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
     // repetition_window == 0), and the slow path then sampled from a stale
     // host copy of the logits - the last one the prefill had written.
     const bool use_fast = use_fast_for(static_cast<int>(history_.size()));
+    // Build the stop-token set once (it never changes during generation):
+    // copying it on every token was a needless heap allocation in the hot loop.
+    std::vector<i32> stops = cfg.stop_tokens;
+    if (stops.empty()) stops.push_back(tok_.eos_id());
     for (int step = 0; step < limit; ++step) {
 
         const int win_now = sc.repetition_window > 0 ? sc.repetition_window
@@ -951,8 +955,6 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
             next = sampler.sample(logits_host_.data(), V, history_);
         }
 
-        std::vector<i32> stops = cfg.stop_tokens;
-        if (stops.empty()) stops.push_back(tok_.eos_id());
         bool is_stop = std::find(stops.begin(), stops.end(), next) != stops.end();
         if (is_stop) break;
 

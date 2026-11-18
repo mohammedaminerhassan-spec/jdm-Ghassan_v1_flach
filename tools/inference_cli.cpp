@@ -99,6 +99,7 @@ static u64 ggml_nbytes_of(GGMLType t, u64 nelems) {
         case GGMLType::F16:  return nelems * 2;
         case GGMLType::Q8_0: return ((nelems + 31) / 32) * 34;
         case GGMLType::Q4_0: return ((nelems + 31) / 32) * 18;
+        case GGMLType::Q4_1: return ((nelems + 31) / 32) * 20;
         default:             return nelems * 4;
     }
 }

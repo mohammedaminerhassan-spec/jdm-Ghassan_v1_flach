@@ -99,17 +99,14 @@ std::string utf8_from_bytes(const std::string& bytes) {
 }
 
 bool utf8_is_complete(const std::string& s) {
+    // Reuse the full decoder: it also rejects overlong encodings, surrogate
+    // code points and values above U+10FFFF, which a continuation-byte-only
+    // check would let through.
     size_t i = 0;
     while (i < s.size()) {
-        u8 b = static_cast<u8>(s[i]);
-        int len = utf8_seq_len(b);
-        if (len == 0) return false;
-        if (i + static_cast<size_t>(len) > s.size()) return false;
-
-        for (int k = 1; k < len; ++k) {
-            if ((static_cast<u8>(s[i + static_cast<size_t>(k)]) & 0xC0) != 0x80) return false;
-        }
-        i += static_cast<size_t>(len);
+        const size_t before = i;
+        const u32 cp = utf8_decode(s, i);
+        if (cp == 0xFFFD || i == before) return false;
     }
     return true;
 }
