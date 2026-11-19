@@ -143,6 +143,15 @@ void check_free_vram(size_t need, const char* what) {
 }
 
 void* cublas_handle() {
+    // A handle is bound to the device that was current when it was created.
+    // Rebind on device changes (DDP / ScopedDevice) instead of silently
+    // running GEMMs on the wrong GPU.
+    int cur_dev = -1;
+    if (g_cublas && cudaGetDevice(&cur_dev) == cudaSuccess &&
+        cur_dev != g_cublas_dev) {
+        check_blas(cublasDestroy(g_cublas), "cublasDestroy");
+        g_cublas = nullptr;
+    }
     if (!g_cublas) {
         check_blas(cublasCreate(&g_cublas), "cublasCreate");
 

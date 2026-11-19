@@ -65,9 +65,12 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
             kv_layers = 0;
             for (int lt : c.layer_types) if (lt != 0) ++kv_layers;
         }
+        // KVCache stores K/V as fp16 by default (kv_cache.h:137); use the real
+        // element size so the OOM guard does not reject a context that fits.
+        const size_t kv_elem_bytes = sizeof(u16);
         size_t need = 2ULL * static_cast<size_t>(kv_layers) *
                       static_cast<size_t>(max_context_) *
-                      static_cast<size_t>(c.kv_dim()) * sizeof(float);
+                      static_cast<size_t>(c.kv_dim()) * kv_elem_bytes;
         if (dev == Device::CUDA && cuda_available()) {
 
 #ifdef GAI_CUDA
@@ -306,7 +309,7 @@ float* Generator::decode_step_logits(i32 token, int position) {
         float* qp = q_.f32();
         float* kp = k_.f32();
         float* vp = v_.f32();
-        if (qkv_.defined()) {
+        if (qkv_.defined() && model_.fused_qkv_ptr(l) != nullptr) {
             ops::linear_forward_fp16(dev, xb_.f32(), model_.fused_qkv_ptr(l),
                                      qkv_.f32(), 1, d, qd + 2 * kvd);
             qp = qkv_.f32();
@@ -478,7 +481,10 @@ void Generator::decode_mamba_layer(int layer_index, const float* x_in, float* ou
     // CUDA: the whole single-token step stays on the device. This removes the
     // two synchronous copies per Mamba layer per token (72 per token on
     // Granite) and runs the small recurrence on the GPU instead of the host.
-    if (dev == Device::CUDA && st.ssm_dev.defined()) {
+    // The device kernels hardcode the n_groups == 1 conv layout (Granite-4.0
+    // is always n_groups == 1, enforced by ModelConfig::validate); anything
+    // else takes the host path, which is fully general.
+    if (dev == Device::CUDA && st.ssm_dev.defined() && n_groups == 1) {
         if (is_half_or_quant(L.mamba_in_proj.w)) {
             const WeightRef wi = weight_ref(dev, L.mamba_in_proj.w, 0);
             const WeightRef wo = weight_ref(dev, L.mamba_out_proj.w, 1);
@@ -713,7 +719,7 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
         float* qp = q.f32();
         float* kp = k.f32();
         float* vp = v.f32();
-        if (qkv.defined()) {
+        if (qkv.defined() && model_.fused_qkv_ptr(l) != nullptr) {
             ops::linear_forward_fp16(dev, xb.f32(), model_.fused_qkv_ptr(l),
                                      qkv.f32(), P, d, qd + 2 * kvd);
             ops::split_qkv(dev, qkv.f32(), q.f32(), k.f32(), v.f32(), P, qd, kvd);
@@ -922,7 +928,11 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
     // middle of a generation (the penalty window grows with the history when
     // repetition_window == 0), and the slow path then sampled from a stale
     // host copy of the logits - the last one the prefill had written.
-    const bool use_fast = use_fast_for(static_cast<int>(history_.size()));
+    // repetition_window==0 means "the entire history" on the slow path, but
+    // the fast path caps the window at FAST_HIST_MAX (2048). Force the slow
+    // path so the configured semantics are honoured.
+    const bool use_fast = sc.repetition_window != 0 &&
+                          use_fast_for(static_cast<int>(history_.size()));
     // Build the stop-token set once (it never changes during generation):
     // copying it on every token was a needless heap allocation in the hot loop.
     std::vector<i32> stops = cfg.stop_tokens;
@@ -1087,19 +1097,29 @@ double Generator::score_tokens(const std::vector<i32>& tokens, const std::vector
     Device dev = model_.device();
     double sum_all = 0.0;
     i64 n_all = 0;
+    // Reuse ONE activation object across chunks so the Mamba-2 recurrent
+    // state survives the chunk boundary. The convolution window is NOT part
+    // of that state, so each chunk (after the first) re-scores `overlap`
+    // preceding tokens and discards their losses; otherwise the first
+    // d_conv-1 predictions of every chunk use a zeroed conv history.
+    const int overlap = std::max(0, model_.config().mamba_d_conv - 1);
+    const int Tn_max = std::min(SCORE_CHUNK + overlap + 1, T);
+    Activations act = model_.make_activations(1, Tn_max, false);
     for (int off = 0; off < T; off += SCORE_CHUNK) {
         const int Tc = std::min(SCORE_CHUNK, T - off);
-
         const int Tend = std::min(T, off + Tc + 1);
-        const int Tn = Tend - off;
+        const int start = std::max(0, off - overlap);
+        const int Tn = Tend - start;
         if (Tn < 2) break;
-        Activations act = model_.make_activations(1, Tn, false);
-        act.pos_offset = off;
-        std::vector<i32> ids(tokens.begin() + off, tokens.begin() + off + Tn);
+        act.T = Tn;
+        act.pos_offset = start;
+        std::vector<i32> ids(tokens.begin() + start, tokens.begin() + start + Tn);
         std::vector<i32> tgt(static_cast<size_t>(Tn), -100);
         for (int i = 0; i + 1 < Tn; ++i) {
-            bool supervised = !mask || (*mask)[static_cast<size_t>(off + i) + 1];
-            if (supervised) tgt[static_cast<size_t>(i)] = tokens[static_cast<size_t>(off + i) + 1];
+            const int pos = start + i;
+            if (pos < off) continue;  // overlap context: not supervised
+            bool supervised = !mask || (*mask)[static_cast<size_t>(pos) + 1];
+            if (supervised) tgt[static_cast<size_t>(i)] = tokens[static_cast<size_t>(pos) + 1];
         }
 
         Tensor d_ids({Tn}, DType::I32, Device::CPU);
@@ -1114,14 +1134,15 @@ double Generator::score_tokens(const std::vector<i32>& tokens, const std::vector
         if (segment_ids) {
             Tensor h_segments({Tn}, DType::I32, Device::CPU);
             for (int i = 0; i < Tn; ++i) {
-                h_segments.i32p()[i] = (*segment_ids)[static_cast<size_t>(off + i)];
+                h_segments.i32p()[i] = (*segment_ids)[static_cast<size_t>(start + i)];
             }
             dev_segments = Tensor({Tn}, DType::I32, dev);
             dev_segments.copy_from(h_segments);
         }
 
         Tensor& logits = model_.forward(dev_ids.i32p(), 1, Tn, act,
-                                        segment_ids ? dev_segments.i32p() : nullptr);
+                                        segment_ids ? dev_segments.i32p() : nullptr,
+                                        /*reset_mamba_states=*/start == 0);
         double sum = 0.0;
         i64 n = 0;
 

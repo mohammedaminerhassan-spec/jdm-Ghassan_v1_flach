@@ -17,6 +17,19 @@
 
 namespace gai {
 
+#ifdef _WIN32
+static std::wstring mmap_wide_path(const std::string& p) {
+    if (p.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, p.c_str(),
+                                      static_cast<int>(p.size()), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, p.c_str(), static_cast<int>(p.size()),
+                        out.data(), n);
+    return out;
+}
+#endif
+
 MappedFile::~MappedFile() { close(); }
 
 MappedFile::MappedFile(MappedFile&& o) noexcept
@@ -63,7 +76,7 @@ bool MappedFile::open(const std::string& path) {
     if (path.empty()) return false;
 #ifdef _WIN32
 
-    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ,
+    HANDLE f = CreateFileW(mmap_wide_path(path).c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;

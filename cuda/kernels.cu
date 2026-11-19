@@ -74,6 +74,7 @@ void free_workspaces() { free_workspace(); }
 size_t pool_bytes() { return g_ws_bytes; }
 
 static i32* g_pen_hist = nullptr;
+static int g_pen_hist_cap = 0;
 static int* g_pen_freq = nullptr;
 static int g_pen_freq_cap = 0;
 static i32* g_argmax_id = nullptr;
@@ -83,6 +84,7 @@ static int g_topk_cap = 0;
 
 void free_sampling_workspace() {
     if (g_pen_hist) { cudaFree(g_pen_hist); g_pen_hist = nullptr; }
+    g_pen_hist_cap = 0;
     if (g_pen_freq) { cudaFree(g_pen_freq); g_pen_freq = nullptr; }
     g_pen_freq_cap = 0;
     if (g_argmax_id) { cudaFree(g_argmax_id); g_argmax_id = nullptr; }
@@ -366,7 +368,10 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
         if (beta == 0.0f) {
             CU_CHECK(cudaMemset2D(C, sizeof(float) * ldc, 0, sizeof(float) * N, M));
         } else if (beta != 1.0f) {
-            scale_inplace(C, beta, static_cast<i64>(M) * N);
+            // C has row stride ldc, not N; the old flat scale touched wrong
+            // elements whenever ldc != N.
+            for (int r = 0; r < M; ++r)
+                scale_inplace(C + static_cast<size_t>(r) * ldc, beta, N);
         }
         return;
     }
@@ -466,7 +471,7 @@ void convert_f16_to_f32(const u16* src, float* dst, i64 n) {
 // ---- native quantized weight dequantization ------------------------------
 // GGML block layouts (32 values per block), identical to the GGUF codec:
 //   Q4_0: [f16 scale][16 bytes; low nibble = v[j], high = v[j+16]]  = (q-8)*d
-//   Q4_1: [f16 scale][f16 min][16 bytes; low = v[2j], high = v[2j+1]] = q*d+m
+//   Q4_1: [f16 scale][f16 min][16 bytes; low = v[j], high = v[j+16]] = q*d+m
 //   Q8_0: [f16 scale][32 x i8]                                     = q*d
 // One thread per output element, grid-stride loop so even the 50M-element
 // MoE expert matrices are covered without exceeding the launch grid limit.
@@ -553,14 +558,15 @@ __device__ __forceinline__ float q4_val(const u8* blk, int j, int kind) {
 }
 
 __global__ void k_linear_q4_fused(const float* __restrict__ A, const u16* __restrict__ W,
-                                  float* __restrict__ C, int M, int K, int N, int kind) {
+                                  float* __restrict__ C, int M, int K, int N, int kind,
+                                  int m_offset) {
     // One block per output row m; threads tile over the N columns.
-    const int m = blockIdx.y;
+    const int m = blockIdx.y + m_offset;
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (m >= M || n >= N) return;
     const int bpb = (kind == 0) ? 9 : (kind == 1) ? 10 : 17; // u16 per 32-value block
     const u8* wrow = reinterpret_cast<const u8*>(W + static_cast<size_t>(n) *
-                                                 ((static_cast<size_t>(K) / 32) * bpb));
+                                                 (((static_cast<size_t>(K) + 31) / 32) * bpb));
     const float* a = A + static_cast<size_t>(m) * K;
     float acc = 0.0f;
     for (int k = 0; k < K; ++k) {
@@ -574,10 +580,17 @@ void linear_forward_q4(const float* x, const u16* w, float* y,
                        int M, int K, int N, int kind) {
     if (M <= 0 || N <= 0) return;
     if (K <= 0) { CU_CHECK(cudaMemset(y, 0, sizeof(float) * static_cast<size_t>(M) * N)); return; }
+    GAI_CHECK(K % 32 == 0, "linear_forward_q4: K must be a multiple of 32");
     const int block = 128;
-    dim3 grid(grid_for(N, block), M);
-    k_linear_q4_fused<<<grid, block>>>(x, w, y, M, K, N, kind);
-    CU_CHECK(cudaGetLastError());
+    // grid.y is limited to 65535 (CUDA): keep the launch grid bounded for
+    // long prefills instead of dropping rows silently.
+    constexpr int kMaxGridY = 65535;
+    for (int m0 = 0; m0 < M; m0 += kMaxGridY) {
+        const int rows = std::min(kMaxGridY, M - m0);
+        dim3 grid(grid_for(N, block), rows);
+        k_linear_q4_fused<<<grid, block>>>(x, w, y, M, K, N, kind, m0);
+        CU_CHECK(cudaGetLastError());
+    }
 }
 
 void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, int N) {
@@ -926,14 +939,6 @@ __global__ void k_rope(float* q, float* k, const i32* pos, i64 ntok,
     }
 }
 
-void rope_forward(float* q, float* k, const i32* pos, i64 ntok,
-                  int n_heads, int n_kv, int hd, float theta) {
-    if (ntok <= 0) return;
-    GAI_CHECK(ntok <= 2147483647LL, "rope_forward: ntok exceeds INT_MAX");
-    k_rope<<<static_cast<int>(ntok), 256>>>(q, k, pos, ntok, n_heads, n_kv, hd, theta, 1.0f);
-    CU_CHECK(cudaGetLastError());
-}
-
 void rope_backward(float* dq, float* dk, const i32* pos, i64 ntok,
                    int n_heads, int n_kv, int hd, float theta) {
     if (ntok <= 0) return;
@@ -1134,6 +1139,8 @@ __global__ void k_ce(const float* logits, const i32* targets, float* dlogits,
             d[j] = __expf(row[j] - mx) * invsum * scale;
         }
         __syncthreads();
+        // dL/dlogit = p*(1 + 2*z*logZ) - onehot (the -logit_t term is
+        // unscaled). Keep in sync with cpu::softmax_cross_entropy.
         if (threadIdx.x == 0) d[tgt] -= 1.0f;
     }
 }
@@ -1259,7 +1266,7 @@ __global__ void k_rep_apply(float* logits, int V, const int* freq,
     int cnt = freq[i];
     if (cnt == 0) return;
     float l = logits[i];
-    if (rep != 1.0f) l = (l > 0.0f) ? l / rep : l * rep;
+    if (rep > 0.0f && rep != 1.0f) l = (l > 0.0f) ? l / rep : l * rep;
     if (freq_p != 0.0f) l -= freq_p * (float)cnt;
     if (pres != 0.0f) l -= pres;
     logits[i] = l;
@@ -1269,17 +1276,26 @@ void apply_rep_penalties(float* logits, int V, const i32* hist, int hist_n,
                          float rep, float freq, float pres) {
     if (V <= 0 || hist_n <= 0) return;
     if (rep == 1.0f && freq == 0.0f && pres == 0.0f) return;
-    GAI_CHECK(hist_n <= 2048, "penalties: history window exceeds 2048 (use legacy path)");
-    if (!g_pen_hist) CU_CHECK(cudaMalloc(&g_pen_hist, sizeof(i32) * 2048));
+    // No artificial 2048-token window: grow the staging buffer on demand.
+    if (!g_pen_hist || g_pen_hist_cap < hist_n) {
+        if (g_pen_hist) CU_CHECK(cudaFree(g_pen_hist));
+        CU_CHECK(cudaMalloc(&g_pen_hist, sizeof(i32) * (size_t)hist_n));
+        g_pen_hist_cap = hist_n;
+    }
     if (g_pen_freq_cap < V) {
         if (g_pen_freq) { CU_CHECK(cudaFree(g_pen_freq)); g_pen_freq = nullptr; }
         CU_CHECK(cudaMalloc(&g_pen_freq, sizeof(int) * (size_t)V));
         g_pen_freq_cap = V;
     }
+    // MUST clear the FULL table every call: k_rep_apply reads freq[i] for all
+    // i in [0,V). Clearing only the current `hist` buckets leaves (a) garbage
+    // from cudaMalloc on first use and (b) stale counts from tokens that have
+    // since left the sliding window. A 4*V byte memset is cheap (~200 KB for a
+    // 50k vocab) and is the only correct way to reset this dense table.
+    CU_CHECK(cudaMemset(g_pen_freq, 0, sizeof(int) * (size_t)V));
 
     CU_CHECK(cudaMemcpy(g_pen_hist, hist, sizeof(i32) * (size_t)hist_n,
                         cudaMemcpyHostToDevice));
-    CU_CHECK(cudaMemset(g_pen_freq, 0, sizeof(int) * (size_t)V));
     k_rep_hist<<<grid_for((i64)hist_n, 256), 256>>>(g_pen_hist, hist_n, g_pen_freq, V);
     CU_CHECK(cudaGetLastError());
     k_rep_apply<<<grid_for((i64)V, 256), 256>>>(logits, V, g_pen_freq,

@@ -74,7 +74,11 @@ inline u16 fp32_to_fp16(float f) {
         mant |= 0x800000u;
         u32 shift = static_cast<u32>(14 - exp);
         u32 sub   = mant >> shift;
-        if ((mant >> (shift - 1)) & 1u) sub += 1;
+        // Round-to-nearest-even (matches __float2half on CUDA). The previous
+        // half-up rule diverged by 1 ULP exactly at subnormal midpoints.
+        const u32 half = 1u << (shift - 1);
+        const u32 rem  = mant & ((1u << shift) - 1u);
+        if (rem > half || (rem == half && (sub & 1u))) sub += 1;
         return static_cast<u16>(sign | sub);
     }
     u16 h = static_cast<u16>(sign | (static_cast<u32>(exp) << 10) | (mant >> 13));

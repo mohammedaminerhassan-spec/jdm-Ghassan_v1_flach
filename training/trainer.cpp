@@ -1257,7 +1257,11 @@ double Trainer::evaluate(i64 max_batches) {
         ntok_total += n;
     }
     if (jit_saved != 0.0f) ops::set_moe_jitter(jit_saved);
-    return ntok_total > 0 ? total / static_cast<double>(ntok_total) : 0.0;
+    // No supervised tokens means "no measurement", not "perfect loss".
+    // Returning 0 would make the first (and every later) checkpoint look
+    // like a new best and freeze best_val at 0 forever.
+    return ntok_total > 0 ? total / static_cast<double>(ntok_total)
+                          : std::numeric_limits<double>::infinity();
 }
 
 void Trainer::log_step(double loss, float lr, double gnorm, double dt, i64 ntok) {
@@ -1662,7 +1666,7 @@ void Trainer::run_stage() {
                                 vl, std::exp(std::min(20.0, vl)),
                                 state_.best_val < 1e29 ? strfmt("%.4f", state_.best_val).c_str()
                                                        : "-"));
-                is_best = (vl < state_.best_val);
+                is_best = std::isfinite(vl) && (vl < state_.best_val);
                 if (is_best) state_.best_val = vl;
             } else {
                 model_.moe_balance_reset();
@@ -1791,6 +1795,8 @@ void Trainer::sync_gradients() {
         if (p->g.device() != Device::CUDA)
             GAI_FAIL("DDP requires all trainable grads on CUDA (param '" + p->name +
                      "' is CPU); move the model to CUDA or disable ddp");
+        GAI_CHECK(p->g.dtype() == DType::F32,
+                  "DDP gradient of '" + p->name + "' must be FP32");
         size_t numel = static_cast<size_t>(p->g.numel());
         if (numel == 0) continue;
         if (numel >= kLarge) {

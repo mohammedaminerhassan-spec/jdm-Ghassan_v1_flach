@@ -69,8 +69,6 @@ void rmsnorm_backward(const float* x, const float* weight, const float* dout,
 
 // ---- the RoPE (math_cpu.cpp)
 
-void rope_forward(float* q, float* k, const i32* pos,
-                  i64 ntok, int n_heads, int n_kv, int head_dim, float theta);
 void rope_backward(float* dq, float* dk, const i32* pos,
                    i64 ntok, int n_heads, int n_kv, int head_dim, float theta);
 

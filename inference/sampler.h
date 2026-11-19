@@ -37,7 +37,6 @@ public:
 
     i32 sample_candidates(const float* vals, const i32* ids, int K);
 
-    static double log_prob(const float* logits, int vocab, i32 token);
 
 private:
     void apply_penalties(float* logits, int vocab, const std::vector<i32>& history) const;

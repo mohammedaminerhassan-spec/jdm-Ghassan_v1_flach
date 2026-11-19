@@ -14,6 +14,17 @@
 #include <unordered_map>
 #include <vector>
 
+namespace {
+// Packed quantization blocks are byte arrays; reading a u16 through a
+// reinterpret_cast is UB on strict-alignment targets. memcpy compiles to the
+// same unaligned load where the ISA supports it.
+inline std::uint16_t load_u16(const std::uint8_t* p) {
+    std::uint16_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+}  // namespace
+
 #ifdef GAI_CUDA
 #define GAI_DISPATCH(dev, call) \
     do { if ((dev) == Device::CUDA) { cuda_ops::call; return; } cpu::call; } while (0)
@@ -300,20 +311,20 @@ const u16* quant_materialize(Device dev, const void* packed, int kind, i64 n, in
             float v;
             if (kind == 0) { // Q4_0
                 const u8* blk = p + b * 18;
-                const float sc = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                const float sc = fp16_to_fp32(load_u16(blk));
                 const u8 byte = blk[2 + (j & 15)];
                 const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
                 v = static_cast<float>(q - 8) * sc;
             } else if (kind == 1) { // Q4_1
                 const u8* blk = p + b * 20;
-                const float sc = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
-                const float mn = fp16_to_fp32(*reinterpret_cast<const u16*>(blk + 2));
+                const float sc = fp16_to_fp32(load_u16(blk));
+                const float mn = fp16_to_fp32(load_u16(blk + 2));
                 const u8 byte = blk[4 + (j & 15)];
                 const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
                 v = static_cast<float>(q) * sc + mn;
             } else { // Q8_0
                 const u8* blk = p + b * 34;
-                const float sc = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                const float sc = fp16_to_fp32(load_u16(blk));
                 v = static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[j]) * sc;
             }
             buf[static_cast<size_t>(i)] = fp32_to_fp16(v);
@@ -350,25 +361,27 @@ void linear_forward_q4(Device dev, const float* x, const void* w, float* y,
         std::vector<u16> row(static_cast<size_t>(K));
         const u8* p = reinterpret_cast<const u8*>(w);
         const int bpb = (kind == 0) ? 18 : (kind == 1) ? 20 : 34; // bytes per 32-val block
+        GAI_CHECK(K % 32 == 0, "linear_forward_q4: K must be a multiple of 32");
+        const size_t row_bytes = (static_cast<size_t>(K) / 32) * static_cast<size_t>(bpb);
         for (int n = 0; n < N; ++n) {
-            const u8* wr = p + static_cast<size_t>(n) * (static_cast<size_t>(K) / 32) * bpb;
+            const u8* wr = p + static_cast<size_t>(n) * row_bytes;
             for (int k = 0; k < K; ++k) {
                 const u8* blk = wr + static_cast<size_t>(k >> 5) * bpb;
                 float v;
                 if (kind == 0) {
-                    const float d = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                    const float d = fp16_to_fp32(load_u16(blk));
                     const int j = k & 31;
                     const u8 b = blk[2 + (j & 15)];
                     const int q = (j < 16) ? (b & 0x0F) : (b >> 4);
                     v = static_cast<float>(q - 8) * d;
                 } else if (kind == 1) {
-                    const float d = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
-                    const float mn = fp16_to_fp32(*reinterpret_cast<const u16*>(blk + 2));
+                    const float d = fp16_to_fp32(load_u16(blk));
+                    const float mn = fp16_to_fp32(load_u16(blk + 2));
                     const u8 b = blk[4 + ((k & 31) & 15)];
                     const int q = ((k & 31) < 16) ? (b & 0x0F) : (b >> 4);
                     v = static_cast<float>(q) * d + mn;
                 } else {
-                    const float d = fp16_to_fp32(*reinterpret_cast<const u16*>(blk));
+                    const float d = fp16_to_fp32(load_u16(blk));
                     v = static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[k & 31]) * d;
                 }
                 row[static_cast<size_t>(k)] = fp32_to_fp16(v);
@@ -489,11 +502,6 @@ void rmsnorm_backward(Device dev, const float* x, const float* weight, const flo
                       const float* rrms, float* dx, float* dweight,
                       i64 rows, int dim) {
     GAI_DISPATCH(dev, rmsnorm_backward(x, weight, dout, rrms, dx, dweight, rows, dim));
-}
-
-void rope_forward(Device dev, float* q, float* k, const i32* pos,
-                  i64 ntok, int n_heads, int n_kv, int head_dim, float theta) {
-    GAI_DISPATCH(dev, rope_forward(q, k, pos, ntok, n_heads, n_kv, head_dim, theta));
 }
 
 void rope_backward(Device dev, float* dq, float* dk, const i32* pos,
@@ -946,6 +954,7 @@ void moe_forward_bias_half(Device dev,
         cpu::moe_forward_bias_half(x, router_w, router_bias, g0, u0, d0, sg, su, sd,
                                    out, probs_cache, idx_cache, w_cache,
                                    s_gate, s_up, s_act, N, d, E, ne, K, SH);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
     (void)dev;

@@ -5,6 +5,7 @@
 #include "format/gguf_codec.h"
 #include "format/hf_checkpoint.h"
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -100,7 +101,7 @@ Device pick_device(const Args& a) {
 bool is_gguf_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     u32 magic = 0;
-    f.read(reinterpret_cast<char*>(&magic), 4);
+    if (!f.read(reinterpret_cast<char*>(&magic), 4) || f.gcount() != 4) return false;
     return magic == GGUF_MAGIC;
 }
 
@@ -338,10 +339,27 @@ GenerationConfig make_gen_config(const Args& a) {
     g.sampling.top_p = static_cast<float>(a.real("top-p", 0.92));
     g.sampling.min_p = static_cast<float>(a.real("min-p", 0.05));
     g.sampling.repetition_penalty = static_cast<float>(a.real("repeat", 1.12));
+    g.sampling.repetition_window = a.num_int("repeat-window", 128);
+    g.sampling.frequency_penalty = static_cast<float>(a.real("frequency-penalty", 0.0));
+    g.sampling.presence_penalty  = static_cast<float>(a.real("presence-penalty", 0.0));
     g.sampling.no_repeat_ngram = a.num_int("no-repeat-ngram", 0);
-    g.sampling.seed = static_cast<u64>(a.num("seed", 0));
+    g.sampling.seed = a.num_u64("seed", 0);
     g.sampling.greedy = a.flag("greedy", false);
     g.sampling.gpu_fast_sample = !a.flag("no-fast-sample", false);
+    // Fail fast on invalid values: validate() coerces silently (e.g. a
+    // negative --temp becomes greedy), which makes quality comparisons
+    // meaningless.
+    const SamplingConfig& s = g.sampling;
+    GAI_CHECK(std::isfinite(s.temperature) && s.temperature >= 0.0f && s.temperature <= 5.0f,
+              "--temp must be in [0,5]");
+    GAI_CHECK(std::isfinite(s.top_p) && s.top_p > 0.0f && s.top_p <= 1.0f,
+              "--top-p must be in (0,1]");
+    GAI_CHECK(std::isfinite(s.min_p) && s.min_p >= 0.0f && s.min_p < 1.0f,
+              "--min-p must be in [0,1)");
+    GAI_CHECK(s.top_k >= 0, "--top-k must be >= 0");
+    GAI_CHECK(std::isfinite(s.repetition_penalty) && s.repetition_penalty > 0.0f,
+              "--repeat must be > 0");
+    GAI_CHECK(s.repetition_window >= 0, "--repeat-window must be >= 0");
     g.sampling.validate();
     return g;
 }

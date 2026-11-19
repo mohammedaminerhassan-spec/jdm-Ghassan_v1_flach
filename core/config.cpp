@@ -248,7 +248,6 @@ i64 Config::get_int_strict(const std::string& key) const {
     i64 value = 0;
     if (full_integer_number(trim(it->second), value)) return value;
     GAI_FAIL("config: malformed int for '" + key + "': '" + it->second + "' (refusing silent default)");
-    return 0;
 }
 
 double Config::get_f64_strict(const std::string& key) const {
@@ -258,7 +257,6 @@ double Config::get_f64_strict(const std::string& key) const {
     i64 oi = 0; double od = 0.0;
     if (full_number(trim(it->second), true, oi, od)) return od;
     GAI_FAIL("config: malformed number for '" + key + "': '" + it->second + "' (refusing silent default)");
-    return 0.0;
 }
 
 bool Config::get_bool_strict(const std::string& key) const {
@@ -270,7 +268,6 @@ bool Config::get_bool_strict(const std::string& key) const {
     if (v == "true" || v == "yes" || v == "on" || v == "1") return true;
     if (v == "false" || v == "no" || v == "off" || v == "0") return false;
     GAI_FAIL("config: malformed bool for '" + key + "': '" + it->second + "' (refusing silent default)");
-    return false;
 }
 
 std::vector<std::string> Config::get_list(const std::string& key) const {

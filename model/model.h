@@ -342,7 +342,7 @@ public:
     bool fp16_weight_cache_enabled() const { return fp16_weight_cache_; }
     size_t fp16_weight_cache_bytes() const;
 
-    // The fp16 weight storage mode.
+    // The packed weight storage modes (fp16 / native Q4-Q8).
     //
     // The big matrices are stored on the device in half precision: 12.9 GiB
     // for the 6.94B Granite instead of the 25.9 GiB of fp32 masters, which
@@ -355,7 +355,6 @@ public:
     //
     // The mode is chosen when the model is built (the storage dtype of a
     // parameter cannot change afterwards).
-    bool fp16_weight_storage_enabled() const { return weight_f16_; }
     // Native quantized weight storage: packed Q4/Q8 weights stay resident and
     // are dequantized into a shared FP16 scratch buffer per op.
     bool quant_weight_storage_enabled() const { return weight_q4_; }
@@ -368,7 +367,8 @@ public:
     const float* rope_inv_freq_ptr() const;
 
     Tensor& forward(const i32* ids, int B, int T, Activations& act,
-                    const i32* segment_ids = nullptr);
+                    const i32* segment_ids = nullptr,
+                    bool reset_mamba_states = true);
 
     // NOTE: an `embed_override` overload used to be declared here but was
     // never defined (and never called): Generator::forward_prefill applies
@@ -426,6 +426,14 @@ public:
     // After this call the adapter parameters are zeroed and the model
     // computes exactly the same function as the trained adapter.
     void merge_lora();
+    // The LoRA delta for one base parameter, in fp32, laid out like the
+    // weight ([out, in], row-major). Returns true when `name` is a base
+    // weight that has an ENABLED adapter (q/k/v/o always, gate/up/down on
+    // dense FFN); otherwise returns false and leaves `out` untouched.
+    // Used by the safetensors/GGUF exporters to fold adapters into the
+    // exported weights without round-tripping the delta through the base
+    // storage dtype (Q4 requantization would swallow it).
+    bool lora_delta_for(const std::string& name, std::vector<float>& out) const;
     // True when the model carries at least one trainable LoRA adapter.
     bool has_lora() const { return cfg_.lora_rank > 0; }
     // Trainable parameter count (the LoRA adapters when LoRA is on, every
@@ -434,7 +442,6 @@ public:
 
     void ensure_moe_bias();
     const float* moe_bias_ptr(int layer) const;
-    float* moe_bias_ptr_mut(int layer);
     void update_moe_bias(int layer, const float* frac_host, int ne);
     void set_moe_bias(int layer, const float* values, size_t count);
     const std::vector<std::vector<float>>& moe_bias_all() const { return moe_bias_; }
@@ -477,7 +484,7 @@ private:
     void forward_mamba_layer(Device dev, int l, Activations& act, i64 N);
 
     void forward_body(const i32* ids, int B, int T, Activations& act,
-                      const i32* segment_ids);
+                      const i32* segment_ids, bool reset_mamba_states);
     // (The embed_override overload was removed: see the note at forward().)
 
     ModelConfig cfg_;

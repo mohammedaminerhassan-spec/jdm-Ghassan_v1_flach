@@ -876,8 +876,18 @@ bool GGUFReader::read_tensor_info(std::istream& is, uint64_t count) {
         if (!read_pod(is, ti.offset)) return false;
         // Fill the byte count (the header declared it but never populated it):
         // numel = product of dimensions, bytes depend on the GGML dtype.
-        i64 numel = 1;
-        for (uint64_t d : ti.dimensions) numel *= static_cast<i64>(d);
+        u64 numel = 1;
+        for (uint64_t d : ti.dimensions) {
+            if (d != 0 && numel > (UINT64_MAX / d)) {
+                log_error("gguf_format: tensor dimension overflow for " + ti.name);
+                return false;
+            }
+            numel *= d;
+        }
+        if (numel == 0 || numel > static_cast<u64>(INT64_MAX)) {
+            log_error("gguf_format: invalid element count for " + ti.name);
+            return false;
+        }
         size_t type_size = 0, block = 1;
         switch (ti.type) {
             case GGMLType::F32: type_size = 4; break;
@@ -887,8 +897,12 @@ bool GGUFReader::read_tensor_info(std::istream& is, uint64_t count) {
             case GGMLType::Q4_1: type_size = 20; block = 32; break;
             default: type_size = 0; break;
         }
-        if (type_size && numel > 0)
-            ti.nbytes = static_cast<uint64_t>((numel + block - 1) / block) * type_size;
+        if (type_size == 0) {
+            log_error(strfmt("gguf_format: tensor '%s' uses unsupported GGML type %u",
+                             ti.name.c_str(), static_cast<uint32_t>(ti.type)));
+            return false;
+        }
+        ti.nbytes = static_cast<uint64_t>((numel + block - 1) / block) * type_size;
         tensor_infos_.push_back(std::move(ti));
     }
     return true;
@@ -1163,6 +1177,10 @@ ModelConfig GGUFReader::model_config() const {
         c.max_seq_len       = static_cast<int>(get_uint("llama.context_length", static_cast<uint64_t>(c.max_seq_len)));
         c.rope_theta        = get_float("llama.rope.freq_base", c.rope_theta);
         c.rms_eps           = get_float("llama.attention.layer_norm_rms_epsilon", c.rms_eps);
+        // Persisted by --compat llama; without it the reader's default
+        // (neox, rope_type=1) disagrees with the interleaved export.
+        c.rope_type         = static_cast<int>(get_uint("llama.rope.type",
+                                                        static_cast<uint64_t>(c.rope_type)));
         c.tie_embeddings    = get_bool("llama.tie_word_embeddings", true);
 
         const uint64_t ne = get_uint("llama.expert_count", 0);
@@ -1412,8 +1430,9 @@ Tensor GGUFReader::read_tensor_raw(const std::string& name) const {
             }
         }
     } else {
-        GAI_FAIL("gguf_format: unsupported quantization type for reading: " +
-                 std::to_string(static_cast<uint32_t>(ti->type)));
+        log_error(strfmt("gguf_format: unsupported quantization type %u for tensor '%s'",
+                         static_cast<uint32_t>(ti->type), name.c_str()));
+        return Tensor();
     }
 
     if (nonfinite > 0) {
@@ -1534,9 +1553,11 @@ bool load_model_from_gguf(const std::string& path, Model& model, int quant_kind)
             const GGUFTensorInfo* ti = r.find_tensor(bn);
             if (!ti) continue;
             Tensor t = r.read_tensor_f32(bn);
-            float* dst = model.moe_bias_ptr_mut(l);
-            if (dst && t.numel() == model.config().num_experts)
-                std::memcpy(dst, t.data_ptr(), sizeof(float) * static_cast<size_t>(t.numel()));
+            // set_moe_bias() performs the host->device copy on CUDA; writing
+            // into moe_bias_ptr_mut() (host-only) silently left the device
+            // bias at zero.
+            if (t.defined() && t.numel() == model.config().num_experts)
+                model.set_moe_bias(l, t.f32(), static_cast<size_t>(t.numel()));
         }
     }
     return true;
@@ -1710,8 +1731,12 @@ void export_model_gguf(const std::string& path, Model& model,
     // so the file still reloads with identical behaviour.
     w.add_custom_metadata("general.version", meta_str("version", "1.0"));
     w.add_custom_metadata("general.author", meta_str("author", "Ghassan AI"));
-    w.set_description(meta_str("description", "Ghassan v1 Flash - by team Ghassan AI"));
+    w.set_description(meta_str("description", "Ghassan v1 Flash - by team Ghassan AI. Derived from IBM Granite-4.0 (Apache-2.0), copyright IBM Corp. and contributors."));
     w.set_general_type("model");
+    // Apache-2.0 section 4(d): the derived artifact retains the upstream
+    // copyright notice. The license id is part of the file's metadata so a
+    // converter cannot silently drop it.
+    w.add_custom_metadata("general.license", "apache-2.0");
     // No base_model / base_org field is written at all: the artifact is a
     // standalone "Ghassan v1 Flash" from team Ghassan AI, like any other
     // release. The geometry stays in ghassan.* metadata so the engine can
@@ -1739,6 +1764,8 @@ void export_model_gguf(const std::string& path, Model& model,
     af32("attention.layer_norm_rms_epsilon", cfg.rms_eps);
     au64("rope.dimension_count", static_cast<uint64_t>(cfg.head_dim()));
     af32("rope.freq_base", cfg.rope_theta);
+    if (want_llama || want_moe)
+        au64("rope.type", static_cast<uint64_t>(cfg.rope_type));
     au64("context_length", static_cast<uint64_t>(cfg.max_seq_len));
     w.add_custom_metadata(akey("tie_word_embeddings"), cfg.tie_embeddings);
     if (want_moe) {
@@ -1815,7 +1842,20 @@ void export_model_gguf(const std::string& path, Model& model,
     }
     w.set_tokenizer_tokens(tok.vocab_entries());
     {
+        // Derive real merge scores instead of writing an all-zero array.
+        // GGUF consumers use tokenizer.ggml.scores to rank competing BPE
+        // merges; rank order from tokenizer.json is the best available proxy
+        // (higher score = earlier merge). Tokens not produced by a merge keep
+        // 0, which is the conventional neutral score.
         std::vector<float> scores(static_cast<size_t>(tok.vocab_size()), 0.0f);
+        const auto merges = tok.merge_pairs_ordered();
+        const float top = static_cast<float>(merges.size());
+        for (size_t r = 0; r < merges.size(); ++r) {
+            const std::string piece = merges[r].first + merges[r].second;
+            const i32 id = tok.token_to_id(piece);
+            if (id >= 0 && static_cast<size_t>(id) < scores.size())
+                scores[static_cast<size_t>(id)] = top - static_cast<float>(r);
+        }
         w.set_tokenizer_scores(scores);
         std::vector<int32_t> types;
         types.reserve(static_cast<size_t>(tok.vocab_size()));
@@ -1905,7 +1945,12 @@ void export_model_gguf(const std::string& path, Model& model,
     // error exponentially.
     ExportProfileGGUF prof = profile;
     prof.hybrid = (cfg.arch == ModelConfig::ArchGranite);
+    size_t exported_tensors = 0;
     for (Parameter* p : model.parameters()) {
+        // The LoRA adapters are folded into the base weight inside the
+        // producer below (see lora_delta_for): emitting them as separate
+        // tensors would add bogus entries no consumer can load.
+        if (p->name.find(".lora_") != std::string::npos) continue;
         GGMLType dt = gguf_dtype_for(p->name, prof);
         std::string wname = p->name;
         std::vector<i64> shape = p->shape;
@@ -1935,9 +1980,18 @@ void export_model_gguf(const std::string& path, Model& model,
         }
         size_t est = ggml_nbytes(dt, static_cast<size_t>(p->numel()));
         total_bytes += static_cast<u64>(est);
-        auto producer = [p, reshape, &cfg]() -> Tensor {
+        auto producer = [&model, p, reshape, &cfg]() -> Tensor {
             Tensor cpu = p->w.to(Device::CPU);
             if (cpu.dtype() != DType::F32) cpu = quant::dequantize(cpu, DType::F32);
+            // Fold the LoRA delta (fp32) into the dequantized base: the
+            // exported artifact is the merged model, self-contained. This
+            // is exact - the delta never round-trips through Q4/Q8.
+            std::vector<float> delta;
+            if (model.lora_delta_for(p->name, delta)) {
+                GAI_CHECK(delta.size() == static_cast<size_t>(cpu.numel()),
+                          "gguf export: the LoRA delta size does not match the base weight " + p->name);
+                for (i64 i = 0; i < cpu.numel(); ++i) cpu.f32()[i] += delta[static_cast<size_t>(i)];
+            }
             if (reshape == 1)
                 return reshape_3d(cpu, cfg.num_experts, cfg.moe_expert_dim,
                                   static_cast<i64>(cfg.hidden_size));
@@ -1947,6 +2001,7 @@ void export_model_gguf(const std::string& path, Model& model,
             return cpu;
         };
         w.add_tensor_deferred(wname, shape, dt, producer);
+        ++exported_tensors;
 
         if ((want_llama || want_moe) && p->name == "tok_embeddings" && cfg.tie_embeddings) {
             size_t est2 = ggml_nbytes(dt, static_cast<size_t>(p->numel()));
@@ -1971,7 +2026,7 @@ void export_model_gguf(const std::string& path, Model& model,
 
     log_info(strfmt("[gguf] exported %s  profile=%s compat=%s self_contained=yes  tensors=%zu  weights=%s",
                     path.c_str(), profile.name.c_str(), compat.c_str(),
-                    model.parameters().size(),
+                    exported_tensors,
                     human_bytes(total_bytes).c_str()));
 
     // ---- the precision report: what each tensor kept.

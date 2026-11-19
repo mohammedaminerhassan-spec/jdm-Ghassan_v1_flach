@@ -152,7 +152,10 @@ void Tensor::copy_from_f32(const Tensor& src) {
     // fp32 path.
     GAI_CHECK(src.device() == Device::CPU,
               "copy_from_f32: the source must live on the host");
-    std::vector<u16> half(static_cast<size_t>(numel_));
+    // Reuse a per-thread scratch: this runs for every weight-cache refresh,
+    // and allocating a numel-sized vector each time fragments the heap.
+    thread_local std::vector<u16> half;
+    half.resize(static_cast<size_t>(numel_));
     const float* src_f = src.f32();
     for (i64 i = 0; i < numel_; ++i) half[static_cast<size_t>(i)] = fp32_to_fp16(src_f[i]);
     device_copy(data_ptr(), device_, half.data(), Device::CPU,

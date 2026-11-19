@@ -16,6 +16,7 @@ public:
     i64         num(const std::string& k, i64 def = 0) const;
     int         num_int(const std::string& k, int def = 0) const;
     u64         num_u64(const std::string& k, u64 def = 0) const;
+    u64         num_u64_strict(const std::string& k) const;
     double      real(const std::string& k, double def = 0.0) const;
     bool        flag(const std::string& k, bool def = false) const;
 

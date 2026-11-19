@@ -20,9 +20,11 @@ enum class ChatTemplate : u8 {
 //   <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n
 //   <|im_start|>assistant\n...<|im_end|>\n
 //
-// There are no engine-invented prompts: no default system message, no
-// language routing, no persona logic. A system message is rendered only
-// when the caller (or the user) explicitly supplies one.
+// There is no language routing and no persona logic. ChatML renders a
+// system turn only when the caller supplies one. The Granite-4 template is
+// the exception: its reference format always opens with a system turn, so
+// render_granite() inserts the checkpoint's default system sentence when
+// the caller supplies none (documented explicitly to avoid ambiguity).
 enum class Role : u8 { System = 0, User = 1, Assistant = 2 };
 
 struct Message {
@@ -58,8 +60,10 @@ std::vector<i32> encode_chatml(const Tokenizer& tk,
 //   <|start_of_role|>assistant<|end_of_role|>
 //
 // The loss mask covers the assistant content and its <|end_of_text|> turn
-// terminator only. No engine-invented default system message is added: a
-// system turn is rendered only when the caller supplies one.
+// terminator only. As with the ChatML notes above, render_granite() inserts
+// the reference system turn when the caller supplies none; the text comes
+// from the checkpoint's chat template in the reference format and is
+// reproduced here so the prompt matches the training distribution.
 std::vector<ChatSegment> render_granite(const Tokenizer& tk,
                                         const std::vector<Message>& msgs,
                                         bool add_generation_prompt);

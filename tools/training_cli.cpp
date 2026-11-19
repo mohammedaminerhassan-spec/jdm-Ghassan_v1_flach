@@ -52,6 +52,9 @@ static void usage() {
     "  --build-shards <dir>   tokenize the .txt documents of <dir> (one per line)\n"
     "                        into the .gbin shards the loader reads, with the\n"
     "                        engine's own tokenizer. --shard-prefix train --shard-tokens N\n"
+    "                        Parquet/CSV/JSON: convert first with tools/py/prepare_dataset.py\n"
+    "                        (no native Parquet reader in the engine yet); .jsonl instruction\n"
+    "                        datasets under --data are auto-converted to .gbin.\n"
     "  --strict-config        unknown/dead config keys fail instead of warning\n"
     "  --dry-run              arithmetic-only memory/schedule estimate (allocates nothing)\n"
     "  --max-vram-mb <n>      pre-flight gate: fail if the predicted peak exceeds n MiB\n"
@@ -195,7 +198,10 @@ int main(int argc, char** argv) {
                 }
                 log_info(strfmt("[sft ] pretrained checkpoint: %s (HuggingFace safetensors, %d layers, d=%d)",
                                 pc.c_str(), hc.num_layers, hc.hidden_size));
-                // The trainer loads the weights (it owns the pretrained path).
+                // The CLI owns this checkpoint: load it here instead of doing
+                // a full random init only to overwrite it in the Trainer.
+                weights_loaded_by_cli = true;
+                tcfg.pretrained_loaded = true;
             }
         }
 
@@ -276,7 +282,7 @@ if (args.has("resume-mode")) {
             if (tcfg.ce_chunks <= 0) tcfg.ce_chunks = 1;
             if (tcfg.ce_chunks > 32) tcfg.ce_chunks = 32;
         }
-        if (args.has("seed"))            tcfg.seed = static_cast<u64>(strict_args ? args.num_strict("seed") : args.num("seed"));
+        if (args.has("seed"))            tcfg.seed = strict_args ? args.num_u64_strict("seed") : args.num_u64("seed", 0);
         if (args.has("device"))          tcfg.device = args.str("device");
         if (args.has("log-every"))       tcfg.log_every = strict_args ? args.num_strict("log-every") : args.num("log-every");
         if (args.has("eval-every"))      tcfg.eval_every = strict_args ? args.num_strict("eval-every") : args.num("eval-every");
@@ -368,9 +374,14 @@ print_device_report();
             GAI_CHECK(cuda_available(), "--device cuda requested but no CUDA device is available");
             dev = Device::CUDA;
         } else if (tcfg.device == "tpu" || tcfg.device == "metal" || tcfg.device == "vulkan") {
-            GAI_FAIL("--device " + tcfg.device + " is not supported: T4-only build (auto|cpu|cuda)");
+            log_warn("--device " + tcfg.device + " has no native backend; falling back to CPU "
+                     "(portable OpenMP kernels), same as the inference CLI");
+            dev = Device::CPU;
         } else if (tcfg.device == "auto") {
             dev = best_device();
+        } else if (tcfg.device != "cpu") {
+            GAI_FAIL("unknown --device '" + tcfg.device + "' (use auto|cpu|cuda; "
+                     "tpu/metal/vulkan have no native backend)");
         }
 
         // ---- the shard builder (a mode, not a training step) ----
@@ -582,22 +593,13 @@ print_device_report();
 
         if (args.has("export")) {
             // A LoRA run trains adapters; the exported model must be a plain
-            // dense checkpoint, so the adapters are folded into the base
-            // weights first.
-            //
-            // With the half weight storage the base weights have no fp32
-            // master to merge into (that is the point: 12.9 GB instead of
-            // 27.7 GB). The adapters are then exported as they are, next to
-            // the half base: a PEFT-style checkpoint.
+            // checkpoint. The exporters (safetensors and GGUF) already fold
+            // the adapters into the base weights at write time, in fp32,
+            // directly from the base's own storage dtype - no merge pass and
+            // no Q4 round-trip of the delta, so this works the same for an
+            // fp16 run, a QLoRA run and a plain fp32 run.
             if (model.has_lora()) {
-                if (model.fp16_weight_storage_enabled()) {
-                    log_info("[expt] the base weights are in half precision: the "
-                             "adapters are exported as they are (no merge) - a "
-                             "PEFT-style checkpoint (base + adapters)");
-                } else {
-                    log_info("[expt] merging the LoRA adapters into the base weights");
-                    model.merge_lora();
-                }
+                log_info("[expt] the LoRA adapters are folded into the exported weights");
             }
             int my_rank = 0;
             if (const char* rank_env = std::getenv("RANK")) {
@@ -610,7 +612,8 @@ print_device_report();
             } else {
                 std::string prof = args.str("export-profile", "q8_k");
 
-                std::string tok_path = args.str("tokenizer", cfg.get_str("tokenizer.path", ""));
+                // Reuse the path resolved at 303-317: redeclaring it here
+                // discarded the config-relative resolution and broke --export.
                 Tokenizer etok;
                 if (!have_hf_tok && !tok_path.empty()) {
                     std::vector<i32> e_ids;
@@ -637,7 +640,8 @@ print_device_report();
                     // tokenizer lives there even if --tokenizer was not given.
                     const std::string tok_src = !tok_path.empty() ? tok_path
                         : (hf ? mdir : std::string());
-                    copy_tokenizer_files(tok_src, args.str("export"));
+                    GAI_CHECK(copy_tokenizer_files(tok_src, args.str("export")),
+                              "the tokenizer files were not copied into " + args.str("export"));
                 } else {
                     GAI_CHECK(fmt == "gguf", "unknown --export-format '" + fmt +
                                            "' (gguf|safetensors)");

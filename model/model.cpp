@@ -197,13 +197,6 @@ const float* Model::moe_bias_ptr(int layer) const {
     return moe_bias_dev_[static_cast<size_t>(layer)].f32();
 }
 
-float* Model::moe_bias_ptr_mut(int layer) {
-    if (!cfg_.use_moe || !cfg_.moe_aux_free) return nullptr;
-    ensure_moe_bias();
-    if (layer < 0 || static_cast<size_t>(layer) >= moe_bias_.size()) return nullptr;
-    return moe_bias_[static_cast<size_t>(layer)].data();
-}
-
 void Model::update_moe_bias(int layer, const float* frac_host, int ne) {
     if (!cfg_.use_moe || !cfg_.moe_aux_free || !frac_host || ne <= 0) return;
     ensure_moe_bias();
@@ -302,7 +295,15 @@ void Model::apply_moe_bias_step(const float* global_count_sum, bool apply) {
         // masked SFT microbatch can never desync the two.
         double row_sum = 0.0;
         for (int e = 0; e < ne; ++e) row_sum += static_cast<double>(global_count_sum[base + e]);
-        const double inv = (row_sum > 0.0) ? 1.0 / row_sum : 0.0;
+        // row_sum is the number of ROUTED SLOTS (N * top_k). DeepSeek's
+        // steering rule uses load_e = count_e / N (a fraction of TOKENS,
+        // summing to top_k) against target = top_k / ne. Using count_e /
+        // row_sum (sum = 1) against that target scales every update by
+        // 1/top_k and points it at the wrong center. Divide by the number
+        // of routed tokens instead.
+        const double routed_tokens = row_sum /
+            static_cast<double>(cfg_.moe_top_k > 0 ? cfg_.moe_top_k : 1);
+        const double inv = (routed_tokens > 0.0) ? 1.0 / routed_tokens : 0.0;
         if (inv <= 0.0) continue;   // layer routed nothing this step
         for (int e = 0; e < ne; ++e)
             frac[static_cast<size_t>(e)] =
@@ -354,22 +355,34 @@ void ModelConfig::validate() const {
     GAI_CHECK(rope_scale <= 8.0f, "rope_scale must be <= 8.0 (larger is unvalidated extrapolation)");
     GAI_CHECK(std::isfinite(z_loss_scale) && z_loss_scale >= 0.0f && z_loss_scale <= 0.01f,
               "z_loss_scale must be finite and in [0,0.01]");
+    // logits_scaling is used as a divisor in forward and backward; 0 or a
+    // non-finite value would silently NaN the whole run.
+    GAI_CHECK(std::isfinite(logits_scaling) && logits_scaling > 0.0f,
+              "logits_scaling must be finite and > 0");
+    GAI_CHECK(std::isfinite(embedding_multiplier) && std::isfinite(residual_multiplier) &&
+              std::isfinite(attention_multiplier),
+              "multipliers must be finite");
     GAI_CHECK(std::isfinite(moe_jitter) && moe_jitter >= 0.0f && moe_jitter <= 0.5f,
               "moe_jitter must be finite and in [0,0.5]");
     GAI_CHECK(std::isfinite(rope_yarn_mscale) && rope_yarn_mscale >= 0.0f && rope_yarn_mscale <= 2.0f,
               "rope_yarn_mscale must be finite and in [0,2]");
-    // ---- Pro fields (default OFF = bit-identical legacy; فعلها فقط لـPro جديد)
+    // ---- Pro fields (default OFF = bit-identical legacy; opt in only for new Pro runs)
     GAI_CHECK(std::isfinite(rope_yarn_low) && rope_yarn_low >= 1.0f && rope_yarn_low <= 128.0f,
               "rope_yarn_low must be finite and in [1,128]");
     GAI_CHECK(std::isfinite(rope_yarn_high) && rope_yarn_high >= 1.0f && rope_yarn_high <= 128.0f,
               "rope_yarn_high must be finite and in [1,128]");
     GAI_CHECK(rope_yarn_high >= rope_yarn_low, "rope_yarn_high must be >= rope_yarn_low");
     GAI_CHECK(sliding_window >= 0 && sliding_window <= 16384, "sliding_window must be in [0,16384]");
+    // The engine has no in_proj/out_proj bias parameters for Mamba-2. Refuse
+    // the flag instead of silently ignoring checkpoints that carry them.
+    GAI_CHECK(!mamba_proj_bias,
+              "mamba_proj_bias=true is not implemented (no in_proj/out_proj bias tensors)");
     GAI_CHECK(rope_type == 0 || rope_type == 1, "rope_type must be 0 (interleaved) or 1 (neox)");
     // NeoX kernels (CPU+CUDA) implemented: rope_type=1 allowed for new Pro checkpoints.
     // Interleaved stays default for bit-identical legacy resumes.
     if (moe_aux_free && moe_aux_scale != 0.0f) {
-        // aux-loss-free تعني لا aux grad: نفرض scale=0 بصوت عال بدل تجاهل صامت.
+        // Aux-loss-free means there is no aux gradient: require scale == 0 loudly
+        // instead of ignoring it silently.
         GAI_CHECK(false, "moe_aux_free=true requires moe_aux_scale: 0.0 (aux-loss-free has no aux grad)");
     }
     if (use_moe) {
@@ -453,8 +466,8 @@ ModelConfig ModelConfig::from_config(const Config& c, const std::string& p) {
                   std::string("model.") + k + " out of int range");
         return static_cast<int>(v);
     };
-    // PRO: sliding_window/rope_type يقبلان 0 (off/interleaved) — الفاحص
-    // العام v>0 كان يرفض القيمة الصحيحة 0. فاحص >=0 منفصل لهما.
+    // PRO: sliding_window/rope_type accept 0 (off/interleaved) - the generic v>0
+    // check rejected a valid 0, so they get their own >=0 check.
     auto get_int_checked0 = [&](const char* k, int def) {
         i64 v = c.get_int(key(k), static_cast<i64>(def));
         GAI_CHECK(v >= 0 && v <= static_cast<i64>(std::numeric_limits<int>::max()),
@@ -537,6 +550,7 @@ ModelConfig ModelConfig::from_config(const Config& c, const std::string& p) {
         }
     }
     m.use_qk_norm       = c.get_bool(key("use_qk_norm"), m.use_qk_norm);
+    m.use_qkv_bias      = c.get_bool(key("use_qkv_bias"), m.use_qkv_bias);
     m.z_loss_scale      = c.get_f32(key("z_loss_scale"), m.z_loss_scale);
     m.rope_scale        = c.get_f32(key("rope_scale"), m.rope_scale);
     m.rope_yarn_mscale  = c.get_f32(key("rope_yarn_mscale"), m.rope_yarn_mscale);
@@ -569,15 +583,17 @@ static float rope_theta_eff_local(const ModelConfig& m) {
 
 // YaRN attention rescale (DeepSeek long-ctx): mscale = 0.1*ln(scale)+1.
 // Multiplies the 1/sqrt(hd) scale so entropy stays flat at 8k ctx.
-// PRO: مع yarn_low/high نطبق ramp الكامل (YaRN paper §3): الأبعاد ذات الطول
-// الموجي < low تبقى خطية، > high تستكمل NTK، وبينهما interpolation سلس.
-// mscale هنا للـattention-temperature؛ الـramp الكامل للـtheta يبقى NTK
-// (theta_eff أعلاه) حتى ترحيل الـkernel — نفس سلوك legacy عند low=1/high=32.
+// PRO: with yarn_low/high we apply the full ramp (YaRN paper section 3): the
+// dimensions whose wavelength < low stay linear, > high defer to NTK, and in
+// between an interpolation is applied smoothly.
+// mscale here is the attention temperature; the full ramp for theta stays NTK
+// (theta_eff above) until the kernel is migrated - at low=1/high=32 this is
+// bit-identical to the legacy path.
 static float rope_mscale_local(const ModelConfig& m) {
     if (m.rope_scale <= 1.0f) return 1.0f;
     if (m.rope_yarn_mscale > 0.0f) return m.rope_yarn_mscale;
-    // ramp factor: يحفظ mscale الأصلي عند الإعداد الافتراضي (low=1/high=32
-    // يعطي نفس 0.1*ln+1 ضمن 1%) ويتيح ضبطا دقيقا لاحقا.
+    // ramp factor: keeps the original mscale at the default settings
+    // (low=1/high=32 yields the same 0.1*ln+1 within 1%) and enables fine tuning later.
     float base = 0.1f * std::log(m.rope_scale) + 1.0f;
     if (m.rope_yarn_low <= 1.0f && m.rope_yarn_high >= 32.0f) return base;
     float span = m.rope_yarn_high - m.rope_yarn_low;
@@ -667,6 +683,14 @@ bool ModelConfig::same_architecture_as(const ModelConfig& o, std::string* reason
     if (mamba_n_groups != o.mamba_n_groups) return fail("mamba_n_groups differs");
     if (mamba_d_conv != o.mamba_d_conv) return fail("mamba_d_conv differs");
     if (mamba_expand != o.mamba_expand) return fail("mamba_expand differs");
+    // These change the function computed without changing weight shapes;
+    // checkpoint.cpp::arch_match and arch_identity() already compare them.
+    if (mamba_chunk_size != o.mamba_chunk_size) return fail("mamba_chunk_size differs");
+    if (mamba_conv_bias != o.mamba_conv_bias) return fail("mamba_conv_bias differs");
+    if (mamba_proj_bias != o.mamba_proj_bias) return fail("mamba_proj_bias differs");
+    if (rope_yarn_low != o.rope_yarn_low) return fail("rope_yarn_low differs");
+    if (rope_yarn_high != o.rope_yarn_high) return fail("rope_yarn_high differs");
+    if (moe_jitter != o.moe_jitter) return fail("moe_jitter differs");
     return true;
 }
 
@@ -951,7 +975,10 @@ DType Model::storage_dtype_for(const std::string& name) const {
             name.find("norm") != std::string::npos ||
             name.find("qk_qnorm") != std::string::npos ||
             name.find("qk_knorm") != std::string::npos ||
-            name.find("bias") != std::string::npos;
+            name.find("bias") != std::string::npos ||
+            name.find(".bq") != std::string::npos ||
+            name.find(".bk") != std::string::npos ||
+            name.find(".bv") != std::string::npos;
         if (fragile) return DType::F32;
         return q4_kind_ == 0 ? DType::Q4_0 : q4_kind_ == 1 ? DType::Q4_1 : DType::Q8_0;
     }
@@ -983,7 +1010,12 @@ DType Model::storage_dtype_for(const std::string& name) const {
         name.find("norm") != std::string::npos ||      // attn_norm, ffn_norm, final_norm, mamba norm
         name.find("qk_qnorm") != std::string::npos ||
         name.find("qk_knorm") != std::string::npos ||
-        name.find("bias") != std::string::npos;
+        name.find("bias") != std::string::npos ||
+        // QKV biases are named layers.N.bq/.bk/.bv: keep them FP32 too,
+        // otherwise add_bias() reinterprets half/quantized bytes as floats.
+        name.find(".bq") != std::string::npos ||
+        name.find(".bk") != std::string::npos ||
+        name.find(".bv") != std::string::npos;
     return fragile ? DType::F32 : DType::F16;
 }
 
@@ -1084,6 +1116,15 @@ Model::Model(ModelConfig cfg, Device dev, bool fp16_weights, int quant_kind)
             alloc_param(L.wk,        pre + "wk",        {kvd, d}, true);
             alloc_param(L.wv,        pre + "wv",        {kvd, d}, true);
             alloc_param(L.wo,        pre + "wo",        {d, qd},  true);
+            if (cfg_.use_qkv_bias) {
+                // Qwen2/3-style attention biases. They used to be declared in
+                // LayerParams but never allocated: has_qkv_bias() was always
+                // false and checkpoints carrying them were silently loaded
+                // without these vectors.
+                alloc_param(L.bq, pre + "bq", {qd},  false);
+                alloc_param(L.bk, pre + "bk", {kvd}, false);
+                alloc_param(L.bv, pre + "bv", {kvd}, false);
+            }
         }
         if (cfg_.use_qk_norm) {
             const i64 hd = cfg_.head_dim();
@@ -1218,6 +1259,11 @@ ParamReport Model::parameter_report() const {
     add("attn.wk   [kv_dim, d]", kvd * d, n_attn);
     add("attn.wv   [kv_dim, d]", kvd * d, n_attn);
     add("attn.wo   [d, q_dim]",  d * qd,  n_attn);
+    if (cfg_.use_qkv_bias) {
+        add("attn.bq   [q_dim]",  qd,  n_attn);
+        add("attn.bk   [kv_dim]", kvd, n_attn);
+        add("attn.bv   [kv_dim]", kvd, n_attn);
+    }
     if (n_mamba > 0) {
         const i64 proj = static_cast<i64>(cfg_.mamba_expand) * d + 2 * cfg_.mamba_n_groups * cfg_.mamba_d_state + cfg_.mamba_n_heads;
         add("mamba.in_proj [proj, d]", proj * d, n_mamba);
@@ -1238,16 +1284,21 @@ ParamReport Model::parameter_report() const {
             add("moe.shared.down [d, SH]", d * SH, L);
         }
     } else {
-        add("ffn.gate  [ffn, d]",    F * d,   n_attn);
-        add("ffn.up    [ffn, d]",    F * d,   n_attn);
-        add("ffn.down  [d, ffn]",    d * F,   n_attn);
+        // Every layer owns a dense FFN (unlike the attention projection or the
+        // mamba blocks): count with L, not n_attn, or a hybrid config that
+        // reached this branch would silently under-report it.
+        add("ffn.gate  [ffn, d]",    F * d,   L);
+        add("ffn.up    [ffn, d]",    F * d,   L);
+        add("ffn.down  [d, ffn]",    d * F,   L);
     }
-    add("attn_norm [d]",         d,       n_attn);
+    // Every layer (mamba included) owns an attn_norm; ffn_norm is also
+    // allocated for every layer. qk norms only exist on attention layers.
+    add("attn_norm [d]",         d,       L);
     add("ffn_norm  [d]",         d,       L);
     if (cfg_.use_qk_norm) {
         const i64 hd = cfg_.head_dim();
-        add("qk_qnorm  [hd]", hd, L);
-        add("qk_knorm  [hd]", hd, L);
+        add("qk_qnorm  [hd]", hd, n_attn);
+        add("qk_knorm  [hd]", hd, n_attn);
     }
     add("final_norm [d]",        d,       1);
     if (!cfg_.tie_embeddings) add("lm_head [V, d]", cfg_.vocab_size * d, 1);
@@ -1445,6 +1496,51 @@ void Model::merge_lora() {
     // The fp16 cache (if any) now holds stale values.
     mark_weights_dirty();
     log_info(strfmt("[lora] merged %d adapters into the base weights", (int)jobs.size()));
+}
+
+bool Model::lora_delta_for(const std::string& name, std::vector<float>& out) const {
+    if (cfg_.lora_rank <= 0) return false;
+
+    struct Pair { const Parameter* base; const LoraAdapter* adapter; };
+    for (const LayerParams& L : layers_) {
+        const Pair pairs[] = {
+            {&L.wq, &L.lora_q},
+            {&L.wk, &L.lora_k},
+            {&L.wv, &L.lora_v},
+            {&L.wo, &L.lora_o},
+            {&L.w_gate, &L.lora_gate},
+            {&L.w_up, &L.lora_up},
+            {&L.w_down, &L.lora_down},
+        };
+        for (const Pair& pr : pairs) {
+            const LoraAdapter& ad = *pr.adapter;
+            if (!pr.base->name.empty() && pr.base->name == name && ad.enabled) {
+                const int r = ad.rank;
+                const int in_d = ad.in_dim;
+                const int out_d = ad.out_dim;
+                GAI_CHECK(r > 0 && in_d > 0 && out_d > 0,
+                          "lora_delta_for: adapter with non-positive geometry");
+                GAI_CHECK(ad.A.w.numel() == static_cast<i64>(r) * in_d &&
+                              ad.B.w.numel() == static_cast<i64>(out_d) * r,
+                          "lora_delta_for: adapter shape does not match the base weight");
+                const float sc = ad.scale();
+                const float* a = ad.A.w.f32();
+                const float* b = ad.B.w.f32();
+                out.assign(static_cast<size_t>(out_d) * static_cast<size_t>(in_d), 0.0f);
+                // delta[o, i] = sc * sum_r B[o, r] * A[r, i]
+                for (int o = 0; o < out_d; ++o) {
+                    float* drow = out.data() + static_cast<size_t>(o) * static_cast<size_t>(in_d);
+                    for (int k = 0; k < r; ++k) {
+                        const float bk = sc * b[static_cast<size_t>(o) * static_cast<size_t>(r) + k];
+                        const float* arow = a + static_cast<size_t>(k) * static_cast<size_t>(in_d);
+                        for (int i = 0; i < in_d; ++i) drow[i] += bk * arow[i];
+                    }
+                }
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void Model::init_weights(u64 seed) {
@@ -1743,8 +1839,9 @@ Activations Model::make_activations(int B, int T, bool with_grad, int ce_chunks)
         }
         // Single transient probs buffer, recomputed per layer in backward
         // (saves (L-1)*B*H*T*T floats, e.g. 2.5GB at B=2,T=1024,L=26).
-        // PRO-HARDEN: حارس T² داخل make_activations نفسها (كان في Trainer فقط)
-        // فيحمي أي استدعاء مباشر/اختبار من OOM صامت على T4.
+        // PRO-HARDEN: a T^2 guard inside make_activations itself (it used to
+        // live only in the Trainer), so any direct call or test is protected
+        // from a silent OOM on T4.
         {
             const size_t need_tmp =
                 static_cast<size_t>(B) * static_cast<size_t>(cfg_.num_heads) *
@@ -1968,6 +2065,7 @@ u64 Model::count_parameters(const ModelConfig& cfg) {
             n += mamba_layer_parameters(cfg);
         } else {
             n += qd * d + kvd * d + kvd * d + d * qd;  // wq, wk, wv, wo
+            if (cfg.use_qkv_bias) n += qd + 2 * kvd;  // bq, bk, bv
             if (cfg.use_qk_norm) n += 2 * hd;         // qk_qnorm, qk_knorm
         }
         if (cfg.use_moe) {
@@ -2010,14 +2108,16 @@ size_t Model::count_fp16_cache_bytes(const ModelConfig& cfg) {
     n2 += V * d;                                              // tok_embeddings
     for (u64 i = 0; i < L; ++i) {
         if (layer_is_mamba(i)) {
-            // in_proj, out_proj, conv1d.weight (the 1-D ones have no cache)
+            // in_proj and out_proj are 2-D; conv1d.weight is 3-D and has no
+            // fp16_cache (enable_fp16_weight_cache() only caches rank-2).
             const u64 d_inner = static_cast<u64>(cfg.mamba_expand) * d;
             const u64 conv_dim = d_inner + 2ull * static_cast<u64>(cfg.mamba_n_groups) *
                                           static_cast<u64>(cfg.mamba_d_state);
             const u64 proj = d_inner + conv_dim + static_cast<u64>(cfg.mamba_n_heads);
-            n2 += proj * d;                                   // in_proj
-            n2 += conv_dim * static_cast<u64>(cfg.mamba_d_conv);
-            n2 += d * d_inner;                                // out_proj
+            n2 += proj * d;                                   // in_proj (2D -> cache)
+            // conv1d.weight is 3D: enable_fp16_weight_cache() only allocates
+            // fp16_cache for shape.size()==2, so it must not be counted.
+            n2 += d * d_inner;                                // out_proj (2D)
         } else {
             n2 += qd * d + kvd * d + kvd * d + d * qd;         // wq, wk, wv, wo
             // the per-layer fused QKV cache: [qd + 2*kvd, d]
@@ -2053,6 +2153,11 @@ static u64 fragile_param_count(const ModelConfig& cfg) {
             n += static_cast<u64>(cfg.num_experts) * d;  // the router
         if (cfg.use_qk_norm)
             n += 2ull * hd;
+        const bool attn_layer = !((cfg.arch == ModelConfig::ArchGranite) &&
+                                  l < static_cast<int>(cfg.layer_types.size()) &&
+                                  cfg.layer_types[static_cast<size_t>(l)] == 0);
+        if (cfg.use_qkv_bias && attn_layer)
+            n += static_cast<u64>(cfg.q_dim()) + 2ull * static_cast<u64>(cfg.kv_dim());
         const bool is_mamba = (cfg.arch == ModelConfig::ArchGranite) &&
                               l < static_cast<int>(cfg.layer_types.size()) &&
                               cfg.layer_types[static_cast<size_t>(l)] == 0;
@@ -2188,7 +2293,7 @@ static void check_act_device(Device dev, const char* name, const Tensor& t) {
 }
 
 void Model::forward_body(const i32* ids, int B, int T, Activations& act,
-                         const i32* segment_ids) {
+                         const i32* segment_ids, bool reset_mamba_states) {
     // FIX: fail-fast guards (training/inference crash + T4/low-PC OOM safety).
     // Old code accepted B/T<=0 -> N<=0 cast to size_t = huge alloc -> OOM,
     // and N>INT_MAX truncated to int M in linear_forward -> silent zero math.
@@ -2218,8 +2323,10 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
     // backward (which assumes a zero initial state) would not match it.
     // The inference path does not use these states: the generator carries
     // its own, token by token (the prefill of a hybrid model is a decode).
-    for (Tensor& st : act.mamba_states) {
-        if (st.defined() && st.numel() > 0) ops::zero(dev, st.f32(), st.numel());
+    if (reset_mamba_states) {
+        for (Tensor& st : act.mamba_states) {
+            if (st.defined() && st.numel() > 0) ops::zero(dev, st.f32(), st.numel());
+        }
     }
     if (fp16_weight_cache_ && fp16_weights_dirty_) {
         for (Parameter* p : params_) {
@@ -2347,7 +2454,7 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         float* qp = nullptr;
         float* kp = nullptr;
         float* vp = nullptr;
-        if (act.qkv.defined()) {
+        if (act.qkv.defined() && L.wqkv_fp16.defined()) {
             ops::linear_forward_fp16(dev, act.xb.f32(), L.wqkv_fp16.ptr<u16>(),
                                      act.qkv.f32(), static_cast<int>(N), d, qd + 2 * kvd);
             ops::split_qkv(dev, act.qkv.f32(), act.q.f32(), act.k.f32(), act.v.f32(),
@@ -2364,6 +2471,11 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             linear_param(dev, L.wv.w, act.xb.f32(), vp, static_cast<int>(N), d, kvd);
         }
 
+        if (L.has_qkv_bias()) {
+            ops::add_bias(dev, L.bq.w.f32(), qp, static_cast<int>(N), qd);
+            ops::add_bias(dev, L.bk.w.f32(), kp, static_cast<int>(N), kvd);
+            ops::add_bias(dev, L.bv.w.f32(), vp, static_cast<int>(N), kvd);
+        }
         lora_forward(L.lora_q, dev, act.xb.f32(), qp, static_cast<int>(N));
         lora_forward(L.lora_k, dev, act.xb.f32(), kp, static_cast<int>(N));
         lora_forward(L.lora_v, dev, act.xb.f32(), vp, static_cast<int>(N));
@@ -2489,10 +2601,10 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
 }
 
 Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
-                       const i32* segment_ids) {
+                       const i32* segment_ids, bool reset_mamba_states) {
     // Full-[N,V] inference/eval path. Chunked training activations carry only
     // compact [Cc,V] scratch: they must go through forward_backward().
-    forward_body(ids, B, T, act, segment_ids);
+    forward_body(ids, B, T, act, segment_ids, reset_mamba_states);
     const int d = cfg_.hidden_size;
     const int V = cfg_.vocab_size;
     const i64 N = static_cast<i64>(B) * T;
@@ -2550,7 +2662,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                             : (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale_local(cfg_);
     Device dev = device_;
 
-    forward_body(ids, B, T, act, segment_ids);
+    forward_body(ids, B, T, act, segment_ids, /*reset_mamba_states=*/true);
 
     // ---- chunked lm head + loss (roadmap item 6; with z-loss stabilizer).
     // Materializing full [N,V] logits+dlogits costs 524MB at B=2,T=1024,V=32k
@@ -2591,8 +2703,11 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
             }
             if (!any_supervised) continue; // fully-masked block: nothing to learn
         }
-        ops::linear_forward(dev, hnorm_full + r0 * d, lm_head().w.f32(),
-                            logits_c, Ci, d, V);
+        // The lm_head may be half/quantized (fp16 weight storage / native Q4).
+        // Always route the forward through the dtype-aware helper, exactly as
+        // forward() and the backward below do; passing w.f32() here would
+        // reinterpret half bytes as floats and produce garbage logits.
+        linear_param(dev, lm_head().w, hnorm_full + r0 * d, logits_c, Ci, d, V);
         if (cfg_.logits_scaling != 1.0f) {
             ops::scale_inplace(dev, logits_c, 1.0f / cfg_.logits_scaling, Cr * V);
         }
@@ -2885,7 +3000,9 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
         // dq/dk hold dL/d(normed Q/K) from rope_backward. rmsnorm_backward does dx+=f(dout), so
         // dout and dx must NOT alias. att_out [N,qd] and dattout [N,kvd] stage dout.
         // We pass the true pre-norm Q/K (saved_qk_raw_q/k) as input x to rmsnorm_backward.
-        if (cfg_.use_qk_norm && L.qk_qnorm.w.defined()) {
+        if (cfg_.use_qk_norm && L.qk_qnorm.w.defined() && L.qk_knorm.w.defined()) {
+            // Both norms must exist: the forward skips QK-Norm entirely when
+            // either is missing, so the saved tensors below would be empty.
             // Q path: stage dout in att_out, zero dq, then rmsnorm_backward.
             ops::copy(dev, act.att_out.f32(), act.dq.f32(), N * qd);
             ops::zero(dev, act.dq.f32(), N * qd);
@@ -2898,6 +3015,15 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
             ops::rmsnorm_backward(dev, act.saved_qk_raw_k[sl].f32(), L.qk_knorm.w.f32(), act.dattout.f32(),
                                   act.saved_qk_rms_k[sl].f32(), act.dk.f32(), gptr(L.qk_knorm.g),
                                   N * KV, hd);
+        }
+
+        // dq/dk/dv now hold dL/d(projection output), i.e. after Wx+b and
+        // before RoPE/QK-norm have been undone. The bias gradient is the sum
+        // over tokens of that same tensor (bias_backward accumulates).
+        if (L.has_qkv_bias()) {
+            ops::bias_backward(dev, act.dq.f32(), gptr(L.bq.g), N, qd);
+            ops::bias_backward(dev, act.dk.f32(), gptr(L.bk.g), N, kvd);
+            ops::bias_backward(dev, act.dv.f32(), gptr(L.bv.g), N, kvd);
         }
 
         ops::zero(dev, act.dxb.f32(), N * d);
@@ -2979,8 +3105,26 @@ double Model::moe_aux_loss(Activations& act, int B, int T) {
 // ---------------------------------------------------------------- raw io
 static constexpr u32 RAW_MAGIC = 0x57415247u;   // "GRAW" (legacy, FP32 only)
 static constexpr u32 RAW_MAGIC2 = 0x32515247u;  // "GRW2" (per-tensor dtype)
+// Raw checkpoints must round-trip every storage dtype, including the packed
+// Q4/Q8 tensors used by native quantized mode. The old two-value code wrote
+// Q4 bytes with an F32 tag and the reader then expected numel*4 bytes.
 static constexpr u32 dtype_code(DType d) {
-    return d == DType::F16 ? 1u : 0u;  // 0 = F32, 1 = F16
+    switch (d) {
+        case DType::F16:  return 1u;
+        case DType::Q8_0: return 2u;
+        case DType::Q4_0: return 3u;
+        case DType::Q4_1: return 4u;
+        default:          return 0u;  // F32 (and BF16/I32: not written raw)
+    }
+}
+static DType dtype_from_code(u32 c) {
+    switch (c) {
+        case 1u: return DType::F16;
+        case 2u: return DType::Q8_0;
+        case 3u: return DType::Q4_0;
+        case 4u: return DType::Q4_1;
+        default: return DType::F32;
+    }
 }
 
 void Model::save_raw(const std::string& path) const {
@@ -3029,22 +3173,26 @@ bool Model::load_raw(const std::string& path) {
         Parameter* p = find_parameter(name);
         if (!p || static_cast<u64>(p->numel()) != ne) return false;
         if (p->shape.empty()) return false;
-        DType file_dt = has_dtype && dt == 1u ? DType::F16 : DType::F32;
+        DType file_dt = has_dtype ? dtype_from_code(dt) : DType::F32;
         Tensor cpu(p->shape, file_dt, Device::CPU);
         if (cpu.nbytes() == 0) return false;
         if (!f.read(reinterpret_cast<char*>(cpu.data_ptr()),
                     static_cast<std::streamsize>(cpu.nbytes()))) return false;
+        const bool target_quant = p->w.dtype() == DType::Q4_0 ||
+                                  p->w.dtype() == DType::Q4_1 ||
+                                  p->w.dtype() == DType::Q8_0;
         if (file_dt == p->w.dtype()) {
             p->w.copy_from(cpu);
+        } else if (file_dt == DType::F32) {
+            // copy_from_f32 only handles F32->F16; quantized destinations
+            // need an explicit host-side quantization step.
+            if (target_quant) p->w.copy_from(quant::quantize(cpu, p->w.dtype()));
+            else p->w.copy_from_f32(cpu);
         } else {
-            // Convert on the host and use the dtype-aware copy
-            // (copy_from_f32 halves the PCIe traffic for half storage).
-            std::vector<float> f32(static_cast<size_t>(ne));
-            for (size_t i = 0; i < f32.size(); ++i)
-                f32[i] = file_dt == DType::F16 ? fp16_to_fp32(cpu.ptr<u16>()[i]) : cpu.f32()[i];
-            Tensor src(p->shape, DType::F32, Device::CPU);
-            std::memcpy(src.data_ptr(), f32.data(), f32.size() * sizeof(float));
-            p->w.copy_from_f32(src);
+            // Decode to FP32 first, then convert/quantize to the target.
+            Tensor f32 = quant::dequantize(cpu, DType::F32);
+            if (target_quant) p->w.copy_from(quant::quantize(f32, p->w.dtype()));
+            else p->w.copy_from_f32(f32);
         }
     }
     if (fp16_weight_cache_) enable_fp16_weight_cache(true);

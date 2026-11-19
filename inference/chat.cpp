@@ -12,8 +12,9 @@ ChatSession::ChatSession(Generator& gen, ChatOptions opts)
     : gen_(gen), opts_(std::move(opts)) {
     GAI_CHECK(opts_.max_history_turns >= 0, "chat history turns must be >= 0");
     GAI_CHECK(opts_.gen.max_new_tokens >= 0, "chat max tokens must be >= 0");
-    // A system message is rendered only when one was explicitly configured.
-    // The checkpoint speaks as it was trained to speak.
+    // ChatSession does not add a system turn itself. Note that the Granite
+    // chat-template renderer inserts the reference system turn when none is
+    // supplied (see chat_template.h:23-27), which is intentional.
     if (!opts_.system.empty()) {
         history_.push_back({Role::System, opts_.system});
     }

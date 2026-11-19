@@ -128,11 +128,6 @@ void DistributedContext::finalize() {
         coll_dev_ = nullptr;
         coll_dev_bytes_ = 0;
     }
-    if (f16_stage_) {
-        cudaFree(f16_stage_);
-        f16_stage_ = nullptr;
-        f16_stage_bytes_ = 0;
-    }
     if (stream_) {
         cudaStreamDestroy(stream_);
         stream_ = nullptr;
@@ -313,20 +308,6 @@ void DistributedContext::barrier() {
     NCCL_CHECK(ncclAllReduce(barrier_dev_, barrier_dev_, 1, ncclInt32, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     ops::perf_note_sync();
-#endif
-}
-
-std::string DistributedContext::get_nccl_unique_id() {
-#ifdef GAI_NCCL
-    ncclUniqueId id;
-    ncclGetUniqueId(&id);
-    std::ostringstream oss;
-    for (int i = 0; i < NCCL_UNIQUE_ID_BYTES; ++i) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(id.internal[i]);
-    }
-    return oss.str();
-#else
-    return "";
 #endif
 }
 

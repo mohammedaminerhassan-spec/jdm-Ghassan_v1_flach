@@ -53,7 +53,6 @@ public:
 
     void barrier();
 
-    static std::string get_nccl_unique_id();
 
 private:
 #ifdef GAI_NCCL
@@ -77,8 +76,6 @@ private:
     void* barrier_dev_ = nullptr;
     void* coll_dev_ = nullptr;
     size_t coll_dev_bytes_ = 0;
-    void* f16_stage_ = nullptr;
-    size_t f16_stage_bytes_ = 0;
     std::string id_file_;
 #endif
 };

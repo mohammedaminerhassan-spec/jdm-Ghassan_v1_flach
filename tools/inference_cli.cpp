@@ -65,6 +65,8 @@ static void usage() {
     "  --top-p <f>       nucleus                [0.92]\n"
     "  --min-p <f>       min-p                  [0.05]\n"
     "  --repeat <f>      repetition penalty     [1.12]\n"
+    "  --repeat-window <n>  history window      [128]\n"
+    "  --frequency-penalty <f> / --presence-penalty <f>  [0]\n"
     "  --no-repeat-ngram <n>  ban seen n-grams  [0=off]\n"
     "  --max-tokens <n>  max new tokens         [256]\n"
     "  --seed <n>        rng seed (0 = random)\n"
@@ -227,9 +229,12 @@ static int cmd_info(const Args& args) {
         std::map<std::string, std::pair<u64, u64>> by_dtype;
         u64 total_bytes = 0, total_params = 0;
         for (const auto& e : r.tensors()) {
-            i64 n = 1;
-            for (u64 d : e.dimensions) n *= static_cast<i64>(d);
-            total_params += static_cast<u64>(n);
+            u64 n = 1;
+            for (u64 d : e.dimensions) {
+                GAI_CHECK(d == 0 || n <= (UINT64_MAX / d), "tensor dimension overflow in GGUF info");
+                n *= d;
+            }
+            total_params += n;
             u64 nb = ggml_nbytes_of(e.type, static_cast<u64>(n));
             total_bytes += nb;
             auto& slot = by_dtype[ggml_type_str(e.type)];
@@ -376,7 +381,9 @@ static int cmd_bench(const Args& args) {
 
     const int vocab = lm.model->config().vocab_size;
     std::vector<i32> prompt;
-    prompt.push_back(lm.tokenizer.encode("hello", false, false).front());
+    const std::vector<i32> seed_ids = lm.tokenizer.encode("hello", false, false);
+    GAI_CHECK(!seed_ids.empty(), "bench: tokenizer encodes 'hello' to zero tokens");
+    prompt.push_back(seed_ids.front());
     for (int i = 1; i < nprompt; ++i) prompt.push_back(static_cast<i32>((300 + (i * 37)) % vocab));
 
     log_info(strfmt("[bench] prefill %d tokens, decode %d tokens on %s",
@@ -485,8 +492,12 @@ static int cmd_tokenize(const Args& args) {
             u32 len = 0;
             bf.read(reinterpret_cast<char*>(&len), 4);
             if (!bf) break;
+            GAI_CHECK(len <= (1u << 20), "--batch record too large (max 1 MiB)");
             std::string s(len, '\0');
-            if (len) bf.read(s.data(), len);
+            if (len) {
+                bf.read(s.data(), len);
+                GAI_CHECK(static_cast<u32>(bf.gcount()) == len, "--batch file truncated");
+            }
             const std::vector<i32> bids = tk.encode_default(s);
             std::cout << "{\"text\":\"" << json_escape(s) << "\",\"ids\":[";
             for (size_t i = 0; i < bids.size(); ++i) {
@@ -603,7 +614,8 @@ static int cmd_export(const Args& args) {
         // The tokenizer files are a property of the vocabulary, not of the
         // weights: they are copied verbatim (re-serialising them would lose
         // the merges and the added tokens).
-        copy_tokenizer_files(tok_path, out);
+        GAI_CHECK(copy_tokenizer_files(tok_path, out),
+                  "the tokenizer files were not copied into " + out);
         return 0;
     }
     GAI_CHECK(format == "gguf", "unknown --format '" + format + "' (gguf|safetensors)");
@@ -641,7 +653,7 @@ static int cmd_perplexity(const Args& args) {
         result = evaluate_shard_perplexity(
             gen, args.str("shards"), args.str("prefix", "val"), batch_size,
             seq_len, max_batches, args.flag("pack", false),
-            static_cast<u64>(args.num("seed", 42)));
+            args.num_u64("seed", 42));
     } else {
         GAI_FAIL("perplexity requires --text or --shards");
     }
@@ -730,7 +742,8 @@ static int cmd_logits(const Args& args) {
             }
         }
         std::cout << strfmt("  pos %3d argmax=%6d (%.4f) top5:", t, top[0], row[top[0]]);
-        for (int k = 0; k < 5; ++k) std::cout << strfmt(" %d:%.3f", top[k], row[top[k]]);
+        for (int k = 0; k < 5 && top[k] >= 0; ++k)
+            std::cout << strfmt(" %d:%.3f", top[k], row[top[k]]);
         std::cout << "\n";
     }
     if (out) {

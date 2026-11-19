@@ -119,6 +119,7 @@ void moe_forward(const float* x, const float* router_w,
     GAI_CHECK(K >= 1 && K <= 8, "moe_forward: K must be in [1,8]");
     GAI_CHECK(ne > 0 && ne <= 64, "moe_forward: ne out of range");
     GAI_CHECK(d > 0 && E > 0, "moe_forward: bad dims");
+    GAI_CHECK(s_gate && s_up && s_act, "moe_forward: expert scratch buffers are required");
 #ifdef GAI_OPENMP
     #pragma omp parallel if(N > 4)
 #endif
@@ -329,6 +330,7 @@ void moe_backward(const float* x, const float* router_w,
 
     GAI_CHECK(K >= 1 && K <= 8, "moe_backward: K must be in [1,8]");
     GAI_CHECK(ne > 0 && ne <= 64, "moe_backward: ne out of range");
+    GAI_CHECK(s_dact, "moe_backward: s_dact scratch is required");
 
     BwdScratch sc;
     sc.ensure(ne, E, d, SH);

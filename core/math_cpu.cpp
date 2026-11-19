@@ -317,7 +317,8 @@ void rmsnorm_forward(const float* x, const float* weight, float* out, float* rrm
 
 void rmsnorm_backward(const float* x, const float* weight, const float* dout,
                       const float* rrms, float* dx, float* dweight, i64 rows, int dim) {
-
+    GAI_CHECK(x && weight && dout && rrms && dx,
+              "rmsnorm_backward: x/weight/dout/rrms/dx must be non-null");
     int nthreads = 1;
 #ifdef GAI_OPENMP
     nthreads = omp_get_max_threads();
@@ -452,11 +453,6 @@ static void rope_apply(float* q, float* k, const i32* pos,
             }
         }
     }
-}
-
-void rope_forward(float* q, float* k, const i32* pos,
-                  i64 ntok, int n_heads, int n_kv, int head_dim, float theta) {
-    rope_apply(q, k, pos, ntok, n_heads, n_kv, head_dim, theta, 0, 1.0f, 32.0f, 1.0f, 1.0f);
 }
 
 void rope_backward(float* dq, float* dk, const i32* pos,
@@ -603,6 +599,8 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
                 float p = std::exp(row[j] - mx) * invsum;
                 d[j] = p * scale;
             }
+            // dL/dlogit_j = p_j*(1 + 2*z*logZ) - delta_jt: the -logit_t
+            // term is NOT scaled by the z-loss factor.
             d[tgt] -= 1.0f;
         }
     }
@@ -708,34 +706,46 @@ void topk_select(const float* logits, int V, int K, float* out_vals, i32* out_id
 
 i32 argmax_token(const float* logits, int V) {
     GAI_CHECK(V > 0, "argmax_token: empty vocabulary");
-    int best = 0;
-    float bv = logits[0];
-    for (int i = 1; i < V; ++i)
-        if (logits[i] > bv) { bv = logits[i]; best = i; }
+    int best = -1;
+    float bv = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < V; ++i) {
+        const float v = logits[i];
+        if (std::isfinite(v) && (best < 0 || v > bv)) { bv = v; best = i; }
+    }
+    if (best < 0) {
+        best = 0;
+        for (int i = 1; i < V; ++i) if (logits[i] > logits[best]) best = i;
+    }
     return static_cast<i32>(best);
 }
 
 void apply_rep_penalties(float* logits, int V, const i32* hist, int hist_n,
                          float rep, float freq, float pres) {
     if (hist_n <= 0 || V <= 0) return;
-    const bool use_rep = rep != 1.0f;
+    const bool use_rep = rep > 0.0f && rep != 1.0f;
     const bool use_freq = freq != 0.0f;
     const bool use_pres = pres != 0.0f;
     if (!use_rep && !use_freq && !use_pres) return;
-    thread_local std::vector<int> counts;
-    if (counts.size() < static_cast<size_t>(V)) counts.resize(static_cast<size_t>(V));
-    std::fill(counts.begin(), counts.end(), 0);
+    // Touch only tokens that actually appear in the history. The old code
+    // zeroed and scanned a V-sized count table on every decode step (O(V)
+    // per token); this is O(hist_n log hist_n) with vocab-sized worst case.
+    thread_local std::vector<i32> toks;
+    toks.clear();
+    toks.reserve(static_cast<size_t>(hist_n));
     for (int i = 0; i < hist_n; ++i) {
         const i32 tok = hist[i];
-        if (tok >= 0 && tok < V) ++counts[static_cast<size_t>(tok)];
+        if (tok >= 0 && tok < V) toks.push_back(tok);
     }
-    for (int tok = 0; tok < V; ++tok) {
-        const int n = counts[static_cast<size_t>(tok)];
-        if (n == 0) continue;
-        float& l = logits[tok];
+    std::sort(toks.begin(), toks.end());
+    for (size_t i = 0; i < toks.size();) {
+        size_t j = i + 1;
+        while (j < toks.size() && toks[j] == toks[i]) ++j;
+        const int n = static_cast<int>(j - i);
+        float& l = logits[toks[i]];
         if (use_rep) l = (l > 0.0f) ? l / rep : l * rep;
         if (use_freq) l -= freq * static_cast<float>(n);
         if (use_pres) l -= pres;
+        i = j;
     }
 }
 

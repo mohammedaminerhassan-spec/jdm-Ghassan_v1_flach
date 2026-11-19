@@ -79,6 +79,7 @@ private:
     };
 
     std::string          path_;
+    std::string          tmp_path_;
     std::vector<Entry>   entries_;
     size_t               total_ = 0;
     std::ofstream        out_;

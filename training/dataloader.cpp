@@ -117,10 +117,17 @@ void ShardWriter::close() {
     if (closed_) return;
 
     fs::path p(path_);
-    if (p.has_parent_path()) fs::create_directories(p.parent_path());
+    if (p.has_parent_path()) {
+        std::error_code mk_ec;
+        fs::create_directories(p.parent_path(), mk_ec);
+        GAI_CHECK(!mk_ec, "cannot create shard directory: " + mk_ec.message());
+    }
 
-    std::ofstream f(path_, std::ios::binary);
-    GAI_CHECK(f.good(), "cannot write shard: " + path_);
+    // Write to a temp file and publish atomically: a crash or disk-full must
+    // never leave a truncated file with a valid header at the final path.
+    const std::string tmp = path_ + ".tmp";
+    std::ofstream f(tmp, std::ios::binary);
+    GAI_CHECK(f.good(), "cannot write shard: " + tmp);
 
     ShardHeader h;
     h.dtype    = u16_mode_ ? 0u : 1u;
@@ -145,7 +152,17 @@ void ShardWriter::close() {
                 static_cast<std::streamsize>(mask_.size()));
     }
     f.flush();
-    GAI_CHECK(f.good(), "shard write failed: " + path_);
+    GAI_CHECK(f.good(), "shard write failed: " + tmp);
+    f.close();
+    GAI_CHECK(!f.fail(), "shard close failed: " + tmp);
+
+    std::error_code ec;
+    if (fs::exists(path_, ec) && !ec) {
+        fs::remove(path_, ec);
+        GAI_CHECK(!ec, "cannot replace shard " + path_ + ": " + ec.message());
+    }
+    fs::rename(tmp, path_, ec);
+    GAI_CHECK(!ec, "cannot publish shard " + path_ + ": " + ec.message());
     // [FIX P2-24] Mark closed only after the write fully succeeded, so a
     // failed close() can be retried instead of being silently skipped.
     closed_ = true;
@@ -510,10 +527,10 @@ bool DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
             if (best_avail >= static_cast<u64>(T) + 1) break;
         }
     }
-    if (best_avail == 0 || best_start >= sh.n_tokens()) return true;
+    if (best_avail == 0 || best_start >= sh.n_tokens()) return false;
     u64 want = std::min<u64>(best_avail, static_cast<u64>(T) + 1);
     if (best_start + want > sh.n_tokens()) want = sh.n_tokens() - best_start;
-    if (want == 0) return true;
+    if (want == 0) return false;
     thread_local std::vector<u32> toks;
     thread_local std::vector<u8> masks;
     if (!sh.read_window(best_start, want, toks, masks)) return false;
@@ -544,7 +561,7 @@ bool DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
             }
         }
     }
-    return true;
+    return filled > 0;
 }
 
 bool DataLoader::fill_packed_row(const Shard& sh, Batch& out, int b) {

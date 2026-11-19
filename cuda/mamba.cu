@@ -796,6 +796,12 @@ static void mamba2_backward_impl(const float* x,
                                              y_norm, B * T, d_inner, proj_size, eps);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
+    // dy_norm is the dx accumulator of linear_backward[_half] (beta=1.0).
+    // This buffer is carved out of a reused workspace: it contains stale
+    // bytes, not zeros. Accumulating into it silently corrupts dy_scan and
+    // every gradient flowing to earlier layers. Zero it first (the CPU
+    // reference gets a zero-initialized std::vector for free).
+    CU_MAMBA_CHECK(cudaMemset(dy_norm, 0, sizeof(float) * n_tok * d_inner));
     mamba_linear_bwd(y_norm, w_out, dout, dy_norm, dw_out, B * T, d_inner, d);
 
     // B2) Gated RMSNorm backward

@@ -139,7 +139,18 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
                         bool force_fp32 = false) {
     if (nB <= 0 || M <= 0 || N <= 0) return;
     if (K <= 0 || alpha == 0.0f) {
-        GAI_FAIL("attn_sbgemm: degenerate K<=0/alpha==0 path not implemented");
+        // Same contract as gemm(): C = beta*C (or zero when beta==0).
+        for (int i = 0; i < nB; ++i) {
+            if (!C[i]) continue;
+            if (beta == 0.0f) {
+                CU_CHECK(cudaMemset2D(C[i], sizeof(float) * ldaC, 0,
+                                      sizeof(float) * N, M));
+            } else if (beta != 1.0f) {
+                for (int r = 0; r < M; ++r)
+                    scale_inplace(C[i] + static_cast<size_t>(r) * ldaC, beta, N);
+            }
+        }
+        return;
     }
     if (ops::gemm_bf16_enabled()) {
         static bool warned = false;

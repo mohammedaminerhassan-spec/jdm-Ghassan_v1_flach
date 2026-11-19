@@ -105,7 +105,11 @@ u64 Args::num_u64(const std::string& k, u64 def) const {
     // fingerprints) and silently falls back to the default.
     try {
         size_t pos = 0;
-        const unsigned long long v = std::stoull(it->second, &pos, 0);
+        if (it->second.empty() || it->second[0] == '-') {
+            log_warn("args: negative unsigned integer for '--" + k + "', using default");
+            return def;
+        }
+        const unsigned long long v = std::stoull(it->second, &pos, 0);  // accept 0x… seeds
         if (pos != it->second.size()) {
             log_warn("args: trailing characters in '--" + k + "', using parsed value");
         }
@@ -113,6 +117,21 @@ u64 Args::num_u64(const std::string& k, u64 def) const {
     } catch (const std::exception&) {
         log_warn("args: ignoring out-of-range integer for '--" + k + "'");
         return def;
+    }
+}
+
+u64 Args::num_u64_strict(const std::string& k) const {
+    auto it = kv_.find(k);
+    if (it == kv_.end()) GAI_FAIL("args: missing '--" + k + "'");
+    if (it->second.empty() || it->second[0] == '-')
+        GAI_FAIL("args: '--" + k + "' must be an unsigned integer");
+    try {
+        size_t pos = 0;
+        const unsigned long long v = std::stoull(it->second, &pos, 0);  // accept 0x… seeds
+        if (pos != it->second.size()) GAI_FAIL("args: bad unsigned integer for '--" + k + "'");
+        return static_cast<u64>(v);
+    } catch (const std::exception&) {
+        GAI_FAIL("args: bad unsigned integer for '--" + k + "'");
     }
 }
 
@@ -189,9 +208,8 @@ void apply_common_flags(const Args& a) {
     i64 t = a.num("threads", 0);
     if (t > 0) {
         set_num_threads(static_cast<int>(t));
-    } else {
-
-        set_num_threads(num_threads());
+    } else if (a.has("threads")) {
+        log_warn("args: ignoring non-positive --threads");
     }
 }
 

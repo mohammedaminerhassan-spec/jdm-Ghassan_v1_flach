@@ -121,6 +121,15 @@ static void mamba2_forward_impl(const float* x,          // [B, T, d]
     std::vector<float> y(static_cast<size_t>(N) * d_inner);
     {
         const int inner = n_heads * d_head;
+        // conv_dim carries d_inner + 2*(n_groups*d_state): derive the real
+        // B/C region width instead of assuming one group.
+        const int d_state_tot = (conv_dim - d_inner) / 2;
+        GAI_CHECK(d_state_tot >= d_state && d_state_tot % d_state == 0,
+                  "mamba: inconsistent conv_dim / d_state");
+        const int groups = d_state_tot / d_state;
+        GAI_CHECK(groups > 0 && n_heads % groups == 0,
+                  "mamba: n_heads must be divisible by n_groups");
+        const int heads_per_group = n_heads / groups;
 #ifdef GAI_OPENMP
         #pragma omp parallel for schedule(static) if (B * inner > 4)
 #endif
@@ -145,10 +154,11 @@ static void mamba2_forward_impl(const float* x,          // [B, T, d]
                 // (reading `i` instead of `h * d_head + i` gave every head
                 // the same input, i.e. head 1 read head 0's channels).
                 const float xv = brow[h * d_head + i];
+                const int g_off = (h / heads_per_group) * d_state;
                 float acc = 0.0f;
                 for (int j = 0; j < d_state; ++j) {
-                    srow[j] = dA * srow[j] + (dt_val * brow[d_inner + j]) * xv;
-                    acc += brow[d_inner + d_state + j] * srow[j];
+                    srow[j] = dA * srow[j] + (dt_val * brow[d_inner + g_off + j]) * xv;
+                    acc += brow[d_inner + d_state_tot + g_off + j] * srow[j];
                 }
                 // The channel of this row inside d_inner: the head offset
                 // matters. Writing to `i` instead of `h * d_head + i` made
@@ -293,6 +303,9 @@ void mamba2_backward(const float* x,
     // 3) Selective scan forward: compute y_scan
     std::vector<float> y_scan(static_cast<size_t>(N) * d_inner, 0.0f);
     const int inner = n_heads * d_head;
+    const int d_state_tot = (conv_dim - d_inner) / 2;
+    const int groups = (d_state > 0) ? d_state_tot / d_state : 1;
+    const int heads_per_group = (groups > 0) ? n_heads / groups : n_heads;
     {
 #ifdef GAI_OPENMP
         #pragma omp parallel for schedule(static) if (B * inner > 4)
@@ -302,6 +315,7 @@ void mamba2_backward(const float* x,
             const int rem = row - b * inner;
             const int h   = rem / d_head;
             const int i   = rem - h * d_head;
+            const int g_off = (h / heads_per_group) * d_state;
             const float a_val     = -std::exp(a_log[h]);
             const float dt_bias_v = dt_bias[h];
             const float dskip     = D[h];
@@ -317,8 +331,8 @@ void mamba2_backward(const float* x,
                 const float xv = brow[h * d_head + i];
                 float acc = 0.0f;
                 for (int j = 0; j < d_state; ++j) {
-                    s[j] = dA * s[j] + (dt_val * brow[d_inner + j]) * xv;
-                    acc += brow[d_inner + d_state + j] * s[j];
+                    s[j] = dA * s[j] + (dt_val * brow[d_inner + g_off + j]) * xv;
+                    acc += brow[d_inner + d_state_tot + g_off + j] * s[j];
                 }
                 y_scan[(static_cast<size_t>(b) * T + t) * d_inner + h * d_head + i] = acc + dskip * xv;
             }

@@ -299,9 +299,11 @@ void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
     GAI_CHECK(scratch_.defined(),
               "orthogonalize: scratch workspace is not allocated");
     const i64 rc = static_cast<i64>(rows) * cols;
-    const i64 cc = static_cast<i64>(cols) * cols;
+    const i64 small = rows < cols ? rows : cols;
+    const i64 gram = small * small;
+    const bool tall = rows > cols;
 
-    GAI_CHECK(rc <= omax_rc_ && cc <= amax_cc_,
+    GAI_CHECK(rc <= omax_rc_ && gram <= amax_cc_,
               "orthogonalize: shape exceeds the construction-time workspace "
               "(rebuild Muon with a larger min_ns_dim coverage)");
     Timer ns_t;
@@ -322,9 +324,17 @@ void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
     const i64 saved_thr = ops::gemm_fp16_mnk_threshold();
     ops::set_gemm_fp16_mnk_threshold((i64)1 << 60);
     for (int it = 0; it < cfg_.ns_steps; ++it) {
-
-        ops::gemm(dev, true, false, cols, cols, rows, 1.0f, O, cols, O, cols, 0.0f, A, cols);
-        ops::gemm(dev, false, false, rows, cols, cols, 1.0f, O, cols, A, cols, 0.0f, T, cols);
+        if (tall) {
+            // rows >= cols: orthogonalize the COLUMNS (O^T O -> I).
+            ops::gemm(dev, true, false, cols, cols, rows, 1.0f, O, cols, O, cols, 0.0f, A, cols);
+            ops::gemm(dev, false, false, rows, cols, cols, 1.0f, O, cols, A, cols, 0.0f, T, cols);
+        } else {
+            // rows <= cols: O^T O is rows> cols and cannot converge to I.
+            // Orthogonalize the ROWS instead (O O^T -> I), which is what
+            // Muon's reference implementation does after transposing.
+            ops::gemm(dev, false, true, rows, rows, cols, 1.0f, O, cols, O, cols, 0.0f, A, rows);
+            ops::gemm(dev, false, false, rows, cols, rows, 1.0f, A, rows, O, cols, 0.0f, T, cols);
+        }
 
         ops::scale_inplace(dev, O, kNSa, rc);
         ops::scale_inplace(dev, T, kNSb, rc);
@@ -366,7 +376,9 @@ Muon::Muon(Model& model, MuonConfig cfg) : model_(model), cfg_(cfg) {
             ++ns_matrices;
             const i64 r = p->shape[0], c = p->shape[1];
             max_rc = std::max(max_rc, r * c);
-            max_cc = std::max(max_cc, c * c);
+            // The Gram matrix is built on the SMALLER dimension (rows for
+            // wide matrices, cols for tall ones), not always on cols.
+            max_cc = std::max(max_cc, (r < c ? r : c) * (r < c ? r : c));
         }
     }
 

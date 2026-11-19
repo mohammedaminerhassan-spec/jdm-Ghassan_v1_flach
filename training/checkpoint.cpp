@@ -12,7 +12,7 @@ namespace gai {
 
 static constexpr u32 CKPT_MAGIC   = 0x54504B47u;
 
-static constexpr u32 CKPT_VERSION = 15u;
+static constexpr u32 CKPT_VERSION = 16u;
 static constexpr u8 OPT_ADAMW = 0u;
 static constexpr u8 OPT_LION  = 1u;
 static constexpr u8 OPT_MUON  = 2u;
@@ -113,6 +113,12 @@ static void wr_config(std::ostream& o, const ModelConfig& c) {
     u32 n_lt = static_cast<u32>(c.layer_types.size());
     wr(o, n_lt);
     for (int lt : c.layer_types) wr(o, lt);
+    // v16 fields MUST come after everything rd_config_v15() consumes: the
+    // v16 reader calls rd_config_v15() first, then reads these three values.
+    // Placing them before n_lt desynchronised the stream and broke resume.
+    u8 conv_bias = c.mamba_conv_bias ? 1 : 0, proj_bias = c.mamba_proj_bias ? 1 : 0;
+    wr(o, conv_bias); wr(o, proj_bias);
+    wr(o, c.mamba_chunk_size);
 }
 static bool rd_config_v6(std::istream& i, ModelConfig& c) {
     u8 tie = 0, moe = 0, sh = 0, qk = 0;
@@ -197,6 +203,15 @@ static bool rd_config_v15(std::istream& i, ModelConfig& c) {
     for (u32 idx = 0; idx < n_lt; ++idx) {
         if (!rd(i, c.layer_types[idx])) return false;
     }
+    return true;
+}
+static bool rd_config_v16(std::istream& i, ModelConfig& c) {
+    if (!rd_config_v15(i, c)) return false;
+    u8 conv_bias = 0, proj_bias = 0;
+    if (!rd(i, conv_bias) || !rd(i, proj_bias)) return false;
+    if (!rd(i, c.mamba_chunk_size)) return false;
+    c.mamba_conv_bias = conv_bias != 0;
+    c.mamba_proj_bias = proj_bias != 0;
     return true;
 }
 static bool rd_config_v5(std::istream& i, ModelConfig& c) {
@@ -289,7 +304,10 @@ static bool arch_match(const ModelConfig& a, const ModelConfig& b) {
          (a.mamba_n_heads != b.mamba_n_heads || a.mamba_d_head != b.mamba_d_head ||
           a.mamba_d_state != b.mamba_d_state || a.mamba_n_groups != b.mamba_n_groups ||
           a.mamba_d_conv != b.mamba_d_conv || a.mamba_expand != b.mamba_expand ||
+          a.mamba_chunk_size != b.mamba_chunk_size ||
           a.mamba_conv_bias != b.mamba_conv_bias || a.mamba_proj_bias != b.mamba_proj_bias)))
+        return false;
+    if (a.layer_types != b.layer_types || a.mamba_chunk_size != b.mamba_chunk_size)
         return false;
     if (a.max_seq_len != b.max_seq_len || a.rope_theta != b.rope_theta ||
         a.rope_scale != b.rope_scale || a.rope_yarn_mscale != b.rope_yarn_mscale ||
@@ -608,7 +626,9 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
 
     ModelConfig cfg{};
-    if (version >= 15u) {
+    if (version >= 16u) {
+        if (!rd_config_v16(f, cfg)) return false;
+    } else if (version >= 15u) {
         if (!rd_config_v15(f, cfg)) return false;
     } else if (version >= 14u) {
         if (!rd_config_v14(f, cfg)) return false;
@@ -677,7 +697,11 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
                 }
             }
         }
-        pp->w.copy_from(cpu);
+        // Checkpoints store FP32 payloads; the live parameter may be F16
+        // (half weight storage) or packed Q4/Q8 (native quantization).
+        // copy_from() demands an exact dtype match, so use the converting
+        // copy (FP32 -> storage dtype) for all load paths.
+        pp->w.copy_from_f32(cpu);
         seen.insert(name);
     }
 
@@ -746,7 +770,9 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
-    if (version >= 15u) {
+    if (version >= 16u) {
+        if (!rd_config_v16(f, cfg)) return false;
+    } else if (version >= 15u) {
         if (!rd_config_v15(f, cfg)) return false;
     } else if (version >= 14u) {
         if (!rd_config_v14(f, cfg)) return false;
@@ -812,7 +838,11 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
                 }
             }
         }
-        pp->w.copy_from(cpu);
+        // Checkpoints store FP32 payloads; the live parameter may be F16
+        // (half weight storage) or packed Q4/Q8 (native quantization).
+        // copy_from() demands an exact dtype match, so use the converting
+        // copy (FP32 -> storage dtype) for all load paths.
+        pp->w.copy_from_f32(cpu);
         seen_lion.insert(name);
     }
     for (Parameter* pp : model.parameters()) {
@@ -882,7 +912,9 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
-    if (version >= 15u) {
+    if (version >= 16u) {
+        if (!rd_config_v16(f, cfg)) return false;
+    } else if (version >= 15u) {
         if (!rd_config_v15(f, cfg)) return false;
     } else if (version >= 14u) {
         if (!rd_config_v14(f, cfg)) return false;
@@ -948,7 +980,11 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
                 }
             }
         }
-        pp->w.copy_from(cpu);
+        // Checkpoints store FP32 payloads; the live parameter may be F16
+        // (half weight storage) or packed Q4/Q8 (native quantization).
+        // copy_from() demands an exact dtype match, so use the converting
+        // copy (FP32 -> storage dtype) for all load paths.
+        pp->w.copy_from_f32(cpu);
         seen_muon.insert(name);
     }
     for (Parameter* pp : model.parameters()) {
@@ -1010,7 +1046,9 @@ bool Checkpoint::peek(const std::string& path, ModelConfig& cfg, TrainState& sta
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
-    if (version >= 15u) {
+    if (version >= 16u) {
+        if (!rd_config_v16(f, cfg)) return false;
+    } else if (version >= 15u) {
         if (!rd_config_v15(f, cfg)) return false;
     } else if (version >= 14u) {
         if (!rd_config_v14(f, cfg)) return false;

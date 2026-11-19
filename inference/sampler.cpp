@@ -69,15 +69,6 @@ void SamplingConfig::validate() {
     if (no_repeat_ngram > 8) no_repeat_ngram = 8;
 }
 
-double Sampler::log_prob(const float* logits, int vocab, i32 token) {
-    if (token < 0 || token >= vocab) return -1e30;
-    float mx = logits[0];
-    for (int i = 1; i < vocab; ++i) mx = std::max(mx, logits[i]);
-    double sum = 0.0;
-    for (int i = 0; i < vocab; ++i) sum += std::exp(static_cast<double>(logits[i] - mx));
-    return static_cast<double>(logits[token] - mx) - std::log(sum);
-}
-
 void Sampler::apply_penalties(float* logits, int vocab, const std::vector<i32>& hist) const {
     if (hist.empty()) return;
     const bool rep  = cfg_.repetition_penalty != 1.0f;
@@ -98,13 +89,13 @@ void Sampler::apply_penalties(float* logits, int vocab, const std::vector<i32>& 
     }
     if (win_buf.empty()) return;
     std::sort(win_buf.begin(), win_buf.end());
+    // Only history tokens are touched: O(history log history), not O(vocab).
     for (size_t i = 0; i < win_buf.size();) {
         size_t j = i + 1;
         while (j < win_buf.size() && win_buf[j] == win_buf[i]) ++j;
         const int n = static_cast<int>(j - i);
         float& l = logits[win_buf[i]];
         if (rep) {
-
             l = (l > 0.0f) ? l / cfg_.repetition_penalty : l * cfg_.repetition_penalty;
         }
         if (freq) l -= cfg_.frequency_penalty * static_cast<float>(n);
@@ -136,9 +127,16 @@ i32 Sampler::sample(float* logits, int vocab, const std::vector<i32>& history) {
     if (cfg_.no_repeat_ngram > 0) ban_no_repeat_ngram(logits, vocab, history, cfg_.no_repeat_ngram);
 
     if (cfg_.greedy || cfg_.temperature <= 0.0f || cfg_.top_k == 1) {
-        int best = 0;
-        float bv = logits[0];
-        for (int i = 1; i < vocab; ++i) if (logits[i] > bv) { bv = logits[i]; best = i; }
+        int best = -1;
+        float bv = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < vocab; ++i) {
+            const float v = logits[i];
+            if (std::isfinite(v) && (best < 0 || v > bv)) { bv = v; best = i; }
+        }
+        if (best < 0) {  // all logits non-finite: deterministic fallback
+            best = 0;
+            for (int i = 1; i < vocab; ++i) if (logits[i] > logits[best]) best = i;
+        }
         return best;
     }
 

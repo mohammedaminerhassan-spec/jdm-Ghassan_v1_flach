@@ -183,7 +183,7 @@ if(GAI_ENABLE_PARQUET)
         set(GAI_HAVE_PARQUET ON)
         target_link_libraries(gai_core PUBLIC Arrow::arrow_shared Parquet::parquet_shared)
         target_compile_definitions(gai_core PUBLIC GAI_PARQUET=1)
-        message(STATUS "[ghassan-ai] parquet: Arrow ${Arrow_VERSION} (native lake input enabled)")
+        message(STATUS "[ghassan-ai] parquet: Arrow ${Arrow_VERSION} found, but there is NO native Parquet reader in the engine yet; use tools/py/prepare_dataset.py to convert Parquet -> .txt/.jsonl first")
     else()
         message(STATUS "[ghassan-ai] parquet: GAI_ENABLE_PARQUET=ON but Arrow/Parquet not found -> parquet route disabled")
     endif()
@@ -209,11 +209,15 @@ foreach(t ghassan-ai gai_train)
     gai_apply_cxx_flags(${t})
 endforeach()
 
+# End-to-end decode/prefill latency lives in `ghassan-ai bench` (it reports
+# ms/token and tokens/s from the real generation loop). The old
+# tools/bench_latency.cpp micro-benchmark only timed two sampling ops and
+# re-uploaded the logits every iteration, so its numbers were not
+# end-to-end and were removed.
+
 if(GAI_BUILD_TESTS)
-    # The repository ships no test binaries: verification is done by the
-    # Kaggle smoke runs (load -> forward -> export -> reload). The option is
-    # kept so a local tests/ directory can still be added without editing
-    # the build.
+    # Regression tests live in tests/test_*.cpp. Kaggle smoke runs
+    # (load -> forward -> export -> reload) remain the integration check.
     file(GLOB GAI_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/test_*.cpp)
     list(LENGTH GAI_TEST_SOURCES GAI_TEST_COUNT)
     if(GAI_TEST_COUNT EQUAL 0)

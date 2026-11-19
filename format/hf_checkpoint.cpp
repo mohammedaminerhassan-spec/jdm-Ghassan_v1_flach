@@ -83,8 +83,8 @@ bool SafeTensorsFile::open(const std::string& path) {
             log_error("[safetensors] bad data_offsets for " + name);
             return false;
         }
-        if (ti.end > file_size_ - 8 - header_len) {
-            log_error("[safetensors] " + name + " points past the end of the file");
+        if (ti.begin > ti.end || ti.end > file_size_ - 8 - header_len) {
+            log_error("[safetensors] " + name + " has invalid data_offsets");
             return false;
         }
         tensors_.emplace(name, std::move(ti));
@@ -271,6 +271,11 @@ bool build_hf_tokenizer(const HfTokenizerInput& in, Tokenizer& tk,
     }
     i64 max_all = max_id;
     for (const auto& a : added_tokens) max_all = std::max(max_all, a.id);
+    // A corrupt/hostile tokenizer.json must not drive a multi-GB allocation.
+    if (max_all < 0 || max_all > 2'000'000) {
+        log_error("[hf] tokenizer id out of range (max=" + std::to_string(max_all) + ")");
+        return false;
+    }
     std::vector<std::string> ordered(static_cast<size_t>(max_all) + 1);
     std::vector<char> filled(static_cast<size_t>(max_all) + 1, 0);
     for (const auto& [tok, id] : vocab.items()) {
@@ -491,9 +496,14 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
     // is the default here. Getting this wrong silently destroys the
     // pretrained positional signal without any error.
     cfg_.rope_type        = 1;
+    // Modern byte-BPE checkpoints (Qwen/Granite family) tie the output
+    // projection to the embedding. Defaulting to false when the key is
+    // absent allocates a separate random lm_head and silently changes the
+    // model; tied is the safe default (the loader falls back to the
+    // embedding when no output tensor exists anyway).
     cfg_.tie_embeddings   = j.has("tie_word_embeddings")
-                                ? j.at("tie_word_embeddings").as_bool(false)
-                                : false;
+                                ? j.at("tie_word_embeddings").as_bool(true)
+                                : true;
 
     // head_dim: a few architectures declare it explicitly (it is then
     // smaller than hidden_size / num_heads).
@@ -634,6 +644,12 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
     // fine-tuning gradient and the reported loss.
     if (j.has("router_aux_loss_coef")) {
         cfg_.moe_aux_scale = static_cast<float>(fnum("router_aux_loss_coef", 0.0));
+    }
+    // Auxiliary-loss-free load balancing is a recipe flag (DeepSeek-V3
+    // style bias steering). It was never read from config.json, so exported
+    // checkpoints silently reloaded with aux-loss balancing instead.
+    if (j.has("moe_aux_free")) {
+        cfg_.moe_aux_free = j.at("moe_aux_free").as_bool(false);
     }
 
     // RoPE scaling (YaRN). Map the factor onto the engine's YaRN rope path so

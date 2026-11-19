@@ -42,7 +42,11 @@ public:
 
     u64 below(u64 n) {
         GAI_CHECK(n > 0, "below(0)");
-        return next_u64() % n;
+        // Lemire's method: unbiased in O(1) expected time, unlike % n.
+        u64 t = (0u - n) % n;   // 2^64 % n
+        u64 v;
+        do { v = next_u64(); } while (v < t);
+        return v % n;
     }
 
     float normal(float mean = 0.0f, float stddev = 1.0f) {

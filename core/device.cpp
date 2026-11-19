@@ -29,6 +29,22 @@ namespace fs = std::filesystem;
 
 namespace {
 
+#ifdef _WIN32
+// The ANSI Win32 APIs cannot open paths containing non-ASCII characters
+// (Arabic, CJK, ...). Convert the engine's UTF-8 std::string to UTF-16 and
+// use the wide variants everywhere.
+static std::wstring wide_path(const std::string& p) {
+    if (p.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, p.c_str(),
+                                      static_cast<int>(p.size()), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, p.c_str(), static_cast<int>(p.size()),
+                        out.data(), n);
+    return out;
+}
+#endif
+
 struct FileId {
     unsigned long long hi = 0;
     unsigned long long lo = 0;
@@ -39,7 +55,7 @@ struct FileId {
 FileId file_id_of(const std::string& path) {
     FileId id;
 #ifdef _WIN32
-    HANDLE h = CreateFileA(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    HANDLE h = CreateFileW(wide_path(path).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (h == INVALID_HANDLE_VALUE) return id;
     BY_HANDLE_FILE_INFORMATION info{};
@@ -126,7 +142,7 @@ size_t free_disk_bytes(const std::string& path) {
     std::string p = path;
     for (int depth = 0; depth < 8; ++depth) {
 #ifdef _WIN32
-        const DWORD attr = GetFileAttributesA(p.c_str());
+        const DWORD attr = GetFileAttributesW(wide_path(p).c_str());
         const bool exists = (attr != INVALID_FILE_ATTRIBUTES);
         // A file path has the disk space of its parent dir: walk up.
         if (exists && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -137,7 +153,7 @@ size_t free_disk_bytes(const std::string& path) {
         }
         if (exists) {
             ULARGE_INTEGER avail{};
-            if (GetDiskFreeSpaceExA(p.c_str(), &avail, nullptr, nullptr))
+            if (GetDiskFreeSpaceExW(wide_path(p).c_str(), &avail, nullptr, nullptr))
                 return static_cast<size_t>(avail.QuadPart);
             return 0;
         }

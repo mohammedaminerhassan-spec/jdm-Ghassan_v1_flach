@@ -26,7 +26,7 @@ static inline const W* expert_offset(const W* base, i64 elems, int qkind) {
     if (qkind < 0) return base + elems;
     const int bpb = (qkind == 0) ? 9 : (qkind == 1) ? 10 : 17; // u16 per 32-val block
     return reinterpret_cast<const W*>(reinterpret_cast<const u16*>(base) +
-                                      (elems / 32) * bpb);
+                                      ((elems + 31) / 32) * bpb);
 }
 
 template <typename W>
@@ -322,40 +322,6 @@ __global__ void k_route_bias(const float* logits, const float* bias,
     }
 }
 
-__global__ void k_gather_tok(const float* src, const i32* slots, float* dst,
-                             i64 nslots, int rowlen, int K) {
-    i64 stride = (i64)gridDim.x * blockDim.x;
-    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
-        i32 t = slots[s] / K;
-        const float* r = src + (i64)t * rowlen;
-        float* o = dst + s * rowlen;
-        int j = 0;
-        if ((rowlen & 3) == 0 && f4_ok(r) && f4_ok(o)) {
-            const float4* r4 = reinterpret_cast<const float4*>(r);
-            float4* o4 = reinterpret_cast<float4*>(o);
-            for (; j < rowlen / 4; ++j) o4[j] = r4[j];
-        } else {
-            for (; j < rowlen; ++j) o[j] = r[j];
-        }
-    }
-}
-
-__global__ void k_gather(const float* src, const i32* slots, float* dst,
-                         i64 nslots, int rowlen) {
-    i64 stride = (i64)gridDim.x * blockDim.x;
-    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
-        const float* r = src + (i64)slots[s] * rowlen;
-        float* o = dst + s * rowlen;
-        if ((rowlen & 3) == 0 && f4_ok(r) && f4_ok(o)) {
-            const float4* r4 = reinterpret_cast<const float4*>(r);
-            float4* o4 = reinterpret_cast<float4*>(o);
-            for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
-        } else {
-            for (int j = 0; j < rowlen; ++j) o[j] = r[j];
-        }
-    }
-}
-
 __global__ void k_scatter_copy(const float* src, const i32* slots, float* dst,
                                i64 nslots, int rowlen) {
     i64 stride = (i64)gridDim.x * blockDim.x;
@@ -534,30 +500,6 @@ void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
     GAI_CHECK(ne >= 1 && ne <= 64, "moe_count_slots: ne out of kernel range [1,64]");
     k_count_slots<<<grid_for(NK, 256), 256>>>(idx, acc, NK, ne);
     CU_CHECK(cudaGetLastError());
-}
-
-__global__ void k_scale_rows(const float* src, const float* w, const i32* slots,
-                             float* dst, i64 nslots, int d, int K) {
-    i64 stride = (i64)gridDim.x * blockDim.x;
-    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
-        i32 slot = slots[s];
-        i32 t = slot / K;
-        i32 k = slot % K;
-        float wv = w[(i64)t * K + k];
-        const float* r = src + (i64)t * d;
-        float* o = dst + s * d;
-        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
-            const float4* r4 = reinterpret_cast<const float4*>(r);
-            float4* o4 = reinterpret_cast<float4*>(o);
-            for (int j = 0; j < d / 4; ++j) {
-                float4 v = r4[j];
-                v.x *= wv; v.y *= wv; v.z *= wv; v.w *= wv;
-                o4[j] = v;
-            }
-        } else {
-            for (int j = 0; j < d; ++j) o[j] = r[j] * wv;
-        }
-    }
 }
 
 __device__ __forceinline__ float silu_f(float v) {
@@ -840,7 +782,8 @@ static void moe_forward_bias_impl(const float* x, const float* router_w, const f
     if (N <= 0) return;
     if (!router_bias) {
         moe_forward_impl<W>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
-                            probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K, SH);
+                            probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K, SH,
+                            qkind);
         return;
     }
 
@@ -939,7 +882,7 @@ void moe_forward_half(const float* x, const float* router_w,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                  i64 N, int d, int E, int ne, int K, int SH, int qkind = -1) {
+                  i64 N, int d, int E, int ne, int K, int SH, int qkind) {
     moe_forward_impl<u16>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
                           probs_cache, idx_cache, w_cache, s_gate, s_up, s_act,
                           N, d, E, ne, K, SH, qkind);
@@ -964,7 +907,7 @@ void moe_forward_bias_half(const float* x, const float* router_w, const float* r
                       float* out,
                       float* probs_cache, i32* idx_cache, float* w_cache,
                       float* s_gate, float* s_up, float* s_act,
-                      i64 N, int d, int E, int ne, int K, int SH, int qkind = -1) {
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind) {
     moe_forward_bias_impl<u16>(x, router_w, router_bias, gates, ups, downs,
                                sh_g, sh_u, sh_d, out,
                                probs_cache, idx_cache, w_cache,

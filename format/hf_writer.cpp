@@ -48,6 +48,10 @@ SafeTensorsWriter::~SafeTensorsWriter() {
         out_.flush();
         out_.close();
     }
+    if (begun_ && !tmp_path_.empty()) {
+        std::error_code ec;
+        fs::remove(tmp_path_, ec);  // incomplete staged file is never useful
+    }
 }
 
 void SafeTensorsWriter::reserve(const std::string& name, const std::vector<i64>& shape,
@@ -85,7 +89,10 @@ bool SafeTensorsWriter::begin() {
     const size_t pad = (8 - ((8 + head.size()) % 8)) % 8;
     head.append(pad, ' ');
 
-    out_.open(path_, std::ios::binary | std::ios::trunc);
+    // Stage to a temp file: finish() publishes it atomically so a failed
+    // export never destroys a previously valid checkpoint.
+    tmp_path_ = path_ + ".tmp";
+    out_.open(tmp_path_, std::ios::binary | std::ios::trunc);
     if (!out_.good()) return false;
     const uint64_t hlen = static_cast<uint64_t>(head.size());
     out_.write(reinterpret_cast<const char*>(&hlen), 8);
@@ -111,10 +118,23 @@ bool SafeTensorsWriter::finish() {
     if (!begun_) return false;
     if (cursor_ != entries_.size()) return false;
     out_.flush();
-    const bool ok = out_.good();
+    bool ok = out_.good();
     out_.close();
+    ok = ok && !out_.fail() && !failed_;
     begun_ = false;
-    return ok && !failed_;
+    if (!ok) {
+        std::error_code ec;
+        if (!tmp_path_.empty()) fs::remove(tmp_path_, ec);
+        return false;
+    }
+    std::error_code ec;
+    if (fs::exists(path_, ec) && !ec) {
+        fs::remove(path_, ec);
+        if (ec) { log_error("[hf ] cannot replace " + path_ + ": " + ec.message()); return false; }
+    }
+    fs::rename(tmp_path_, path_, ec);
+    if (ec) { log_error("[hf ] cannot publish " + path_ + ": " + ec.message()); return false; }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +154,22 @@ std::vector<float> host_f32(const Tensor& t) {
     // narrow it again to the requested dtype.
     Tensor f32 = quant::dequantize(cpu, DType::F32);
     return std::vector<float>(f32.f32(), f32.f32() + f32.numel());
+}
+
+// host_f32 with the LoRA delta folded in: the exported weights are the
+// MERGED function (base + scale * B A) for any parameter that carries an
+// enabled adapter. Computing the delta here - instead of requantizing a
+// merged base - keeps a QLoRA run exact: the delta never round-trips
+// through Q4/Q8, and the base keeps its storage precision until encode().
+std::vector<float> host_f32_merged(const Model& model, const Parameter& p) {
+    std::vector<float> base = host_f32(p.w);
+    std::vector<float> delta;
+    if (model.lora_delta_for(p.name, delta)) {
+        GAI_CHECK(delta.size() == base.size(),
+                  "the LoRA delta and the base weight have different sizes for " + p.name);
+        for (size_t i = 0; i < base.size(); ++i) base[i] += delta[i];
+    }
+    return base;
 }
 
 void encode(const std::vector<float>& src, SafeDType dt, uint8_t* dst) {
@@ -210,11 +246,14 @@ std::vector<ExportTensor> plan_safetensors_export(Model& model, SafeDType dtype)
                     t.shape = {2LL * ne * E, d};
                     t.dtype = dtype;
                     t.nbytes = static_cast<size_t>(2 * ne * E * d) * safe_dtype_size(dtype);
-                    const Parameter* pg = p;
-                    const Parameter* pu = other;
-                    t.fill = [pg, pu, ne, E, d, dtype](uint8_t* dst) {
-                        std::vector<float> g = host_f32(pg->w);
-                        std::vector<float> u = host_f32(pu->w);
+                    // Resolve by NAME, not by table order: params_ order is
+                    // an implementation detail and a swap would silently
+                    // exchange the gate and up halves of every expert.
+                    const Parameter* pg = (leaf == "moe_gate") ? p : other;
+                    const Parameter* pu = (leaf == "moe_gate") ? other : p;
+                    t.fill = [&model, pg, pu, ne, E, d, dtype](uint8_t* dst) {
+                        std::vector<float> g = host_f32_merged(model, *pg);
+                        std::vector<float> u = host_f32_merged(model, *pu);
                         const size_t block = static_cast<size_t>(E) * static_cast<size_t>(d);
                         std::vector<float> packed(2 * block * static_cast<size_t>(ne));
                         for (int e = 0; e < ne; ++e) {
@@ -248,9 +287,9 @@ std::vector<ExportTensor> plan_safetensors_export(Model& model, SafeDType dtype)
                     // shared-expert weight.
                     const Parameter* pg = (leaf == "moe_sh_gate") ? p : other;
                     const Parameter* pu = (leaf == "moe_sh_gate") ? other : p;
-                    t.fill = [pg, pu, SH, d, dtype](uint8_t* dst) {
-                        std::vector<float> g = host_f32(pg->w);
-                        std::vector<float> u = host_f32(pu->w);
+                    t.fill = [&model, pg, pu, SH, d, dtype](uint8_t* dst) {
+                        std::vector<float> g = host_f32_merged(model, *pg);
+                        std::vector<float> u = host_f32_merged(model, *pu);
                         const size_t half = static_cast<size_t>(SH) * static_cast<size_t>(d);
                         std::vector<float> packed(2 * half);
                         std::memcpy(packed.data(), g.data(), half * sizeof(float));
@@ -270,8 +309,8 @@ std::vector<ExportTensor> plan_safetensors_export(Model& model, SafeDType dtype)
                     t.dtype = dtype;
                     t.nbytes = static_cast<size_t>(p->numel()) * safe_dtype_size(dtype);
                     const Parameter* pp = p;
-                    t.fill = [pp, dtype](uint8_t* dst) {
-                        encode(host_f32(pp->w), dtype, dst);
+                    t.fill = [&model, pp, dtype](uint8_t* dst) {
+                        encode(host_f32_merged(model, *pp), dtype, dst);
                     };
                     out.push_back(std::move(t));
                     continue;
@@ -283,8 +322,8 @@ std::vector<ExportTensor> plan_safetensors_export(Model& model, SafeDType dtype)
                     t.dtype = dtype;
                     t.nbytes = static_cast<size_t>(p->numel()) * safe_dtype_size(dtype);
                     const Parameter* pp = p;
-                    t.fill = [pp, dtype](uint8_t* dst) {
-                        encode(host_f32(pp->w), dtype, dst);
+                    t.fill = [&model, pp, dtype](uint8_t* dst) {
+                        encode(host_f32_merged(model, *pp), dtype, dst);
                     };
                     out.push_back(std::move(t));
                     continue;
@@ -308,8 +347,8 @@ std::vector<ExportTensor> plan_safetensors_export(Model& model, SafeDType dtype)
                 t.dtype = dtype;
                 t.nbytes = static_cast<size_t>(p->numel()) * safe_dtype_size(dtype);
                 const Parameter* pp = p;
-                t.fill = [pp, dtype](uint8_t* dst) {
-                    encode(host_f32(pp->w), dtype, dst);
+                t.fill = [&model, pp, dtype](uint8_t* dst) {
+                    encode(host_f32_merged(model, *pp), dtype, dst);
                 };
                 out.push_back(std::move(t));
                 continue;
@@ -328,8 +367,8 @@ std::vector<ExportTensor> plan_safetensors_export(Model& model, SafeDType dtype)
                            safe_dtype_size(dtype);
                 const Parameter* pp = p;
                 const size_t row_off = static_cast<size_t>(e) * static_cast<size_t>(rows_per_expert);
-                t.fill = [pp, row_off, rows_per_expert, cols, dtype](uint8_t* dst) {
-                    std::vector<float> all = host_f32(pp->w);
+                t.fill = [&model, pp, row_off, rows_per_expert, cols, dtype](uint8_t* dst) {
+                    std::vector<float> all = host_f32_merged(model, *pp);
                     const size_t off = row_off * static_cast<size_t>(cols);
                     const size_t n = static_cast<size_t>(rows_per_expert) * static_cast<size_t>(cols);
                     std::vector<float> part(all.begin() + static_cast<std::ptrdiff_t>(off),
@@ -350,8 +389,8 @@ std::vector<ExportTensor> plan_safetensors_export(Model& model, SafeDType dtype)
         t.dtype = dtype;
         t.nbytes = static_cast<size_t>(p->numel()) * safe_dtype_size(dtype);
         const Parameter* pp = p;
-        t.fill = [pp, dtype](uint8_t* dst) {
-            encode(host_f32(pp->w), dtype, dst);
+        t.fill = [&model, pp, dtype](uint8_t* dst) {
+            encode(host_f32_merged(model, *pp), dtype, dst);
         };
         out.push_back(std::move(t));
     }
@@ -413,18 +452,28 @@ std::string hf_config_json(const ModelConfig& cfg, const std::string& model_name
     if (!description.empty()) {
         j.set("description", Json::string(description));
     }
+    // The bases this engine exports (IBM Granite-4.0 hybrid, Qwen3) are
+    // Apache-2.0. A derivative artifact must carry the license notice
+    // (Apache-2.0 section 4), and the license id is a required field for a
+    // HuggingFace repository to be auto-tagged correctly.
+    j.set("license", Json::string("apache-2.0"));
     if (cfg.sliding_window > 0) {
         j.set("sliding_window", Json::integer(cfg.sliding_window));
         j.set("use_sliding_window", Json::boolean(true));
     }
     if (cfg.use_qkv_bias) j.set("attention_bias", Json::boolean(true));
+    if (cfg.moe_aux_free) j.set("moe_aux_free", Json::boolean(true));
     if (cfg.use_qk_norm) j.set("use_qk_norm", Json::boolean(true));
-    if (cfg.rope_type == 1) j.set("rope_scaling_style", Json::string("neox"));
     if (cfg.rope_scale > 1.0f) {
         Json rs = Json::object();
         rs.set("rope_type", Json::string("yarn"));
         rs.set("factor", Json::number(cfg.rope_scale));
-        rs.set("original_max_position_embeddings", Json::integer(cfg.max_seq_len));
+        // The reader maps this field to rope_yarn_low (the SHORT context).
+        // Writing max_seq_len (the LONG context) shifts the YaRN ramp after a
+        // save/load round-trip.
+        rs.set("original_max_position_embeddings",
+               Json::integer(cfg.rope_yarn_low > 0 ? static_cast<i64>(cfg.rope_yarn_low)
+                                                   : cfg.max_seq_len));
         if (cfg.rope_yarn_mscale > 0.0f) rs.set("mscale", Json::number(cfg.rope_yarn_mscale));
         j.set("rope_scaling", rs);
     }
@@ -592,6 +641,30 @@ bool export_model_safetensors(const std::string& dir, Model& model,
         const std::string gc_path = (fs::path(dir) / "generation_config.json").string();
         if (!write_file(gc_path, g.dump_pretty())) {
             log_error("[hf ] failed to write " + gc_path);
+            return false;
+        }
+    }
+
+    // ---- NOTICE (Apache-2.0 section 4(d): retain the upstream copyright) ----
+    // The export is a derivative of an Apache-2.0 base (IBM Granite-4.0
+    // hybrid or Qwen3). The license requires the copyright notice to travel
+    // with the artifact, so it is written as a file instead of being
+    // something a caller might forget.
+    {
+        const char* notice =
+            "Ghassan v1 Flash\n"
+            "================\n"
+            "This model is a derivative of an Apache-2.0 licensed base model:\n"
+            "  - IBM Granite-4.0 (hybrid Mamba-2/Transformer), (c) IBM Corp. and contributors\n"
+            "  - Qwen3, (c) Alibaba Cloud and contributors\n"
+            "\n"
+            "It is distributed under the Apache License, Version 2.0.\n"
+            "A copy of the license is available at:\n"
+            "  https://www.apache.org/licenses/LICENSE-2.0\n"
+            "\n"
+            "This notice must be preserved with any distribution of this model.\n";
+        if (!write_file((fs::path(dir) / "NOTICE").string(), notice)) {
+            log_error("[hf ] failed to write NOTICE");
             return false;
         }
     }

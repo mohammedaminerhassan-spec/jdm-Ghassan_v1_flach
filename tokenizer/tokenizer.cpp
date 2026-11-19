@@ -9,6 +9,13 @@
 
 namespace gai {
 
+// The GPT-2 / Qwen contraction alternatives are case-insensitive in the
+// reference regex ((?i:'s|'t|...)). Compare ASCII letters folded to lower
+// case so "'S" and "'LL" are matched as contractions too.
+static inline u32 ascii_lower(u32 c) {
+    return (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c;
+}
+
 // ---------------------------------------------------------------------------
 // GPT-2 byte-level alphabet
 // ---------------------------------------------------------------------------
@@ -258,12 +265,10 @@ void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const
     GAI_CHECK(piece.size() <= static_cast<size_t>(std::numeric_limits<int>::max()),
               "tokenizer chunk exceeds int range");
 
-    auto whole = token_ids_.find(piece);
-    if (whole != token_ids_.end() && whole->second >= 0 &&
-        special_ids_.find(whole->second) == special_ids_.end()) {
-        out.push_back(whole->second);
-        return;
-    }
+    // Do not shortcut when `piece` happens to be a vocabulary entry: the
+    // reference BPE always starts from the byte alphabet and applies merges
+    // by rank, which can produce a different segmentation than emitting the
+    // whole-token id directly. The cache below is sufficient for speed.
     {
         std::lock_guard<std::mutex> lk(*cache_mu_);
         auto cit = cache_.find(piece);
@@ -368,7 +373,8 @@ std::vector<Chunk> pre_tokenize_gpt2(const std::string& text, bool split_digits)
                 if (i + len > n) continue;
                 bool ok = true;
                 for (size_t k = 0; k < len; ++k) {
-                    if (cps[i + k] != static_cast<u32>(static_cast<unsigned char>(con[k]))) {
+                    if (ascii_lower(cps[i + k]) !=
+                        ascii_lower(static_cast<u32>(static_cast<unsigned char>(con[k])))) {
                         ok = false;
                         break;
                     }
@@ -476,7 +482,8 @@ std::vector<Chunk> pre_tokenize_qwen(const std::string& text, int digits_max) {
                 if (i + len > n) continue;
                 bool ok = true;
                 for (size_t k = 0; k < len; ++k) {
-                    if (cps[i + k] != static_cast<u32>(static_cast<unsigned char>(con[k]))) {
+                    if (ascii_lower(cps[i + k]) !=
+                        ascii_lower(static_cast<u32>(static_cast<unsigned char>(con[k])))) {
                         ok = false;
                         break;
                     }

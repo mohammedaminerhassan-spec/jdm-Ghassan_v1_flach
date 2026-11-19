@@ -108,12 +108,8 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
         out[b].scale = fp32_to_fp16(scale);
         // GGML layout: low nibble = element j, high nibble = element j+16.
         for (int j = 0; j < Q4_BLOCK / 2; ++j) {
-            int q0 = 8, q1 = 8;
-            if (j < Q4_BLOCK) {
-                // element j is always in a full block
-            }
-            q0 = std::clamp(static_cast<int>(std::lround(x[j] * inv)), -8, 7) + 8;
-            q1 = std::clamp(static_cast<int>(std::lround(x[j + Q4_BLOCK / 2] * inv)), -8, 7) + 8;
+            const int q0 = std::clamp(static_cast<int>(std::lround(x[j] * inv)), -8, 7) + 8;
+            const int q1 = std::clamp(static_cast<int>(std::lround(x[j + Q4_BLOCK / 2] * inv)), -8, 7) + 8;
             out[b].q[j] = static_cast<u8>((q1 << 4) | q0);
         }
     }

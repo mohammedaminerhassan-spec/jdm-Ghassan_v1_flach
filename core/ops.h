@@ -137,8 +137,6 @@ void rmsnorm_backward(Device dev, const float* x, const float* weight, const flo
                       const float* rrms, float* dx, float* dweight,
                       i64 rows, int dim);
 
-void rope_forward(Device dev, float* q, float* k, const i32* pos,
-                  i64 ntok, int n_heads, int n_kv, int head_dim, float theta);
 void rope_backward(Device dev, float* dq, float* dk, const i32* pos,
                    i64 ntok, int n_heads, int n_kv, int head_dim, float theta);
 

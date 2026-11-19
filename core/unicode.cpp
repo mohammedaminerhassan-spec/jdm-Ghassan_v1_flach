@@ -99,14 +99,32 @@ std::string utf8_from_bytes(const std::string& bytes) {
 }
 
 bool utf8_is_complete(const std::string& s) {
-    // Reuse the full decoder: it also rejects overlong encodings, surrogate
-    // code points and values above U+10FFFF, which a continuation-byte-only
-    // check would let through.
+    // Validate byte-by-byte. The old version reused utf8_decode() and treated
+    // cp == U+FFFD as an error, which rejected perfectly valid text that
+    // literally contained the replacement character.
     size_t i = 0;
     while (i < s.size()) {
-        const size_t before = i;
-        const u32 cp = utf8_decode(s, i);
-        if (cp == 0xFFFD || i == before) return false;
+        const u8 b0 = static_cast<u8>(s[i]);
+        const int len = utf8_seq_len(b0);
+        if (len <= 0 || i + static_cast<size_t>(len) > s.size()) return false;
+        u32 cp = 0;
+        switch (len) {
+            case 1: cp = b0; break;
+            case 2: cp = b0 & 0x1Fu; break;
+            case 3: cp = b0 & 0x0Fu; break;
+            case 4: cp = b0 & 0x07u; break;
+            default: return false;
+        }
+        for (int k = 1; k < len; ++k) {
+            const u8 b = static_cast<u8>(s[i + static_cast<size_t>(k)]);
+            if ((b & 0xC0u) != 0x80u) return false;
+            cp = (cp << 6) | (b & 0x3Fu);
+        }
+        if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) ||
+            (len == 4 && cp < 0x10000) ||
+            (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF)
+            return false;
+        i += static_cast<size_t>(len);
     }
     return true;
 }
