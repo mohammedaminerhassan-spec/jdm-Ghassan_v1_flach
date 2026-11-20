@@ -112,6 +112,17 @@ void attn_free_pool() {
     g_attn_exp_cap = 0;
     if (g_attn_dsb) { CU_CHECK2(cudaFree(g_attn_dsb)); g_attn_dsb = nullptr; }
     g_attn_dsb_cap = 0;
+    // Free the device-side batched-GEMM pointer arrays so a model reload in the
+    // same process does not leak VRAM (the old code only freed them at process
+    // exit). These are allocated lazily in attn_ptr_buf() and reused across
+    // chunks; they must be released here alongside the other transient buffers.
+    for (int slot = 0; slot < 3; ++slot) {
+        if (g_attn_ptr[slot]) {
+            CU_CHECK2(cudaFree(g_attn_ptr[slot]));
+            g_attn_ptr[slot] = nullptr;
+        }
+        g_attn_ptr_cap[slot] = 0;
+    }
 }
 
 __global__ void k_attn_cvt_flat(const float* __restrict__ src, __half* __restrict__ dst, i64 n) {
@@ -143,8 +154,8 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
         for (int i = 0; i < nB; ++i) {
             if (!C[i]) continue;
             if (beta == 0.0f) {
-                CU_CHECK(cudaMemset2D(C[i], sizeof(float) * ldaC, 0,
-                                      sizeof(float) * N, M));
+                CU_CHECK2(cudaMemset2D(C[i], sizeof(float) * ldaC, 0,
+                                       sizeof(float) * N, M));
             } else if (beta != 1.0f) {
                 for (int r = 0; r < M; ++r)
                     scale_inplace(C[i] + static_cast<size_t>(r) * ldaC, beta, N);
@@ -185,9 +196,15 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
     if (tb) { if (ldaB < k_chunk) k_chunk = ldaB; }   // cublasA OP_T: lda >= k
     else     { if (ldaB < m_chunk) m_chunk = ldaB; }   // cublasA OP_N: lda >= m
 
-    // The per-batch base pointers (the packed ones in the fp16 branch).
-    std::vector<const void*> Ah(nB), Bh(nB);
-    std::vector<void*> Ch(nB);
+    // Reusable host pointer arrays: this function runs inside the decode hot
+    // loop (per layer, per token), so allocating three std::vectors on every
+    // call causes allocator contention and latency jitter. thread_local gives
+    // each caller its own scratch with no cross-thread data race.
+    thread_local std::vector<const void*> Ah, Bh;
+    thread_local std::vector<void*> Ch;
+    Ah.resize(static_cast<size_t>(nB));
+    Bh.resize(static_cast<size_t>(nB));
+    Ch.resize(static_cast<size_t>(nB));
     if (use_fp16) {
         // Mirror-convert the DENSE ranges once (flat: bitwise-identical to
         // per-matrix conversion); per-batch fp16 pointers follow by offset.
@@ -227,8 +244,13 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
                 // stride (the element size differs between the fp16 mirror
                 // and the raw fp32 buffers).
                 const size_t esz = use_fp16 ? sizeof(__half) : sizeof(float);
-                std::vector<const void*> Ac(nB), Bc(nB);
-                std::vector<void*> Cc(nB);
+                // Same reuse as the base pointer arrays above: no heap churn
+                // inside the chunk loop of every attention GEMM.
+                thread_local std::vector<const void*> Ac, Bc;
+                thread_local std::vector<void*> Cc;
+                Ac.resize(static_cast<size_t>(nB));
+                Bc.resize(static_cast<size_t>(nB));
+                Cc.resize(static_cast<size_t>(nB));
                 for (int i = 0; i < nB; ++i) {
                     // The engine's A (the cublas B-operand): the K dimension
                     // is the columns (ta=0) or the rows (ta=1); the M
@@ -427,8 +449,11 @@ void attention_forward_ex(const float* q, const float* k, const float* v,
     }
     // S = Q * K^T, one grouped call over all (b,h).
     {
-        std::vector<const float*> Aq(BH), Bq(BH);
-        std::vector<float*> Cs(BH);
+        thread_local std::vector<const float*> Aq, Bq;
+        thread_local std::vector<float*> Cs;
+        Aq.resize(static_cast<size_t>(BH));
+        Bq.resize(static_cast<size_t>(BH));
+        Cs.resize(static_cast<size_t>(BH));
         for (int b = 0; b < B; ++b) {
             for (int h = 0; h < H; ++h) {
                 const int i = b * H + h;
@@ -451,8 +476,11 @@ void attention_forward_ex(const float* q, const float* k, const float* v,
     }
     // O = P * V, written directly interleaved; one grouped call.
     {
-        std::vector<const float*> Ap(BH), Bp(BH);
-        std::vector<float*> Co(BH);
+        thread_local std::vector<const float*> Ap, Bp;
+        thread_local std::vector<float*> Co;
+        Ap.resize(static_cast<size_t>(BH));
+        Bp.resize(static_cast<size_t>(BH));
+        Co.resize(static_cast<size_t>(BH));
         for (int b = 0; b < B; ++b) {
             for (int h = 0; h < H; ++h) {
                 const int i = b * H + h;
@@ -496,8 +524,11 @@ void attention_backward_ex(const float* q, const float* k, const float* v,
     float* dE = g_attn_exp;  // expanded per-h dk/dv, then group-reduced
     // dP = dO * V^T into dS.
     {
-        std::vector<const float*> Ad(BH), Bd(BH);
-        std::vector<float*> Cd(BH);
+        thread_local std::vector<const float*> Ad, Bd;
+        thread_local std::vector<float*> Cd;
+        Ad.resize(static_cast<size_t>(BH));
+        Bd.resize(static_cast<size_t>(BH));
+        Cd.resize(static_cast<size_t>(BH));
         for (int b = 0; b < B; ++b) {
             for (int h = 0; h < H; ++h) {
                 const int i = b * H + h;
@@ -520,8 +551,11 @@ void attention_backward_ex(const float* q, const float* k, const float* v,
     }
     // dq = dS * K, written directly interleaved.
     {
-        std::vector<const float*> As(BH), Bs(BH);
-        std::vector<float*> Cq(BH);
+        thread_local std::vector<const float*> As, Bs;
+        thread_local std::vector<float*> Cq;
+        As.resize(static_cast<size_t>(BH));
+        Bs.resize(static_cast<size_t>(BH));
+        Cq.resize(static_cast<size_t>(BH));
         for (int b = 0; b < B; ++b) {
             for (int h = 0; h < H; ++h) {
                 const int i = b * H + h;
@@ -539,8 +573,14 @@ void attention_backward_ex(const float* q, const float* k, const float* v,
     }
     // dk = dS^T * Q and dv = P^T * dO, per-h expanded, then group-reduced.
     {
-        std::vector<const float*> Ak(BH), Bk(BH), Av(BH), Bv(BH);
-        std::vector<float*> Ck(BH), Cv(BH);
+        thread_local std::vector<const float*> Ak, Bk, Av, Bv;
+        thread_local std::vector<float*> Ck, Cv;
+        Ak.resize(static_cast<size_t>(BH));
+        Bk.resize(static_cast<size_t>(BH));
+        Av.resize(static_cast<size_t>(BH));
+        Bv.resize(static_cast<size_t>(BH));
+        Ck.resize(static_cast<size_t>(BH));
+        Cv.resize(static_cast<size_t>(BH));
         for (int b = 0; b < B; ++b) {
             for (int h = 0; h < H; ++h) {
                 const int i = b * H + h;

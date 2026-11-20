@@ -105,14 +105,19 @@ void Tokenizer::build(const std::vector<std::string>& vocab,
     if (opts.added_ids.empty()) {
         added_vec_ = special_vec_;
     } else {
-        added_vec_.reserve(opts.added_ids.size());
+        added_vec_.reserve(opts.added_ids.size() + special_vec_.size());
         for (i32 id : opts.added_ids) {
             if (id < 0) continue;
             if (added_ids_.insert(id).second) added_vec_.push_back(id);
         }
+        // Special tokens are added tokens too: encode() matches over
+        // added_vec_, so leaving them out would BPE-split their literal text
+        // whenever a metadata file declares a separate added-token list.
+        for (i32 id : special_vec_) {
+            if (added_ids_.insert(id).second) added_vec_.push_back(id);
+        }
         std::sort(added_vec_.begin(), added_vec_.end());
     }
-    for (i32 id : special_vec_) added_ids_.insert(id);
 
     merges_.clear();
     merges_.reserve(merges.size() * 2);

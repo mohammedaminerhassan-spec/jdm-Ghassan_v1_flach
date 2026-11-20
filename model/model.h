@@ -409,7 +409,7 @@ public:
                                                 int ce_chunks);
 
     // The recurrent state of the Mamba-2 layers (Granite hybrid).
-    static size_t mamba_state_bytes(const ModelConfig& cfg);
+    static size_t mamba_state_bytes(const ModelConfig& cfg, int batch = 1);
     // The inference KV cache for a given context length (fp16 packed).
     static size_t kv_cache_bytes(const ModelConfig& cfg, int max_len);
 

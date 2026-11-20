@@ -182,6 +182,11 @@ private:
     size_t opt_state_bytes() const;
     void   opt_set_step(i64 t);
     LrScheduler   sched_;
+    // A migrate resume that could not restore optimizer moments restarts t_=0
+    // on already-trained weights. The first optimizer steps would otherwise
+    // get an uncalibrated bias-correction jump, so ramp the LR in over a few
+    // steps. 0 = no warmup (normal start / exact resume).
+    i64           resume_warmup_steps_ = 0;
     DataLoader    train_loader_;
     DataLoader    val_loader_;
     TrainState    state_;

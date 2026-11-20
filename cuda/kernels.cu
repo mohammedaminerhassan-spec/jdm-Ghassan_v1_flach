@@ -362,7 +362,7 @@ static const char* cublas_status_name(cublasStatus_t s) {
 
 void gemm(bool trans_a, bool trans_b, int M, int N, int K,
           float alpha, const float* A, int lda, const float* B, int ldb,
-          float beta, float* C, int ldc) {
+          float beta, float* C, int ldc, bool force_fp32) {
     if (M <= 0 || N <= 0) return;
     if (K <= 0 || alpha == 0.0f) {
         if (beta == 0.0f) {
@@ -378,14 +378,14 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
 
     const i64 mnk = (i64)M * N * K;
     const i64 mnk_thr = ops::gemm_fp16_mnk_threshold();
-    if (g_fp16_gemm && mnk >= mnk_thr) {
+    if (!force_fp32 && g_fp16_gemm && mnk >= mnk_thr) {
         ops::perf_note_fp16_gemm();
         gemm_fp16(trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
 
 #if __CUDACC_VER_MAJOR__ >= 11
-    if (g_bf16_gemm && mnk >= mnk_thr) {
+    if (!force_fp32 && g_bf16_gemm && mnk >= mnk_thr) {
         ops::perf_note_fp16_gemm();
         gemm_bf16(trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
@@ -442,6 +442,10 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
 
 void linear_forward(const float* x, const float* w, float* y, int M, int K, int N) {
     gemm(false, true, M, N, K, 1.0f, x, K, w, K, 0.0f, y, N);
+}
+
+void linear_forward_f32(const float* x, const float* w, float* y, int M, int K, int N) {
+    gemm(false, true, M, N, K, 1.0f, x, K, w, K, 0.0f, y, N, /*force_fp32=*/true);
 }
 
 __global__ void k_f32_to_f16_flat(const float* src, __half* dst, i64 n) {

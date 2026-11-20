@@ -80,7 +80,13 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* smem, int lane
         if (lane == 0) smem[0] = w;
     }
     __syncthreads();
-    return smem[0];
+    const float result = smem[0];
+    // The caller may reuse the same shared buffer for another reduction
+    // (k_mamba_scan_bwd does this three times back-to-back). Without this
+    // final barrier a fast warp can overwrite smem[0] while a lagging warp
+    // is still reading it, silently corrupting da_log/dt gradients.
+    __syncthreads();
+    return result;
 }
 
 // ---------------------------------------------------------------- conv1d

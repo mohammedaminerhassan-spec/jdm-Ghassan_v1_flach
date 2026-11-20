@@ -550,7 +550,10 @@ void softmax_row(float* x, int n) {
     for (int i = 1; i < n; ++i) mx = std::max(mx, x[i]);
     float sum = 0.f;
     for (int i = 0; i < n; ++i) { x[i] = std::exp(x[i] - mx); sum += x[i]; }
-    float inv = 1.0f / sum;
+    // Guard against division by zero / underflow (all-extreme logits → sum≈0).
+    // Without this, MoE routing produces NaN weights that corrupt every expert
+    // output. 1e-12f is well below any realistic sum of exp(-large) values.
+    float inv = (sum > 1e-12f) ? (1.0f / sum) : 0.0f;
     for (int i = 0; i < n; ++i) x[i] *= inv;
 }
 

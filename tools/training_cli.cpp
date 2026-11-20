@@ -77,7 +77,10 @@ static void usage() {
     "      # llama (dense Ollama) | llama_moe (MoE Ollama, needs moe_shared=false)\n"
     "  --export <dir> --export-format safetensors --tokenizer <hf-dir>\n"
     "      # a HuggingFace repository (model.safetensors + config.json + the\n"
-    "      # tokenizer files): what you upload to the Hub.\n";
+    "      # tokenizer files): what you upload to the Hub.\n"
+      "  --thinking           mark the exported GGUF as a thinking model (adds\n"
+      "                       \"thinking\": \"1\" to GGUF metadata so inference CLI\n"
+      "                       knows to use the GhassanThinking chat template)\n";
 }
 
 int main(int argc, char** argv) {
@@ -645,10 +648,13 @@ print_device_report();
                 } else {
                     GAI_CHECK(fmt == "gguf", "unknown --export-format '" + fmt +
                                            "' (gguf|safetensors)");
+                    std::map<std::string, std::string> gguf_meta = {
+                        {"stage", cfg.get_str("training.stage", "pretrain")},
+                        {"steps", std::to_string(trainer.state().step)},
+                    };
+                    if (args.flag("thinking")) gguf_meta["thinking"] = "1";
                     export_model_gguf(args.str("export"), model, effective_tok,
-                                      gguf_profile_for(prof),
-                                      {{"stage", cfg.get_str("training.stage", "pretrain")},
-                                       {"steps", std::to_string(trainer.state().step)}},
+                                      gguf_profile_for(prof), gguf_meta,
                                       args.str("compat", "native"));
                 }
             }

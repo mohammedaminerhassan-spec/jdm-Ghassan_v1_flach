@@ -9,7 +9,7 @@ namespace cuda_ops {
 
 void gemm(bool trans_a, bool trans_b, int M, int N, int K,
           float alpha, const float* A, int lda, const float* B, int ldb,
-          float beta, float* C, int ldc);
+          float beta, float* C, int ldc, bool force_fp32 = false);
 
 void set_fp16_gemm(bool on);
 bool fp16_gemm_enabled();
@@ -21,6 +21,9 @@ void set_moe_jitter(float j);
 void set_moe_jitter_seed(u64 seed);
 
 void linear_forward(const float* x, const float* w, float* y, int M, int K, int N);
+// Router logits must be computed in FP32: a half-precision rounding can flip a
+// near-tie top-k decision and silently change which experts run.
+void linear_forward_f32(const float* x, const float* w, float* y, int M, int K, int N);
 void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, int N);
 void split_qkv(const float* qkv, float* q, float* k, float* v, i64 n, int qd, int kvd);
 void convert_f32_to_f16(const float* src, u16* dst, i64 n);

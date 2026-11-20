@@ -1,6 +1,7 @@
 #include "tools/model_loader.h"
 
 #include "core/device.h"
+#include "core/json.h"
 #include "core/ops.h"
 #include "format/gguf_codec.h"
 #include "format/hf_checkpoint.h"
@@ -8,6 +9,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 
 namespace fs = std::filesystem;
@@ -133,9 +135,13 @@ bool copy_tokenizer_files(const std::string& src, const std::string& dst_dir) {
     int copied = 0;
     if (fs::is_directory(src, ec)) {
         // The files a HuggingFace repository needs to load the tokenizer.
+        // generation_config.json is written by the exporter (the stop tokens
+        // belong to OUR artifact), and chat_template.jinja is deliberately
+        // skipped: an upstream template would advertise a foreign identity
+        // and a prompt format the engine does not use.
         static const char* kFiles[] = {
-            "tokenizer.json", "tokenizer_config.json", "generation_config.json",
-            "special_tokens_map.json", "chat_template.jinja", "vocab.json", "merges.txt",
+            "tokenizer.json", "tokenizer_config.json",
+            "special_tokens_map.json", "vocab.json", "merges.txt",
         };
         for (const char* f : kFiles) {
             const fs::path from = fs::path(src) / f;
@@ -148,6 +154,24 @@ bool copy_tokenizer_files(const std::string& src, const std::string& dst_dir) {
                 continue;
             }
             ++copied;
+        }
+        // Strip any inherited chat template / provenance from the copied
+        // tokenizer config. The engine renders prompts itself; external tools
+        // must see the same self-contained artifact.
+        const fs::path tc = fs::path(dst_dir) / "tokenizer_config.json";
+        if (fs::exists(tc, ec) && !ec) {
+            std::ifstream in(tc, std::ios::binary);
+            std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            Json j;
+            std::string err;
+            if (Json::parse(text, j, &err) && j.is_object()) {
+                for (const char* k : {"chat_template", "_name_or_path", "license",
+                                      "license_link", "author", "model_name"}) {
+                    if (j.has(k)) j.items().erase(k);
+                }
+                std::ofstream out(tc, std::ios::binary | std::ios::trunc);
+                if (out.good()) out << j.dump_pretty();
+            }
         }
     } else {
         // A bare tokenizer.json.
@@ -286,11 +310,8 @@ LoadedModel load_model(const Args& args) {
         lm.cfg = hf.config();
         lm.arch = "hf";
         lm.quant = "q8_k";
-        for (const std::string& f : hf.weight_files()) {
-            std::error_code ec;
-            const auto sz = fs::file_size(f, ec);
-            if (!ec) lm.file_bytes += static_cast<uint64_t>(sz);
-        }
+        // open() already measured the shard sizes; do not stat them again.
+        lm.file_bytes = hf.total_bytes();
 
         if (args.has("tokenizer")) {
             GAI_CHECK(load_tokenizer_auto(args.str("tokenizer"), lm.tokenizer, lm.eos_ids),

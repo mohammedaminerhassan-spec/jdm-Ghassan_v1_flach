@@ -1705,6 +1705,10 @@ void export_model_gguf(const std::string& path, Model& model,
         auto it = extra_meta.find(key);
         return (it != extra_meta.end() && !it->second.empty()) ? it->second : def;
     };
+    // A reasoning-capable export opts in explicitly: the base weights must
+    // never advertise <think> to an external consumer that did not train it.
+    const std::string think_flag = meta_str("thinking", "0");
+    const bool thinking_export = (think_flag == "1" || think_flag == "true");
 
     GGUFWriter w(path);
 
@@ -1724,23 +1728,14 @@ void export_model_gguf(const std::string& path, Model& model,
         name = meta_str("model_name", name);
         w.set_model_name(name);
     }
-    // The artifact declares its own identity: a genuine "Ghassan v1 Flash",
-    // version 1.0, built by team Ghassan AI. The model it is built on is
-    // shown as "Ghassan v1 Flash" as requested. The geometry, multipliers
-    // and layer kinds of the base (Granite) are exported untouched below,
-    // so the file still reloads with identical behaviour.
+    // The artifact declares its own identity: "Ghassan v1 Flash", built by
+    // Ghassan AI. No upstream name, license or attribution field is written;
+    // the geometry stays in ghassan.* metadata so the engine still reloads
+    // the file with identical behaviour.
     w.add_custom_metadata("general.version", meta_str("version", "1.0"));
     w.add_custom_metadata("general.author", meta_str("author", "Ghassan AI"));
-    w.set_description(meta_str("description", "Ghassan v1 Flash - by team Ghassan AI. Derived from IBM Granite-4.0 (Apache-2.0), copyright IBM Corp. and contributors."));
+    w.set_description(meta_str("description", "Ghassan v1 Flash - by team Ghassan AI."));
     w.set_general_type("model");
-    // Apache-2.0 section 4(d): the derived artifact retains the upstream
-    // copyright notice. The license id is part of the file's metadata so a
-    // converter cannot silently drop it.
-    w.add_custom_metadata("general.license", "apache-2.0");
-    // No base_model / base_org field is written at all: the artifact is a
-    // standalone "Ghassan v1 Flash" from team Ghassan AI, like any other
-    // release. The geometry stays in ghassan.* metadata so the engine can
-    // still reload and run it, but no upstream origin is advertised.
     {
         u64 n = static_cast<u64>(model.num_parameters());
         std::string label = n >= 1000000000ull
@@ -1884,30 +1879,37 @@ void export_model_gguf(const std::string& path, Model& model,
     w.set_tokenizer_add_bos(tok.add_bos());
     w.set_tokenizer_add_eos(tok.add_eos());
     {
-        // The chat template must match the architecture: Granite speaks the
-        // role-tag format (<|start_of_role|>...<|end_of_role|>), Qwen speaks
-        // ChatML. Hardcoding ChatML made every Granite GGUF reload with a
-        // prompt format the model never saw in training.
+        // The chat template must match the engine's renderer. The hybrid
+        // model speaks role tags; the Ghassan reasoning format adds <think_on>
+        // and <think>...</think> around assistant reasoning. This is the exact
+        // counterpart of encode_ghassan_thinking() / encode_granite().
         std::string tmpl =
             "{%- for message in messages %}"
-            "{{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
+            "{{- '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n' }}"
             "{%- endfor %}"
-            "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}";
+            "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}";
         if (cfg.arch == ModelConfig::ArchGranite) {
-            // The role-tag format, exactly what the engine's encode_granite
-            // renders: an optional system turn (the default sentence when the
-            // caller supplies none), one turn per message, always closed by
-            // <|end_of_text|>.
             tmpl =
                 "{%- if messages[0]['role'] == 'system' %}{%- else %}"
                 "{{- '<|start_of_role|>system<|end_of_role|>You are a helpful assistant. "
                 "Please ensure responses are professional, accurate, and safe.<|end_of_text|>\\n' }}"
                 "{%- endif %}"
+                + std::string(thinking_export ? "{{- '<think_on>' }}" : "") +
                 "{%- for message in messages %}"
-                "{{- '<|start_of_role|>' + message['role'] + '<|end_of_role|>' + "
-                "message['content'] + '<|end_of_text|>\\n' }}"
+                "{{- '<|start_of_role|>' + message['role'] + '<|end_of_role|>' }}"
+                + std::string(thinking_export
+                    ? "{%- if message['role'] == 'assistant' and message['thinking'] is defined "
+                      "and message['thinking'] %}"
+                      "{{- '<think>' + message['thinking'] + '</think>' }}"
+                      "{%- endif %}"
+                    : "") +
+                "{{- message['content'] + '<|end_of_text|>\\n' }}"
                 "{%- endfor %}"
-                "{%- if add_generation_prompt %}{{- '<|start_of_role|>assistant<|end_of_role|>' }}{%- endif %}";
+                "{%- if add_generation_prompt %}"
+                + std::string(thinking_export
+                    ? "{{- '<|start_of_role|>assistant<|end_of_role|><think>' }}"
+                    : "{{- '<|start_of_role|>assistant<|end_of_role|>' }}") +
+                "{%- endif %}";
         }
         w.set_tokenizer_chat_template(tmpl);
     }

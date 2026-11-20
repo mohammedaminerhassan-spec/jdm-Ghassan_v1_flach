@@ -79,6 +79,9 @@ public:
     const ModelConfig& config() const { return cfg_; }
     const std::string& dir() const { return dir_; }
     const std::vector<std::string>& weight_files() const { return weight_files_; }
+    // Sum of the weight-file sizes measured once in open(); avoids a second
+    // round of filesystem stat() calls in every CLI that loads a checkpoint.
+    uint64_t total_bytes() const { return total_bytes_; }
     const std::map<std::string, SafeTensorInfo>& tensors() const { return tensor_info_; }
 
     // True when the directory looks like a HuggingFace checkpoint.
@@ -109,6 +112,7 @@ private:
     std::string dir_;
     ModelConfig cfg_{};
     std::vector<std::string> weight_files_;
+    uint64_t total_bytes_ = 0;
     std::map<std::string, SafeTensorInfo> tensor_info_;   // name -> info
     std::map<std::string, std::string> tensor_file_;       // name -> file it lives in
     std::map<std::string, SafeTensorsFile> files_;         // file -> reader

@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <limits>
 
+#ifdef GAI_OPENMP
+#include <omp.h>
+#endif
+
 namespace gai {
 namespace quant {
 
@@ -17,6 +21,9 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
     GAI_CHECK(n >= 0, "q8_0 element count must be non-negative");
     BlockQ8_0* out = static_cast<BlockQ8_0*>(dst);
     const i64 full = n / Q8_BLOCK;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static) if (full > 1024)
+#endif
     for (i64 b = 0; b < full; ++b) {
         const float* x = src + b * Q8_BLOCK;
         bool bad = false;
@@ -70,6 +77,9 @@ void dequantize_q8_0(const void* src, float* dst, i64 n) {
     GAI_CHECK(n >= 0, "q8_0 element count must be non-negative");
     const BlockQ8_0* in = static_cast<const BlockQ8_0*>(src);
     const i64 full = n / Q8_BLOCK;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static) if (full > 1024)
+#endif
     for (i64 b = 0; b < full; ++b) {
         float s = fp16_to_fp32(in[b].scale);
         float* o = dst + b * Q8_BLOCK;
@@ -88,6 +98,9 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
     GAI_CHECK(n >= 0, "q4_0 element count must be non-negative");
     BlockQ4_0* out = static_cast<BlockQ4_0*>(dst);
     const i64 full = n / Q4_BLOCK;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static) if (full > 1024)
+#endif
     for (i64 b = 0; b < full; ++b) {
         const float* x = src + b * Q4_BLOCK;
         bool bad = false;
@@ -146,6 +159,9 @@ void dequantize_q4_0(const void* src, float* dst, i64 n) {
     GAI_CHECK(n >= 0, "q4_0 element count must be non-negative");
     const BlockQ4_0* in = static_cast<const BlockQ4_0*>(src);
     const i64 full = n / Q4_BLOCK;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static) if (full > 1024)
+#endif
     for (i64 b = 0; b < full; ++b) {
         float s = fp16_to_fp32(in[b].scale);
         float* o = dst + b * Q4_BLOCK;
@@ -172,6 +188,9 @@ void quantize_q4_1(const float* src, void* dst, i64 n) {
     GAI_CHECK(n >= 0, "q4_1 element count must be non-negative");
     BlockQ4_1* out = static_cast<BlockQ4_1*>(dst);
     const i64 full = n / Q4_BLOCK;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static) if (full > 1024)
+#endif
     for (i64 b = 0; b < full; ++b) {
         const float* x = src + b * Q4_BLOCK;
 
@@ -230,6 +249,9 @@ void dequantize_q4_1(const void* src, float* dst, i64 n) {
     GAI_CHECK(n >= 0, "q4_1 element count must be non-negative");
     const BlockQ4_1* in = static_cast<const BlockQ4_1*>(src);
     const i64 full = n / Q4_BLOCK;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static) if (full > 1024)
+#endif
     for (i64 b = 0; b < full; ++b) {
         float s = fp16_to_fp32(in[b].scale);
         float m = fp16_to_fp32(in[b].min);

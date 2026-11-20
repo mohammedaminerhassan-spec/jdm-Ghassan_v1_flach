@@ -59,9 +59,13 @@ public:
                          StreamFn on_token = nullptr,
                          std::function<void()> after_prefill = nullptr);
 
+    // `thinking` selects the Ghassan reasoning template when the vocabulary
+    // supports it; false keeps the checkpoint's original chat format.
     std::string chat(const std::vector<Message>& msgs, const GenerationConfig& cfg,
                      StreamFn on_token = nullptr,
-                     std::function<void()> after_prefill = nullptr);
+                     std::function<void()> after_prefill = nullptr,
+                     bool thinking = false,
+                     std::string* reasoning_out = nullptr);
 
     double score_tokens(const std::vector<i32>& tokens, const std::vector<u8>* mask = nullptr,
                         i64* out_ntok = nullptr,

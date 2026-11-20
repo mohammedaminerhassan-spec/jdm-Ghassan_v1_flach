@@ -172,6 +172,12 @@ std::string hf_tensor_name(const std::string& internal, bool is_granite) {
         //   block_sparse_moe.output_linear.weight     -> expert down (packed)
         //   shared_mlp.input_linear.weight            -> shared gate+up (packed)
         //   shared_mlp.output_linear.weight           -> shared down
+        //
+        // NOTE: moe_sh_gate and moe_sh_up both map to shared_mlp.input_linear.weight
+        // because the IBM checkpoint packs gate and up into one tensor of shape
+        // [2*SH, d]: gate occupies [0, SH*d), up occupies [SH*d, 2*SH*d).
+        // load_model() splits them by offset, so this is intentional packing,
+        // not a naming collision.
         // The packed expert/shared-MLP weights are shape-driven in load_model().
         if (rest == "moe_router")   return L + "block_sparse_moe.router.layer.weight";
         if (rest == "moe_sh_gate")  return L + "shared_mlp.input_linear.weight";
@@ -548,26 +554,15 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
     // and the layer kind is declared per layer in `layer_types`.
     const std::string model_type =
         j.has("model_type") ? j.at("model_type").as_string("") : "";
-    // The provenance of the checkpoint: the repo it came from ("_name_or_path"
-    // is written by the training scripts) or, failing that, the model family.
-    // It is what the exported artifact declares as its base model, so that a
-    // Granite model stays recognisable as a Granite model after the export
-    // (the name of the artifact is "Ghassan v1 Flash", the base is Granite).
-    {
-        const std::string nop =
-            j.has("_name_or_path") ? j.at("_name_or_path").as_string("") : "";
-        if (!nop.empty()) {
-            cfg_.base_model = nop;
-        } else if (model_type == "granitemoehybrid") {
-            cfg_.base_model = "ibm-granite/granite-4.0-h";
-        } else if (!model_type.empty()) {
-            cfg_.base_model = model_type;
-        }
-        if (cfg_.arch == ModelConfig::ArchGranite || model_type == "granitemoehybrid")
-            cfg_.base_org = "IBM";
-    }
+    // Provenance is deliberately not recorded: an exported artifact is a
+    // self-contained "Ghassan v1 Flash". The hybrid decoder is detected from
+    // geometry (num_local_experts / num_experts), never from an upstream brand
+    // string in the output. Both the upstream base and our own exports load.
+    if (model_type == "ghassan_hybrid")
+        cfg_.arch = ModelConfig::ArchGranite;
     const i64 local_experts = num("num_local_experts", 0);
-    if (model_type == "granitemoehybrid" || local_experts > 0) {
+    if (model_type == "ghassan_hybrid" || model_type == "granitemoehybrid" ||
+        local_experts > 0) {
         cfg_.arch = ModelConfig::ArchGranite;
         const i64 le = local_experts > 0 ? local_experts : num("num_experts", 0);
         cfg_.use_moe        = true;
@@ -632,7 +627,7 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
         // Shared MLP gate/up are fused into input_linear, shared down into
         // output_linear. Mark the model as Granite so the loader/packing
         // paths know about it.
-        log_info(strfmt("[hf] granite-4.0 hybrid recognized: %d layers, %d experts, top-%d, "
+        log_info(strfmt("[hf] hybrid Mamba-2/MoE recognized: %d layers, %d experts, top-%d, "
                         "d=%d, d_inner=%d, arch=%s", cfg_.num_layers, cfg_.num_experts,
                         cfg_.moe_top_k, cfg_.hidden_size, cfg_.mamba_expand * cfg_.hidden_size,
                         pos.c_str()));
@@ -700,6 +695,7 @@ bool HFCheckpoint::read_config_json(const std::string& path) {
 
 bool HFCheckpoint::open(const std::string& dir, bool weights_required) {
     dir_ = dir;
+    total_bytes_ = 0;
     std::error_code ec;
     if (!fs::is_directory(dir_, ec)) {
         log_error("[hf] not a directory: " + dir_);
@@ -755,6 +751,7 @@ bool HFCheckpoint::open(const std::string& dir, bool weights_required) {
         for (const std::string& f : weight_files_) {
             SafeTensorsFile sf;
             if (!sf.open(f)) return false;
+            total_bytes_ += sf.file_size();
             for (const auto& [name, ti] : sf.tensors()) {
                 tensor_info_[name] = ti;
                 tensor_file_[name] = f;

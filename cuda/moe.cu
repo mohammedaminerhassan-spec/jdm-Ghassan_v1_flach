@@ -237,9 +237,14 @@ __global__ void k_route(const float* logits, float* probs, i32* idx, float* w,
             sum_w += pw;
         }
         if (w) {
-            float inv_w = sum_w > 1e-8f ? (1.0f / sum_w) : 0.0f;
-            for (int k = 0; k < K; ++k) {
-                w[t * K + k] = picked_w[k] * inv_w;
+            // Underflow of every selected probability must not zero out the
+            // whole MoE branch: use a uniform mixture instead.
+            if (sum_w > 1e-8f) {
+                const float inv_w = 1.0f / sum_w;
+                for (int k = 0; k < K; ++k) w[t * K + k] = picked_w[k] * inv_w;
+            } else {
+                const float uniform = 1.0f / static_cast<float>(K);
+                for (int k = 0; k < K; ++k) w[t * K + k] = uniform;
             }
         }
     }
@@ -316,8 +321,13 @@ __global__ void k_route_bias(const float* logits, const float* bias,
             sum_w += pw;
         }
         if (w) {
-            float inv_w = sum_w > 1e-8f ? (1.0f / sum_w) : 0.0f;
-            for (int k = 0; k < K; ++k) w[t * K + k] = picked_w[k] * inv_w;
+            if (sum_w > 1e-8f) {
+                const float inv_w = 1.0f / sum_w;
+                for (int k = 0; k < K; ++k) w[t * K + k] = picked_w[k] * inv_w;
+            } else {
+                const float uniform = 1.0f / static_cast<float>(K);
+                for (int k = 0; k < K; ++k) w[t * K + k] = uniform;
+            }
         }
     }
 }
@@ -642,14 +652,35 @@ __global__ void k_group_fill(const i32* idx, i32* grouped, int* cursors,
 
 static int*  g_h_offsets_pinned = nullptr;
 static int   g_h_offsets_cap = 0;
-static cudaEvent_t g_offsets_event = nullptr;
+static cudaEvent_t g_offsets_event = nullptr;   // group-stream offsets ready
+static cudaEvent_t g_route_event = nullptr;     // route indices ready (stream 0)
+static cudaStream_t g_group_stream = nullptr;   // dedicated grouping stream
+
+static void ensure_group_resources() {
+    // Idempotent; safe to call from both the route-ready hook and the
+    // grouping launcher (whichever runs first on a given thread).
+    if (!g_offsets_event) CU_CHECK(cudaEventCreate(&g_offsets_event));
+    if (!g_route_event) CU_CHECK(cudaEventCreate(&g_route_event));
+    if (!g_group_stream) CU_CHECK(cudaStreamCreateWithFlags(&g_group_stream, cudaStreamNonBlocking));
+}
 
 static void ensure_offsets_pinned(int ne) {
+    ensure_group_resources();
     if (ne <= g_h_offsets_cap) return;
     if (g_h_offsets_pinned) CU_CHECK(cudaFreeHost(g_h_offsets_pinned));
-    if (!g_offsets_event) CU_CHECK(cudaEventCreate(&g_offsets_event));
     CU_CHECK(cudaMallocHost(&g_h_offsets_pinned, sizeof(int) * (size_t)(ne + 1)));
     g_h_offsets_cap = ne;
+}
+
+// Called on stream 0 right after k_route: mark the route indices as ready and
+// make the grouping stream wait for them (it must not read idx before routing
+// has finished). The grouping kernels then run on the dedicated stream while
+// the main stream computes the shared-expert GEMMs — real GPU overlap instead
+// of serialising everything on stream 0.
+static void moe_route_ready_on_stream0() {
+    ensure_group_resources();
+    CU_CHECK(cudaEventRecord(g_route_event, 0));
+    CU_CHECK(cudaStreamWaitEvent(g_group_stream, g_route_event, 0));
 }
 
 static void moe_build_groups_launch(const i32* d_idx, i64 N, int K, int ne,
@@ -660,18 +691,19 @@ static void moe_build_groups_launch(const i32* d_idx, i64 N, int K, int ne,
     ensure_offsets_pinned(ne);
     *grouped_out = g_grp_grouped;
     if (NK <= 0) return;
-    CU_CHECK(cudaMemset(g_grp_cnt, 0, sizeof(int) * (size_t)ne));
-    k_group_hist<<<grid_for(NK, 256), 256>>>(d_idx, g_grp_cnt, NK, ne);
+    const cudaStream_t gs = g_group_stream ? g_group_stream : (cudaStream_t)0;
+    CU_CHECK(cudaMemsetAsync(g_grp_cnt, 0, sizeof(int) * (size_t)ne, gs));
+    k_group_hist<<<grid_for(NK, 256), 256, 0, gs>>>(d_idx, g_grp_cnt, NK, ne);
 
-    k_group_offsets<<<1, 1>>>(g_grp_cnt, g_grp_off, g_grp_cur, ne);
+    k_group_offsets<<<1, 1, 0, gs>>>(g_grp_cnt, g_grp_off, g_grp_cur, ne);
     CU_CHECK(cudaGetLastError());
-    k_group_fill<<<grid_for(NK, 256), 256>>>(d_idx, g_grp_grouped, g_grp_cur, NK, ne);
+    k_group_fill<<<grid_for(NK, 256), 256, 0, gs>>>(d_idx, g_grp_grouped, g_grp_cur, NK, ne);
     CU_CHECK(cudaGetLastError());
 
     CU_CHECK(cudaMemcpyAsync(g_h_offsets_pinned, g_grp_off,
                              sizeof(int) * (size_t)(ne + 1),
-                             cudaMemcpyDeviceToHost, 0));
-    CU_CHECK(cudaEventRecord(g_offsets_event, 0));
+                             cudaMemcpyDeviceToHost, gs));
+    CU_CHECK(cudaEventRecord(g_offsets_event, gs));
 }
 
 static void moe_build_groups_sync(i64 NK, int ne, int* h_counts, int* h_offsets) {
@@ -679,7 +711,16 @@ static void moe_build_groups_sync(i64 NK, int ne, int* h_counts, int* h_offsets)
     for (int e = 0; e <= ne; ++e) h_offsets[e] = 0;
     if (NK <= 0) return;
 
-    CU_CHECK(cudaEventSynchronize(g_offsets_event));
+    // The grouping stream has been running concurrently with the shared-expert
+    // GEMMs on stream 0. By now its event is usually already complete, so a
+    // non-blocking query avoids the old unconditional cudaEventSynchronize
+    // that stalled the CPU (and flushed the GPU pipeline) on every layer.
+    cudaError_t q = cudaEventQuery(g_offsets_event);
+    if (q == cudaErrorNotReady) {
+        CU_CHECK(cudaEventSynchronize(g_offsets_event));
+    } else {
+        CU_CHECK(q);
+    }
     for (int e = 0; e <= ne; ++e) h_offsets[e] = g_h_offsets_pinned[e];
     for (int e = 0; e < ne; ++e) {
         int c = h_offsets[e + 1] - h_offsets[e];
@@ -722,13 +763,14 @@ static void moe_forward_impl(const float* x, const float* router_w,
     float* Su = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
     float* Sa = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
 
-    linear_forward(x, router_w, rlogits, (int)N, d, ne);
+    linear_forward_f32(x, router_w, rlogits, (int)N, d, ne);
 
     i32* idx_use = idx_cache ? idx_cache : tmp_idx;
     float* w_use = w_cache ? w_cache : tmp_w;
 
     k_route<<<(unsigned)N, 32>>>(rlogits, probs_cache, idx_use, w_use, N, ne, K, g_moe_jitter, g_moe_jitter_seed);
     CU_CHECK(cudaGetLastError());
+    moe_route_ready_on_stream0();
 
     i32* grouped = nullptr;
     int h_cnt[64], h_off[65];
@@ -812,7 +854,7 @@ static void moe_forward_bias_impl(const float* x, const float* router_w, const f
     float* Su = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
     float* Sa = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
 
-    linear_forward(x, router_w, rlogits, (int)N, d, ne);
+    linear_forward_f32(x, router_w, rlogits, (int)N, d, ne);
 
     i32* idx_use = idx_cache ? idx_cache : tmp_idx;
     float* w_use = w_cache ? w_cache : tmp_w;
@@ -820,6 +862,7 @@ static void moe_forward_bias_impl(const float* x, const float* router_w, const f
     k_route_bias<<<(unsigned)N, 32>>>(rlogits, router_bias, probs_cache, idx_use, w_use,
                                      N, ne, K, g_moe_jitter, g_moe_jitter_seed);
     CU_CHECK(cudaGetLastError());
+    moe_route_ready_on_stream0();
 
     i32* grouped = nullptr;
     int h_cnt[64], h_off[65];
@@ -934,6 +977,11 @@ static void moe_backward_impl(const float* x, const float* router_w,
     const i64 NK = N * K;
     const float aux_coef = (aux_frac && aux_scale != 0.0f)
         ? aux_scale * (float)ne / (float)N : 0.0f;
+    // s_dact (expert activation gradient scratch) is part of the shared
+    // forward/backward API signature. On the CPU path it stores per-slot dact
+    // for swiglu_backward; on the GPU path the backward kernels recompute dact
+    // on the fly (k_scale_all -> k_dp_dot) so this scratch is not needed.
+    // Kept for interface consistency between backends.
     (void)s_dact;
 
     uint8_t* ws = (uint8_t*)moe_workspace(
@@ -991,9 +1039,23 @@ static void moe_backward_impl(const float* x, const float* router_w,
 
     CU_CHECK(cudaMemset(dpfull, 0, sizeof(float) * (size_t)NK));
 
+    // `idx` was produced by the forward pass on stream 0. Establish an
+    // explicit cross-stream dependency before the grouping stream reads it.
+    // (The forward pass also recorded this event; re-recording here is cheap
+    //  and guarantees ordering even if other stream-0 work ran in between.)
+    moe_route_ready_on_stream0();
+
     i32* grouped = nullptr;
     int h_cnt[64], h_off[65];
     moe_build_groups_launch(idx, N, K, ne, &grouped);
+
+    // The grouping kernels (k_group_fill, which writes `grouped`) ran on the
+    // dedicated group stream. Stream 0 must not read `grouped` until that
+    // stream has finished: without this wait the three kernels below can
+    // consume stale slot assignments from the previous layer. This is a
+    // device-side wait (no host stall), unlike moe_build_groups_sync which is
+    // only about reading the host counts.
+    CU_CHECK(cudaStreamWaitEvent(0, g_offsets_event, 0));
 
     k_gather3_all<<<grid_for(NK, 256), 256>>>(s_gate, s_up, s_act, grouped, Gblk, Ublk, Ablk, NK, E);
     CU_CHECK(cudaGetLastError());
@@ -1197,6 +1259,8 @@ void moe_free_workspace() {
     g_aux_cap = 0;
     if (g_aux_raw) { cudaFree(g_aux_raw); g_aux_raw = nullptr; }
     if (g_offsets_event) { cudaEventDestroy(g_offsets_event); g_offsets_event = nullptr; }
+    if (g_route_event) { cudaEventDestroy(g_route_event); g_route_event = nullptr; }
+    if (g_group_stream) { cudaStreamDestroy(g_group_stream); g_group_stream = nullptr; }
     if (g_h_offsets_pinned) { cudaFreeHost(g_h_offsets_pinned); g_h_offsets_pinned = nullptr; }
     g_h_offsets_cap = 0;
 }

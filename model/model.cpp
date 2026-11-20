@@ -11,7 +11,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <system_error>
 #include <sstream>
 #include <cstring>
 #include <algorithm>
@@ -626,7 +628,7 @@ std::string ModelConfig::arch_identity() const {
        << "|swa=" << sliding_window << "|rt=" << rope_type
        << "|pos=" << position_embedding
        << "|ahd=" << head_dim_override
-       << "|arch=" << (arch == ArchGranite ? "granite" : "qwen")
+       << "|arch=" << (arch == ArchGranite ? "hybrid" : "standard")
        << "|mult=" << strfmt("%.4f,%.4f,%.6f,%.4f",
                               (double)embedding_multiplier,
                               (double)residual_multiplier,
@@ -669,7 +671,7 @@ bool ModelConfig::same_architecture_as(const ModelConfig& o, std::string* reason
     if (rope_scale != o.rope_scale) return fail("rope_scale differs");
     if (rope_yarn_mscale != o.rope_yarn_mscale) return fail("rope_yarn_mscale differs");
     if (sliding_window != o.sliding_window) return fail("sliding_window differs");
-    if (arch != o.arch) return fail("architecture family differs (granite vs qwen)");
+    if (arch != o.arch) return fail("architecture family differs (hybrid vs standard)");
     if (layer_types.size() != o.layer_types.size()) return fail("layer_types length differs");
     for (size_t i = 0; i < layer_types.size(); ++i)
         if (layer_types[i] != o.layer_types[i]) return fail("layer kind differs at layer " + std::to_string(i));
@@ -1126,7 +1128,9 @@ Model::Model(ModelConfig cfg, Device dev, bool fp16_weights, int quant_kind)
                 alloc_param(L.bv, pre + "bv", {kvd}, false);
             }
         }
-        if (cfg_.use_qk_norm) {
+        // QK-Norm belongs to attention only: mamba layers never use it.
+        // Allocating it there left dead FP32 weights that no plan counted.
+        if (cfg_.use_qk_norm && !(is_granite && gk == 0)) {
             const i64 hd = cfg_.head_dim();
             alloc_param(L.qk_qnorm, pre + "qk_qnorm", {hd}, false);
             alloc_param(L.qk_knorm, pre + "qk_knorm", {hd}, false);
@@ -1268,7 +1272,10 @@ ParamReport Model::parameter_report() const {
         const i64 proj = static_cast<i64>(cfg_.mamba_expand) * d + 2 * cfg_.mamba_n_groups * cfg_.mamba_d_state + cfg_.mamba_n_heads;
         add("mamba.in_proj [proj, d]", proj * d, n_mamba);
         add("mamba.out_proj [d, inner]", d * (static_cast<i64>(cfg_.mamba_expand) * d), n_mamba);
-        add("mamba.conv1d", (static_cast<i64>(cfg_.mamba_expand) * d + 2 * cfg_.mamba_n_groups * cfg_.mamba_d_state) * cfg_.mamba_d_conv, n_mamba);
+        const i64 conv_dim = static_cast<i64>(cfg_.mamba_expand) * d +
+                             2 * static_cast<i64>(cfg_.mamba_n_groups) * cfg_.mamba_d_state;
+        add("mamba.conv1d", conv_dim * cfg_.mamba_d_conv, n_mamba);
+        add("mamba.conv1d.bias", conv_dim, n_mamba);
         add("mamba.A_log/dt_bias/D", 3 * cfg_.mamba_n_heads, n_mamba);
         add("mamba.norm", static_cast<i64>(cfg_.mamba_expand) * d, n_mamba);
     }
@@ -1395,7 +1402,7 @@ std::string ParamReport::to_string(const ModelConfig& cfg) const {
 }
 
 void Model::print_parameter_report() const {
-    log_info("---------------- Ghassan 1 preview model ----------------");
+    log_info("---------------- Ghassan v1 Flash ----------------");
     log_info("  " + cfg_.summary());
     log_raw(LogLevel::Info, parameter_report().to_string(cfg_));
 }
@@ -1989,11 +1996,11 @@ size_t Model::estimate_activation_bytes_for(const ModelConfig& cfg, bool fp16_on
         // grad scratch: dx/dxb/dq/dk/dv/dattout/dproj/dtmp/dlogits/xfinal/hnorm
         e = sat_add(e, sat_mul(N, (4 * d + qd * 2 + kvd * 2 + V + d * 2)));
     }
-    // Chunked loss (roadmap item 6): logits [N,V] (fwd term) + dlogits [N,V]
-    // (grad scratch term) shrink to [Cc,V] each, Cc = ceil(N/chunks). Both
-    // terms are present in `e` above exactly once, so subtract the saved part.
-    // (e is only ever added to here, never saturated below the true count
-    // before this point, so the subtraction cannot underflow.)
+    // Chunked loss: act.logits and act.dlogits shrink from [N,V] to [Cc,V].
+    // Subtract exactly those two savings. A third V*N allowance in the
+    // backward terms is intentionally left in place: it is conservative
+    // headroom, not a third logits buffer, so reducing it would risk an
+    // optimistic plan and an OOM on the T4. (e cannot underflow here.)
     if (with_grad && ce_chunks > 1 && N > 0) {
         const u64 cc = static_cast<u64>(ce_chunks);
         const u64 crow = N / cc + (N % cc ? 1ULL : 0ULL);
@@ -2028,7 +2035,9 @@ static u64 mamba_layer_parameters(const ModelConfig& cfg) {
     u64 n = 0;
     n += proj * d;                       // in_proj
     n += conv_dim * k;                   // conv1d.weight
-    if (cfg.mamba_conv_bias) n += conv_dim;
+    // The constructor always allocates conv1d.bias (the flag only controls
+    // whether the checkpoint supplies a non-zero one), so count it always.
+    n += conv_dim;                       // conv1d.bias
     n += n_heads;                        // dt_bias
     n += n_heads;                        // A_log
     n += n_heads;                        // D
@@ -2205,7 +2214,7 @@ Model::MemoryPlan Model::plan_memory(const ModelConfig& cfg, int B, int T,
     p.fp16_cache = fp16_weight_cache ? count_fp16_cache_bytes(cfg) : 0;
     p.activations = estimate_activation_bytes_for(cfg, fp16_weight_cache, B, T,
                                                  with_grad, ce_chunks);
-    p.static_total = p.weights + p.grads + p.fp16_cache + mamba_state_bytes(cfg);
+    p.static_total = p.weights + p.grads + p.fp16_cache + mamba_state_bytes(cfg, B);
     p.total = p.static_total + p.activations;
     return p;
 }
@@ -2240,25 +2249,21 @@ Model::WorkspacePlan Model::workspace_plan(const ModelConfig& cfg, int B, int T)
     return p;
 }
 
-// The Mamba-2 layers carry a recurrent state per layer:
-//   conv_state : [conv_dim, d_conv-1]
-//   ssm_state  : [n_heads, d_head, d_state]
-// For Granite-4.0-H-Tiny that is 40 layers x (3328*3 + 48*64*128) floats
-// = 20.8 MB in fp32 - small, but it must be part of the plan so the memory
-// budget is honest.
-size_t Model::mamba_state_bytes(const ModelConfig& cfg) {
-    if (cfg.arch != ModelConfig::ArchGranite) return 0;
+// The Mamba-2 layers carry one recurrent SSM state per layer and per batch
+// row: [B, n_heads, d_head, d_state]. make_activations() allocates exactly
+// that. The causal conv window is a per-call local buffer in the scan
+// kernels, not a persistent state, so it must NOT be counted here (the old
+// formula both added a phantom conv state and ignored the batch factor).
+size_t Model::mamba_state_bytes(const ModelConfig& cfg, int batch) {
+    if (cfg.arch != ModelConfig::ArchGranite || batch <= 0) return 0;
     int mamba_layers = 0;
     for (int k : cfg.layer_types) if (k == 0) ++mamba_layers;
     if (mamba_layers == 0) return 0;
-    const u64 d_inner  = static_cast<u64>(cfg.mamba_expand) * static_cast<u64>(cfg.hidden_size);
-    const u64 conv_dim = d_inner + 2ull * static_cast<u64>(cfg.mamba_n_groups) *
-                                    static_cast<u64>(cfg.mamba_d_state);
-    const u64 conv_win = cfg.mamba_d_conv > 1 ? static_cast<u64>(cfg.mamba_d_conv - 1) : 1ull;
-    const u64 ssm      = static_cast<u64>(cfg.mamba_n_heads) *
-                          static_cast<u64>(cfg.mamba_d_head) *
-                          static_cast<u64>(cfg.mamba_d_state);
-    return static_cast<size_t>(static_cast<u64>(mamba_layers) * (conv_dim * conv_win + ssm) * 4);
+    const u64 ssm = static_cast<u64>(batch) *
+                    static_cast<u64>(cfg.mamba_n_heads) *
+                    static_cast<u64>(cfg.mamba_d_head) *
+                    static_cast<u64>(cfg.mamba_d_state);
+    return static_cast<size_t>(static_cast<u64>(mamba_layers) * ssm * 4ull);
 }
 
 // The inference KV cache (fp16 packed) for the given context length.
@@ -3128,25 +3133,40 @@ static DType dtype_from_code(u32 c) {
 }
 
 void Model::save_raw(const std::string& path) const {
-    std::ofstream f(path, std::ios::binary);
-    GAI_CHECK(f.good(), "cannot write model: " + path);
-    u32 magic = RAW_MAGIC2;
-    f.write(reinterpret_cast<const char*>(&magic), 4);
-    u32 n = static_cast<u32>(params_.size());
-    f.write(reinterpret_cast<const char*>(&n), 4);
-    for (const Parameter* p : params_) {
-        u32 len = static_cast<u32>(p->name.size());
-        f.write(reinterpret_cast<const char*>(&len), 4);
-        f.write(p->name.data(), len);
-        u64 ne = static_cast<u64>(p->numel());
-        f.write(reinterpret_cast<const char*>(&ne), 8);
-        u32 dt = dtype_code(p->w.dtype());
-        f.write(reinterpret_cast<const char*>(&dt), 4);
-        Tensor cpu = p->w.to(Device::CPU);
-        f.write(reinterpret_cast<const char*>(cpu.data_ptr()),
-                static_cast<std::streamsize>(cpu.nbytes()));
-    }
-    GAI_CHECK(f.good(), "model write failed");
+    // Write to a sibling temporary file and rename only after the stream is
+    // flushed and closed: a crash mid-write must leave the previous checkpoint
+    // intact, never a truncated file that looks valid on reload.
+    namespace fs = std::filesystem;
+    const fs::path target(path);
+    fs::path parent = target.parent_path();
+    if (parent.empty()) parent = ".";
+    const fs::path tmp = parent / ("." + target.filename().string() + ".tmp");
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    ec.clear();
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        GAI_CHECK(f.good(), "cannot write model: " + path);
+        u32 magic = RAW_MAGIC2;
+        f.write(reinterpret_cast<const char*>(&magic), 4);
+        u32 n = static_cast<u32>(params_.size());
+        f.write(reinterpret_cast<const char*>(&n), 4);
+        for (const Parameter* p : params_) {
+            u32 len = static_cast<u32>(p->name.size());
+            f.write(reinterpret_cast<const char*>(&len), 4);
+            f.write(p->name.data(), len);
+            u64 ne = static_cast<u64>(p->numel());
+            f.write(reinterpret_cast<const char*>(&ne), 8);
+            u32 dt = dtype_code(p->w.dtype());
+            f.write(reinterpret_cast<const char*>(&dt), 4);
+            Tensor cpu = p->w.to(Device::CPU);
+            f.write(reinterpret_cast<const char*>(cpu.data_ptr()),
+                    static_cast<std::streamsize>(cpu.nbytes()));
+        }
+        GAI_CHECK(f.good(), "model write failed");
+    }  // close + flush before the rename
+    fs::rename(tmp, target, ec);
+    GAI_CHECK(!ec, "cannot finalise model write: " + ec.message());
 }
 
 bool Model::load_raw(const std::string& path) {

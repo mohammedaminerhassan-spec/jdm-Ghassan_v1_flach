@@ -73,6 +73,7 @@ static void usage() {
     "  --greedy          deterministic decoding\n"
     "  --no-fast-sample  disable GPU fast sampling (legacy full-vocab path)\n"
     "  --system <text>   system prompt (default: none)\n"
+    "  --thinking        use the Ghassan reasoning template (<think>...</think>)\n"
     "  --no-stream       print the reply at once\n"
     "  --print-ids      print the generated token ids (verification)\n"
     "  --top <n>        print the top-n candidates for the first token (diagnosis)\n"
@@ -82,7 +83,8 @@ static void usage() {
     "  --weight-f16 0|1      store the big weights in half precision on the device\n"
     "                         (default 1 on the GPU: 12.9 GiB instead of 25.9 GiB for\n"
     "                         a 6.94B Granite; 0 on the CPU, the reference path)\n"
-    "  --ctx <n>              KV cache context size (default: model max_seq_len)\n";
+    "  --ctx <n>              KV cache context size (default: min(model max_seq_len, 4096);\n"
+    "                         pass --ctx explicitly for a larger window)\n";
 }
 static std::string ggml_type_str(GGMLType t) {
     switch (t) {
@@ -116,6 +118,7 @@ static int cmd_chat(const Args& args) {
     Generator gen(*lm.model, lm.tokenizer, opts.gen.max_context);
     opts.stream = !args.flag("no-stream");
     opts.show_stats = args.flag("stats");
+    opts.thinking = args.flag("thinking");
     if (args.has("system")) opts.system = args.str("system");
 
     ChatSession session(gen, opts);
@@ -138,6 +141,7 @@ static int cmd_generate(const Args& args) {
     GAI_CHECK(!prompt.empty(), "--prompt is required");
 
     bool stream = !args.flag("no-stream");
+    const bool thinking = args.flag("thinking");
     const bool print_ids = args.flag("print-ids", false);
     std::vector<i32> gen_ids;
     auto on_piece = [&](const std::string& p, i32 id) {
@@ -172,19 +176,14 @@ static int cmd_generate(const Args& args) {
         if (!sys.empty()) msgs.push_back({Role::System, sys});
         msgs.push_back({Role::User, prompt});
         if (args.flag("dump-prompt", false)) {
-            // The chat format follows the vocabulary (Granite role tags vs
-            // ChatML).
-            const ChatTemplate tmpl =
-                (lm.tokenizer.token_to_id("<|start_of_role|>") >= 0 &&
-                 lm.tokenizer.token_to_id("<|end_of_role|>") >= 0)
-                    ? ChatTemplate::Granite : ChatTemplate::ChatML;
+            const ChatTemplate tmpl = chat_template_from_vocab(lm.tokenizer, thinking);
             const std::vector<i32> ids = encode_chat(lm.tokenizer, tmpl, msgs, true, nullptr);
-            log_info(strfmt("[prompt] %s | %d tokens",
-                            tmpl == ChatTemplate::Granite ? "granite" : "chatml",
-                            static_cast<int>(ids.size())));
+            const char* tname = tmpl == ChatTemplate::GhassanThinking ? "ghassan-thinking"
+                              : (tmpl == ChatTemplate::Granite ? "role-tag" : "chatml");
+            log_info(strfmt("[prompt] %s | %d tokens", tname, static_cast<int>(ids.size())));
             log_info("[prompt] " + lm.tokenizer.decode(ids, true));
         }
-        out = gen.chat(msgs, g, on_tok, probe);
+        out = gen.chat(msgs, g, on_tok, probe, thinking);
     }
     if (stream) std::cout << std::endl;
     else std::cout << out << std::endl;
@@ -355,6 +354,7 @@ static int cmd_quantize(const Args& args) {
     meta["model_name"] = args.str("model-name", "Ghassan v1 Flash");
     meta["version"]    = args.str("version", "1.0");
     meta["author"]     = args.str("team", args.str("author", "Ghassan AI"));
+    if (args.flag("thinking")) meta["thinking"] = "1";
 
     const ExportProfileGGUF profile = gguf_profile_for(prof);
     if (have_embedded) {
@@ -435,13 +435,13 @@ static int cmd_tokenizer_info(const Args& args) {
     // without loading the 13 GB of weights (the tokenizer is enough).
     if (args.has("chat-text")) {
         const std::string text = args.str("chat-text");
-        const bool granite = tk.token_to_id("<|start_of_role|>") >= 0 &&
-                             tk.token_to_id("<|end_of_role|>") >= 0;
-        const ChatTemplate kind = granite ? ChatTemplate::Granite : ChatTemplate::ChatML;
+        const ChatTemplate kind = chat_template_from_vocab(tk, args.flag("thinking"));
         std::vector<Message> msgs;
         msgs.push_back({Role::User, text});
         const std::vector<i32> ids = encode_chat(tk, kind, msgs, true, nullptr);
-        std::cout << "chat_template=" << (granite ? "granite" : "chatml") << "\n";
+        std::cout << "chat_template="
+                  << (kind == ChatTemplate::GhassanThinking ? "ghassan-thinking"
+                      : (kind == ChatTemplate::Granite ? "role-tag" : "chatml")) << "\n";
         std::cout << "chat_prompt_ids=";
         for (i32 id : ids) std::cout << id << " ";
         std::cout << "\n";
@@ -625,6 +625,7 @@ static int cmd_export(const Args& args) {
         {"val_loss", strfmt("%.6f", loaded.best_val)},
     };
     if (args.has("model-name")) meta["model_name"] = args.str("model-name");
+    if (args.flag("thinking")) meta["thinking"] = "1";
     export_model_gguf(out, model, tok, gguf_profile_for(prof), meta, compat);
     return 0;
 }

@@ -8,10 +8,13 @@ namespace gai {
 
 // The chat formats this engine speaks.
 enum class ChatTemplate : u8 {
-    // Qwen / ChatML: <|im_start|>role\ncontent<|im_end|>\n
+    // ChatML: <|im_start|>role\ncontent<|im_end|>\n
     ChatML = 0,
-    // IBM Granite-4: <|start_of_role|>role<|end_of_role|>content<|end_of_text|>\n
+    // Role-tag format: <|start_of_role|>role<|end_of_role|>content<|end_of_text|>\n
     Granite = 1,
+    // Ghassan thinking: the role-tag format plus <think_on> / <think>...</think>.
+    // Every token it uses already exists in the vocabulary of the hybrid model.
+    GhassanThinking = 2,
 };
 
 // The one chat format this engine speaks by default: ChatML, the format Qwen (and
@@ -30,6 +33,9 @@ enum class Role : u8 { System = 0, User = 1, Assistant = 2 };
 struct Message {
     Role        role = Role::User;
     std::string content;
+    // Optional reasoning trace for an assistant turn. Only rendered by the
+    // GhassanThinking template; empty keeps every other template byte-identical.
+    std::string thinking;
 };
 
 // One pre-tokenized piece of a rendered prompt: either a control token to
@@ -72,6 +78,23 @@ std::vector<i32> encode_granite(const Tokenizer& tk,
                                 const std::vector<Message>& msgs,
                                 bool add_generation_prompt,
                                 std::vector<u8>* loss_mask = nullptr);
+
+// Ghassan thinking format. Identical turn structure to the role-tag format,
+// with <think_on> after the system turn and <think>...<\/think> wrapping the
+// reasoning of each assistant turn. The generation prompt opens the think
+// block so the model starts by reasoning and closes it before the answer.
+std::vector<ChatSegment> render_ghassan_thinking(const Tokenizer& tk,
+                                                 const std::vector<Message>& msgs,
+                                                 bool add_generation_prompt);
+
+std::vector<i32> encode_ghassan_thinking(const Tokenizer& tk,
+                                         const std::vector<Message>& msgs,
+                                         bool add_generation_prompt,
+                                         std::vector<u8>* loss_mask = nullptr);
+
+// Pick the template from the vocabulary. `thinking` forces the Ghassan
+// thinking format when the vocabulary carries the required control tokens.
+ChatTemplate chat_template_from_vocab(const Tokenizer& tk, bool thinking = false);
 
 // Encode with the requested template.
 std::vector<i32> encode_chat(const Tokenizer& tk,

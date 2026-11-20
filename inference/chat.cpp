@@ -73,10 +73,15 @@ std::string ChatSession::send(const std::string& user_message) {
             return true;
         };
     }
-    reply = gen_.chat(history_, turn_cfg, cb);
+    std::string reasoning;
+    reply = gen_.chat(history_, turn_cfg, cb, nullptr, opts_.thinking, &reasoning);
     if (opts_.stream) std::cout << std::endl;
 
-    history_.push_back({Role::Assistant, reply});
+    Message answer;
+    answer.role = Role::Assistant;
+    answer.content = reply;
+    answer.thinking = reasoning;
+    history_.push_back(std::move(answer));
     return reply;
 }
 

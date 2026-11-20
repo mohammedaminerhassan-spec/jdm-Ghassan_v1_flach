@@ -173,7 +173,18 @@ i32 Sampler::sample(float* logits, int vocab, const std::vector<i32>& history) {
 
     int k = (cfg_.top_k > 0 && cfg_.top_k < vocab) ? cfg_.top_k : vocab;
 
-    if (k > 2048 && (cfg_.top_k <= 0 || cfg_.top_k >= vocab)) k = 2048;
+    // When the user explicitly disables top-k filtering (top_k <= 0 or
+    // top_k >= vocab) we must NOT clamp k to 2048: doing so would silently
+    // re-apply a top-2048 filter the user asked to turn off. The 2048 cap
+    // only exists to avoid a full-vocab sort when top-k is actually active.
+    if (cfg_.top_k > 0 && cfg_.top_k < vocab && k > 2048) {
+        static bool warned_topk = false;
+        if (!warned_topk) {
+            warned_topk = true;
+            log_warn("[sample] top_k huge; clamping to 2048 (full-sort per token otherwise)");
+        }
+        k = 2048;
+    }
     scratch_.clear();
     scratch_.reserve(static_cast<size_t>(vocab));
     for (int i = 0; i < vocab; ++i) scratch_.emplace_back(logits[i], i);

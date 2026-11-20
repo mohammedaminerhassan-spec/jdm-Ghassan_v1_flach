@@ -150,8 +150,16 @@ void moe_forward(const float* x, const float* router_w,
             topk_pick(sc.logits.data(), ne, K, t_idx, t_w);
             float sum_w = 0.0f;
             for (int k = 0; k < K; ++k) sum_w += t_w[k];
-            float inv_w = sum_w > 1e-8f ? (1.0f / sum_w) : 0.0f;
-            for (int k = 0; k < K; ++k) t_w[k] *= inv_w;
+            // If every selected probability underflowed to zero, fall back to
+            // a uniform mixture instead of zeroing all expert weights (which
+            // would silently drop the whole MoE branch and change the output).
+            if (sum_w > 1e-8f) {
+                const float inv_w = 1.0f / sum_w;
+                for (int k = 0; k < K; ++k) t_w[k] *= inv_w;
+            } else {
+                const float uniform = 1.0f / static_cast<float>(K);
+                for (int k = 0; k < K; ++k) t_w[k] = uniform;
+            }
 
             if (probs_cache) std::memcpy(probs_cache + t * ne, sc.logits.data(),
                                          sizeof(float) * (size_t)ne);
@@ -237,8 +245,13 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
                 t_w[k] = sc.logits[static_cast<size_t>(t_idx[k])];
                 sum_w += t_w[k];
             }
-            float inv_w = sum_w > 1e-8f ? (1.0f / sum_w) : 0.0f;
-            for (int k = 0; k < K; ++k) t_w[k] *= inv_w;
+            if (sum_w > 1e-8f) {
+                const float inv_w = 1.0f / sum_w;
+                for (int k = 0; k < K; ++k) t_w[k] *= inv_w;
+            } else {
+                const float uniform = 1.0f / static_cast<float>(K);
+                for (int k = 0; k < K; ++k) t_w[k] = uniform;
+            }
 
             if (probs_cache) std::memcpy(probs_cache + t * ne, sc.logits.data(),
                                          sizeof(float) * (size_t)ne);
@@ -436,13 +449,16 @@ void moe_backward(const float* x, const float* router_w,
                 float dl = pt[e] * (sc.dp[e] - pdot);
                 if (jj > 0.0f) dl *= (1.0f + jj * 2.0f * jitter_u_cpu(t, e));
                 sc.dlogit[e] = dl;
-            if (drouter_w) {
-            float* dr = drouter_w + (size_t)e * d;
-            for (int j = 0; j < d; ++j) dr[j] += dl * xt[j];
+                if (drouter_w) {
+                    float* dr = drouter_w + (size_t)e * d;
+                    for (int j = 0; j < d; ++j) dr[j] += dl * xt[j];
+                }
+                // dx to the previous layers is ALWAYS computed, even when the
+                // router is frozen (drouter_w == null); only its weight gradient
+                // is skipped.
+                const float* rr = router_w + (size_t)e * d;
+                for (int j = 0; j < d; ++j) sc.dx[j] += dl * rr[j];
             }
-            const float* rr = router_w + (size_t)e * d;
-            for (int j = 0; j < d; ++j) sc.dx[j] += dl * rr[j];
-        }
         }
 
         for (int j = 0; j < d; ++j) dxt[j] += sc.dx[j];

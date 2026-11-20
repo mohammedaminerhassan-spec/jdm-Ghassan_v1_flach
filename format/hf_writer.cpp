@@ -405,16 +405,21 @@ std::vector<ExportTensor> plan_safetensors_export(Model& model, SafeDType dtype)
 std::string hf_config_json(const ModelConfig& cfg, const std::string& model_name,
                            const std::string& description) {
     Json j = Json::object();
+    // The exported artifact is a self-contained "Ghassan v1 Flash". The
+    // architecture names below are Ghassan's own; the geometry keys written
+    // further down are what the engine actually reads on reload (the reader
+    // keys the hybrid decoder on `num_local_experts`, not on a brand string).
     j.set("architectures", [&] {
         Json a = Json::array();
         a.push(Json::string(cfg.arch == ModelConfig::ArchGranite
-                                ? "GraniteMoeHybridForCausalLM"
-                                : (cfg.use_moe ? "Qwen3MoeForCausalLM" : "Qwen3ForCausalLM")));
+                                ? "GhassanMoeHybridForCausalLM"
+                                : (cfg.use_moe ? "GhassanMoeForCausalLM"
+                                               : "GhassanForCausalLM")));
         return a;
     }());
     j.set("model_type", Json::string(cfg.arch == ModelConfig::ArchGranite
-                                         ? "granitemoehybrid"
-                                         : (cfg.use_moe ? "qwen3_moe" : "qwen3")));
+                                         ? "ghassan_hybrid"
+                                         : (cfg.use_moe ? "ghassan_moe" : "ghassan")));
     j.set("hidden_size", Json::integer(cfg.hidden_size));
     j.set("num_hidden_layers", Json::integer(cfg.num_layers));
     j.set("num_attention_heads", Json::integer(cfg.num_heads));
@@ -452,11 +457,9 @@ std::string hf_config_json(const ModelConfig& cfg, const std::string& model_name
     if (!description.empty()) {
         j.set("description", Json::string(description));
     }
-    // The bases this engine exports (IBM Granite-4.0 hybrid, Qwen3) are
-    // Apache-2.0. A derivative artifact must carry the license notice
-    // (Apache-2.0 section 4), and the license id is a required field for a
-    // HuggingFace repository to be auto-tagged correctly.
-    j.set("license", Json::string("apache-2.0"));
+    // No upstream license or provenance field is written: the artifact is a
+    // standalone "Ghassan v1 Flash" release. All geometry keys are kept so
+    // the engine round-trips the checkpoint without needing that metadata.
     if (cfg.sliding_window > 0) {
         j.set("sliding_window", Json::integer(cfg.sliding_window));
         j.set("use_sliding_window", Json::boolean(true));
@@ -481,12 +484,12 @@ std::string hf_config_json(const ModelConfig& cfg, const std::string& model_name
     if (cfg.arch == ModelConfig::ArchGranite) {
         j.set("num_local_experts", Json::integer(cfg.num_experts));
         j.set("num_experts_per_tok", Json::integer(cfg.moe_top_k));
-        // The EFFECTIVE shared expert width (shared_width() falls back to the
-        // routed width when it is not set). Writing the raw field would
-        // write a zero here and the reloaded model would lose its shared
-        // expert (the loader keys "the shared expert exists" on the
-        // PRESENCE of this key).
-        j.set("shared_intermediate_size", Json::integer(cfg.shared_width()));
+        // The loader keys "the shared expert exists" on the PRESENCE of this
+        // key. Only write it when the model actually has a shared expert;
+        // otherwise the reload would allocate shared weights that were never
+        // exported and fail on the first missing shared_mlp tensor.
+        if (cfg.moe_shared)
+            j.set("shared_intermediate_size", Json::integer(cfg.shared_width()));
         j.set("embedding_multiplier", Json::number(cfg.embedding_multiplier));
         j.set("residual_multiplier", Json::number(cfg.residual_multiplier));
         j.set("attention_multiplier", Json::number(cfg.attention_multiplier));
@@ -511,9 +514,11 @@ std::string hf_config_json(const ModelConfig& cfg, const std::string& model_name
         j.set("num_experts", Json::integer(cfg.num_experts));
         j.set("num_experts_per_tok", Json::integer(cfg.moe_top_k));
         j.set("moe_intermediate_size", Json::integer(cfg.moe_expert_dim));
-        if (cfg.shared_expert_intermediate_size > 0)
-            j.set("shared_expert_intermediate_size",
-                  Json::integer(cfg.shared_expert_intermediate_size));
+        // The width falls back to the routed expert width when it was never
+        // set explicitly; write the EFFECTIVE width whenever a shared expert
+        // exists, or the reloaded config silently drops it.
+        if (cfg.moe_shared)
+            j.set("shared_expert_intermediate_size", Json::integer(cfg.shared_width()));
     }
     return j.dump_pretty();
 }
@@ -641,30 +646,6 @@ bool export_model_safetensors(const std::string& dir, Model& model,
         const std::string gc_path = (fs::path(dir) / "generation_config.json").string();
         if (!write_file(gc_path, g.dump_pretty())) {
             log_error("[hf ] failed to write " + gc_path);
-            return false;
-        }
-    }
-
-    // ---- NOTICE (Apache-2.0 section 4(d): retain the upstream copyright) ----
-    // The export is a derivative of an Apache-2.0 base (IBM Granite-4.0
-    // hybrid or Qwen3). The license requires the copyright notice to travel
-    // with the artifact, so it is written as a file instead of being
-    // something a caller might forget.
-    {
-        const char* notice =
-            "Ghassan v1 Flash\n"
-            "================\n"
-            "This model is a derivative of an Apache-2.0 licensed base model:\n"
-            "  - IBM Granite-4.0 (hybrid Mamba-2/Transformer), (c) IBM Corp. and contributors\n"
-            "  - Qwen3, (c) Alibaba Cloud and contributors\n"
-            "\n"
-            "It is distributed under the Apache License, Version 2.0.\n"
-            "A copy of the license is available at:\n"
-            "  https://www.apache.org/licenses/LICENSE-2.0\n"
-            "\n"
-            "This notice must be preserved with any distribution of this model.\n";
-        if (!write_file((fs::path(dir) / "NOTICE").string(), notice)) {
-            log_error("[hf ] failed to write NOTICE");
             return false;
         }
     }

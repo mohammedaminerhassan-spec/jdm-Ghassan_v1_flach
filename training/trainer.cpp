@@ -1049,9 +1049,13 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                 // silently change all future updates after any skipped step.
             } else {
                 opt_set_step(0);
+                // Micro-warmup: ramp the LR over a handful of steps so the
+                // fresh AdamW/Muon moments do not jerk already-trained weights.
+                resume_warmup_steps_ = 20;
                 log_warn(strfmt("[ckpt] moments NOT restored (kind switch/corrupt/legacy); "
-                                "optimizer t_=0 with weights at step %lld (loud, not silent)",
-                                (long long)state_.step));
+                                "optimizer t_=0 with weights at step %lld; LR ramped over %lld steps",
+                                (long long)state_.step,
+                                (long long)resume_warmup_steps_));
             }
 
             train_loader_.set_state(state_.loader);
@@ -1609,6 +1613,12 @@ void Trainer::run_stage() {
         ema_loss_ = (state_.step == 0 && ema_loss_ == 0.0) ? loss : 0.98 * ema_loss_ + 0.02 * loss;
 
         float lr = sched_.lr_at(state_.step);
+        if (resume_warmup_steps_ > 0) {
+            const float ramp = static_cast<float>(state_.step + 1) /
+                               static_cast<float>(resume_warmup_steps_);
+            lr *= std::min(1.0f, ramp);
+            if (state_.step + 1 >= resume_warmup_steps_) resume_warmup_steps_ = 0;
+        }
 
         sync_gradients();
         i64 ntok_global = sync_ntok_sum(ntok_step);

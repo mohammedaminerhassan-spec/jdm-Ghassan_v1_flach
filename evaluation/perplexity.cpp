@@ -45,9 +45,13 @@ PerplexityResult evaluate_shard_perplexity(Generator& generator,
 
         GAI_CHECK(batch.ids.size() == batch.targets.size(),
                   "perplexity: ids/targets length mismatch (dataloader contract)");
+        // targets[i] holds the NEXT token (i+1) or -100. score_tokens()
+        // supervises token j when mask[j] is set, so shift by one: the last
+        // supervised token must be scored and the preceding prompt token must
+        // not be. mask[0] stays 0 (no predecessor).
         std::vector<u8> loss_mask(batch.ids.size(), 0);
-        for (size_t i = 0; i < batch.targets.size(); ++i) {
-            loss_mask[i] = batch.targets[i] >= 0 ? 1 : 0;
+        for (size_t i = 1; i < batch.targets.size(); ++i) {
+            loss_mask[i] = batch.targets[i - 1] >= 0 ? 1 : 0;
         }
         double nll = generator.score_tokens(batch.ids, &loss_mask, &count, &batch.segment_ids);
         sum += nll * static_cast<double>(count);

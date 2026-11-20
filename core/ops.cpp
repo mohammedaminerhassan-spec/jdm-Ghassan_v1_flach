@@ -292,6 +292,11 @@ void convert_f16_to_f32(Device dev, const u16* src, float* dst, i64 n) {
 // into a small FP16 scratch bank and consumed by the existing *_half ops.
 // Only weights used by the SAME kernel need distinct slots; sequential ops
 // reuse slot 0 safely because CUDA stream ordering serializes the GEMMs.
+//
+// IMPORTANT (CPU path): the returned pointer points into a thread-local
+// scratch buffer (g_qcpu[slot]). It remains valid only until the next call to
+// quant_materialize() on the same slot from the same thread, or until
+// quant_scratch_free() is called. Do not store the pointer across calls.
 static constexpr int kQuantSlots = 16;
 static std::vector<u16> g_qcpu[kQuantSlots];   // host scratch (CPU path / tests)
 static std::mutex g_qcpu_mutex;

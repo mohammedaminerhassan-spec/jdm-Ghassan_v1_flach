@@ -429,6 +429,15 @@ void mamba2_backward(const float* x,
     std::vector<double> ddt_bias_accum(static_cast<size_t>(n_heads), 0.0);
 
     {
+        // Same grouped B/C layout as the forward scan, resolved once for the
+        // whole block instead of per row.
+        const int d_state_tot = (conv_dim - d_inner) / 2;
+        GAI_CHECK(d_state_tot >= d_state && d_state_tot % d_state == 0,
+                  "mamba backward: inconsistent conv_dim / d_state");
+        const int groups = d_state_tot / d_state;
+        GAI_CHECK(groups > 0 && n_heads % groups == 0,
+                  "mamba backward: n_heads must be divisible by n_groups");
+        const int heads_per_group = n_heads / groups;
 #ifdef GAI_OPENMP
         #pragma omp parallel
 #endif
@@ -452,6 +461,11 @@ void mamba2_backward(const float* x,
                 const float dt_bias_v = dt_bias[h];
                 const float dskip     = D[h];
 
+                // Match the forward path's grouped B/C layout: with
+                // n_groups > 1 every head reads its own group's vectors.
+                // Hardcoding group 0 here gave wrong d_in_proj gradients.
+                const int g_off = (h / heads_per_group) * d_state;
+
                 // Forward pass for this row: record s_t in s_traj
                 std::fill(s_traj.begin(), s_traj.begin() + d_state, 0.0f);
                 for (int t = 0; t < T; ++t) {
@@ -465,7 +479,7 @@ void mamba2_backward(const float* x,
                     const float* s_prev = s_traj.data() + static_cast<size_t>(t) * d_state;
                     float* s_curr = s_traj.data() + static_cast<size_t>(t + 1) * d_state;
                     for (int j = 0; j < d_state; ++j) {
-                        s_curr[j] = dA * s_prev[j] + (dt_val * brow[d_inner + j]) * xv;
+                        s_curr[j] = dA * s_prev[j] + (dt_val * brow[d_inner + g_off + j]) * xv;
                     }
                 }
 
@@ -495,11 +509,11 @@ void mamba2_backward(const float* x,
                     float d_dt_val = 0.0f;
 
                     for (int j = 0; j < d_state; ++j) {
-                        const float Cj = brow[d_inner + d_state + j];
-                        const float Bj = brow[d_inner + j];
+                        const float Cj = brow[d_inner + d_state_tot + g_off + j];
+                        const float Bj = brow[d_inner + g_off + j];
 
                         #pragma omp atomic
-                        d_brow[d_inner + d_state + j] += dy_val * s_curr[j];
+                        d_brow[d_inner + d_state_tot + g_off + j] += dy_val * s_curr[j];
 
                         const float total_ds = dy_val * Cj + ds[j];
 
@@ -507,7 +521,7 @@ void mamba2_backward(const float* x,
                         d_dt_val += total_ds * Bj * xv;
 
                         #pragma omp atomic
-                        d_brow[d_inner + j] += total_ds * (dt_val * xv);
+                        d_brow[d_inner + g_off + j] += total_ds * (dt_val * xv);
 
                         dx_val += total_ds * (dt_val * Bj);
                         ds[j] = total_ds * dA;

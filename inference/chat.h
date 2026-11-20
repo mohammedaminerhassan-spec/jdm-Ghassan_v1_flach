@@ -15,6 +15,7 @@ struct ChatOptions {
     GenerationConfig gen;
     bool             stream = true;
     bool             show_stats = false;
+    bool             thinking = false;
     int              max_history_turns = 24;
 };
 

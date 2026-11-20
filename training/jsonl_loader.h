@@ -20,6 +20,10 @@ namespace gai {
 
 struct JsonlSample {
     std::vector<Message> messages;
+    // True when at least one assistant turn carries a reasoning trace. Such
+    // samples are rendered with the Ghassan thinking template so <think> and
+    // its content are supervised.
+    bool thinking = false;
 };
 
 class JsonlLoader {

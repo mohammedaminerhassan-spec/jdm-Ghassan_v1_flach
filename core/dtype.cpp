@@ -62,6 +62,12 @@ size_t dtype_nbytes(DType t, size_t numel) {
     if (bs == 1) return numel * dtype_block_bytes(t);
 
     const size_t bsu = static_cast<size_t>(bs);
+    // Quantized block formats (Q4_0 / Q4_1 / Q8_0) round numel up to a whole
+    // number of blocks. The padding bytes in the final partial block are
+    // undefined unless the caller explicitly zeroes them (the quantize_*()
+    // functions in quantization/quantize.cpp do this). Consumers must read
+    // exactly `numel` elements and must not read past the logical end of the
+    // tensor; doing so would read uninitialized padding bytes.
     return ((numel + bsu - 1) / bsu) * dtype_block_bytes(t);
 }
 

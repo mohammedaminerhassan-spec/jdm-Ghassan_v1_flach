@@ -29,6 +29,7 @@ bool role_from_string(const std::string& s, Role& out) {
 
 bool JsonlLoader::parse_line(const std::string& line, JsonlSample& sample) {
     sample.messages.clear();
+    sample.thinking = false;
 
     if (line.empty() || line.find_first_not_of(" \t\r\n") == std::string::npos) {
         return false;
@@ -53,6 +54,12 @@ bool JsonlLoader::parse_line(const std::string& line, JsonlSample& sample) {
             Message msg;
             msg.role = r;
             msg.content = content;
+            if (r == Role::Assistant && item.has("thinking") &&
+                item.at("thinking").is_string() &&
+                !item.at("thinking").as_string().empty()) {
+                msg.thinking = item.at("thinking").as_string();
+                sample.thinking = true;
+            }
             sample.messages.push_back(std::move(msg));
         }
         return !sample.messages.empty();
@@ -71,6 +78,12 @@ bool JsonlLoader::parse_line(const std::string& line, JsonlSample& sample) {
             Message msg;
             msg.role = r;
             msg.content = val;
+            if (r == Role::Assistant && item.has("thinking") &&
+                item.at("thinking").is_string() &&
+                !item.at("thinking").as_string().empty()) {
+                msg.thinking = item.at("thinking").as_string();
+                sample.thinking = true;
+            }
             sample.messages.push_back(std::move(msg));
         }
         return !sample.messages.empty();
@@ -89,6 +102,11 @@ bool JsonlLoader::parse_line(const std::string& line, JsonlSample& sample) {
 
         Message u_msg{Role::User, user_content};
         Message a_msg{Role::Assistant, out};
+        if (j.has("thinking") && j.at("thinking").is_string() &&
+            !j.at("thinking").as_string().empty()) {
+            a_msg.thinking = j.at("thinking").as_string();
+            sample.thinking = true;
+        }
         sample.messages.push_back(std::move(u_msg));
         sample.messages.push_back(std::move(a_msg));
         return true;
@@ -124,12 +142,14 @@ bool JsonlLoader::convert_to_gbin(const std::string& jsonl_path,
         if (sample.messages.empty()) continue;
 
         std::vector<u8> loss_mask;
-        // The chat format is chosen by the vocabulary, not by a flag: Granite-4
-        // tokenizes <|start_of_role|>, Qwen3 tokenizes <|im_start|>.
-        const ChatTemplate tmpl =
-            (tk.token_to_id("<|start_of_role|>") >= 0 && tk.token_to_id("<|end_of_role|>") >= 0)
-                ? ChatTemplate::Granite
-                : ChatTemplate::ChatML;
+        // Samples with a reasoning trace use the Ghassan thinking template;
+        // everything else keeps the checkpoint's original chat format.
+        const ChatTemplate tmpl = chat_template_from_vocab(tk, sample.thinking);
+        if (sample.thinking && tmpl != ChatTemplate::GhassanThinking) {
+            log_warn("[jsonl] a sample carries a thinking trace but this vocabulary "
+                     "lacks <think_on>/<think>/</think>; the trace will be dropped. "
+                     "Use a tokenizer that declares those added tokens.");
+        }
         std::vector<i32> tokens = encode_chat(tk, tmpl, sample.messages,
                                               /*add_generation_prompt=*/false,
                                               &loss_mask);
