@@ -111,6 +111,21 @@ bool load_tokenizer_auto(const std::string& path, Tokenizer& out,
                          std::vector<i32>& eos_out) {
     eos_out.clear();
     std::error_code ec;
+
+    // GGUF mode: a self-contained artifact carries its tokenizer inline.
+    // Without this branch the binary GGUF is handed to the JSON parser and
+    // loading fails, which blocks fine-tuning / export when the only
+    // tokenizer available is the one embedded in the model itself.
+    if (is_gguf_file(path)) {
+        GGUFReader r;
+        if (!r.open(path)) return false;
+        if (!r.has_tokenizer()) return false;
+        if (!r.load_tokenizer(out)) return false;
+        eos_out = r.eos_ids();
+        if (eos_out.empty()) eos_out.push_back(out.eos_id());
+        return true;
+    }
+
     // Directory mode: the tokenizer files live next to (not inside) the
     // weights. No need to mmap several GB of safetensors just to tokenize.
     std::string tok_json = path;
