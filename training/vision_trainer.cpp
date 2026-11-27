@@ -4,6 +4,7 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <fstream>
