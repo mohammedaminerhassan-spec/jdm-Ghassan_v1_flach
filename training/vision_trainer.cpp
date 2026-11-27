@@ -15,6 +15,8 @@
 
 namespace gai {
 
+namespace fs = std::filesystem;
+
 namespace {
 
 class FrozenModelGradGuard {

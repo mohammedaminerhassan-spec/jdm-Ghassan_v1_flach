@@ -477,7 +477,7 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
         g.weight = w;
         for (const auto& p : paths) {
             Shard s;
-                if (!s.load_header(p) && !s.load(p)) {
+            if (!s.load_header(p) && !s.load(p)) {
                 log_warn("dataloader: cannot load shard " + p);
                 continue;
             }
