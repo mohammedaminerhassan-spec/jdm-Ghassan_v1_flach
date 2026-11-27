@@ -12,6 +12,9 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#ifdef GAI_CUDA
+#include "cuda/cuda_utils.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -60,7 +63,12 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
         sat_add(plan.weights, plan.fp16_cache),
         sat_add(plan.activations, sat_add(kv, sat_add(workspaces, qscratch))));
 
-    const size_t available = di.free_mem > 0 ? di.free_mem : di.total_mem;
+    size_t live_free = di.free_mem;
+#ifdef GAI_CUDA
+    const size_t cuda_free = cuda::free_bytes_live();
+    if (cuda_free > 0) live_free = cuda_free;
+#endif
+    const size_t available = live_free > 0 ? live_free : di.total_mem;
     const size_t reserve = available / 10; // Leave 10% headroom for CUDA/runtime allocations.
     const size_t budget = available - reserve;
     const double pct = budget > 0
