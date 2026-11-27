@@ -163,21 +163,36 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
             if (!is_mamba) continue;
             const LayerParams& L = model_.layer(l);
             MambaState st;
-            st.conv_host.assign(static_cast<size_t>(conv_dim) * conv_win, 0.0f);
-            st.ssm_host.assign(static_cast<size_t>(c.mamba_n_heads) * c.mamba_d_head * c.mamba_d_state, 0.0f);
-            if (dev == Device::CUDA) {
+            if (dev == Device::CPU) {
+                st.conv_host.assign(static_cast<size_t>(conv_dim) * conv_win, 0.0f);
+                st.ssm_host.assign(static_cast<size_t>(c.mamba_n_heads) *
+                                   c.mamba_d_head * c.mamba_d_state, 0.0f);
+            } else {
                 st.conv_dev = Tensor::zeros({static_cast<i64>(conv_dim) * conv_win},
                                             DType::F32, dev);
                 st.ssm_dev = Tensor::zeros({static_cast<i64>(c.mamba_n_heads) *
                                             c.mamba_d_head * c.mamba_d_state},
                                            DType::F32, dev);
             }
-            mamba_host_conv_w_.push_back(stage(L.mamba_conv_w.w));
-            mamba_host_conv_b_.push_back(stage(L.mamba_conv_b.w));
-            mamba_host_dt_bias_.push_back(stage(L.mamba_dt_bias.w));
-            mamba_host_a_log_.push_back(stage(L.mamba_A_log.w));
-            mamba_host_D_.push_back(stage(L.mamba_D.w));
-            mamba_host_norm_.push_back(stage(L.mamba_norm.w));
+
+            // The CUDA Mamba step/scan kernels consume device-resident weights and state.
+            // Keep host mirrors only for the CPU fallback; avoid startup D2H copies and
+            // duplicate host allocations on the GPU inference path.
+            if (dev == Device::CPU) {
+                mamba_host_conv_w_.push_back(stage(L.mamba_conv_w.w));
+                mamba_host_conv_b_.push_back(stage(L.mamba_conv_b.w));
+                mamba_host_dt_bias_.push_back(stage(L.mamba_dt_bias.w));
+                mamba_host_a_log_.push_back(stage(L.mamba_A_log.w));
+                mamba_host_D_.push_back(stage(L.mamba_D.w));
+                mamba_host_norm_.push_back(stage(L.mamba_norm.w));
+            } else {
+                mamba_host_conv_w_.emplace_back();
+                mamba_host_conv_b_.emplace_back();
+                mamba_host_dt_bias_.emplace_back();
+                mamba_host_a_log_.emplace_back();
+                mamba_host_D_.emplace_back();
+                mamba_host_norm_.emplace_back();
+            }
             mamba_states_.push_back(std::move(st));
         }
         mamba_states_ready_ = !mamba_states_.empty();
@@ -705,13 +720,6 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
                                     c.mamba_n_heads, c.mamba_d_head, c.mamba_d_state,
                                     conv_k, c.rms_eps,
                                     nullptr, conv_ptr);
-            }
-
-            if (dev == Device::CUDA && st.ssm_dev.defined() && !st.ssm_host.empty()) {
-                device_copy(st.ssm_host.data(), Device::CPU, st.ssm_dev.f32(), dev, sizeof(float) * st.ssm_host.size());
-                if (st.conv_dev.defined() && !st.conv_host.empty()) {
-                    device_copy(st.conv_host.data(), Device::CPU, st.conv_dev.f32(), dev, sizeof(float) * st.conv_host.size());
-                }
             }
 
             if (c.residual_multiplier != 1.0f)
