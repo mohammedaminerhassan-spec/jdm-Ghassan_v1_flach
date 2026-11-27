@@ -12,6 +12,61 @@
 
 namespace gai {
 
+namespace {
+
+class FrozenModelGradGuard {
+public:
+    explicit FrozenModelGradGuard(Model& model)
+        : model_(model), was_grad_enabled_(model.grad_enabled()) {
+        const auto& params = model_.parameters();
+        params_.reserve(params.size());
+        was_frozen_.reserve(params.size());
+        saved_grads_.reserve(params.size());
+        for (Parameter* p : params) {
+            params_.push_back(p);
+            was_frozen_.push_back(p->frozen);
+            saved_grads_.push_back(std::move(p->g));
+            p->frozen = true;
+        }
+    }
+
+    FrozenModelGradGuard(const FrozenModelGradGuard&) = delete;
+    FrozenModelGradGuard& operator=(const FrozenModelGradGuard&) = delete;
+
+    ~FrozenModelGradGuard() { restore(); }
+
+private:
+    void restore() noexcept {
+        if (restored_) return;
+        try {
+            model_.enable_grad(false);
+        } catch (...) {
+            // Continue restoring flags/gradient ownership even during stack unwinding.
+        }
+        for (size_t i = 0; i < params_.size(); ++i) {
+            params_[i]->frozen = was_frozen_[i];
+            params_[i]->g = std::move(saved_grads_[i]);
+        }
+        if (was_grad_enabled_) {
+            try {
+                model_.enable_grad(true);
+            } catch (...) {
+                // The previous state is best-effort restored; never throw from a destructor.
+            }
+        }
+        restored_ = true;
+    }
+
+    Model& model_;
+    bool was_grad_enabled_ = false;
+    bool restored_ = false;
+    std::vector<Parameter*> params_;
+    std::vector<bool> was_frozen_;
+    std::vector<Tensor> saved_grads_;
+};
+
+} // namespace
+
 std::vector<VisionSample> load_vision_jsonl(const std::string& path) {
     std::ifstream f(path);
     GAI_CHECK(f.good(), "cannot open vision JSONL dataset: " + path);
@@ -75,6 +130,12 @@ VisionTrainStats run_vision_training(Model& model,
 
     const int inter = (vcfg.proj_hidden > 0) ? vcfg.proj_hidden : vcfg.out_dim;
 
+    // Projector-only mode must not allocate gradients for billions of frozen LLM weights.
+    // The language-model backward pass still propagates d(visual embeddings) with null dW pointers.
+    std::unique_ptr<FrozenModelGradGuard> frozen_llm;
+    if (!cfg.train_llm) {
+        frozen_llm = std::make_unique<FrozenModelGradGuard>(model);
+    }
     model.enable_grad(true);
 
     std::unique_ptr<AdamW> llm_opt;

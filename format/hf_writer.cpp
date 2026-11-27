@@ -537,17 +537,6 @@ bool export_model_safetensors(const std::string& dir, Model& model,
     }
     const size_t nshards = shards.size();
 
-    {
-        std::error_code rm_ec;
-        fs::remove(fs::path(dir) / "model.safetensors", rm_ec);
-        fs::remove(fs::path(stage) / "model.safetensors.index.json", rm_ec);
-        for (const auto& entry : fs::directory_iterator(dir, rm_ec)) {
-            const std::string n = entry.path().filename().string();
-            if (n.rfind("model-", 0) == 0 && n.find(".safetensors") != std::string::npos)
-                fs::remove(entry.path(), rm_ec);
-        }
-    }
-
     std::map<std::string, std::string> weight_map;
     uint64_t total_size = 0;
     for (size_t s = 0; s < nshards; ++s) {

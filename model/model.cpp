@@ -362,11 +362,16 @@ void ModelConfig::validate() const {
                          "d_state=%d d_conv=%d expand=%d chunk=%d)",
                          mamba_n_heads, mamba_d_head, mamba_d_state,
                          mamba_d_conv, mamba_expand, mamba_chunk_size));
-        const int d_inner = mamba_expand * hidden_size;
-        GAI_CHECK(mamba_n_heads * mamba_d_head <= d_inner,
-                  strfmt("granite: mamba_n_heads*mamba_d_head (%d*%d=%d) must fit in the "
-                         "x block of the conv output (d_inner = expand*hidden = %d)",
-                         mamba_n_heads, mamba_d_head, mamba_n_heads * mamba_d_head, d_inner));
+        const i64 d_inner = static_cast<i64>(mamba_expand) *
+                            static_cast<i64>(hidden_size);
+        const i64 scan_inner = static_cast<i64>(mamba_n_heads) *
+                               static_cast<i64>(mamba_d_head);
+        GAI_CHECK(scan_inner == d_inner,
+                  "granite: mamba_n_heads*mamba_d_head (" +
+                      std::to_string(scan_inner) +
+                      ") must equal expand*hidden_size (" +
+                      std::to_string(d_inner) +
+                      "); a smaller scan width leaves output elements unwritten");
     }
     {
         const int KV_TILE = head_dim() <= 64 ? 64 : (head_dim() <= 96 ? 48 : 32);
@@ -1518,9 +1523,10 @@ void Model::enable_grad(bool on) {
     grad_enabled_ = on;
     if (on) {
         for (const Parameter* p : params_) {
+            if (p->frozen) continue;
             GAI_CHECK(!p->w.is_external(),
-                      "enable_grad on mmap-backed weights is forbidden (read-only file pages): " +
-                      p->name + " - reload without --mmap for training");
+                      "enable_grad on mmap-backed trainable weights is forbidden (read-only file pages): " +
+                      p->name + " - freeze this parameter or reload without --mmap for full fine-tuning");
         }
     }
     for (Parameter* p : params_) {

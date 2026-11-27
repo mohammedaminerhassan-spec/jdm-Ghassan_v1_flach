@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 
 namespace fs = std::filesystem;
@@ -24,44 +25,76 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
     const DeviceInfo& di = device_info();
     if (!di.cuda_available || di.total_mem == 0) return;
 
+    auto sat_add = [](size_t a, size_t b) -> size_t {
+        const size_t maxv = (std::numeric_limits<size_t>::max)();
+        return b > maxv - a ? maxv : a + b;
+    };
+    auto sat_mul = [](size_t a, size_t b) -> size_t {
+        const size_t maxv = (std::numeric_limits<size_t>::max)();
+        return a != 0 && b > maxv / a ? maxv : a * b;
+    };
+
     const int kv_ctx = ctx > 0 ? ctx : std::min(cfg.max_seq_len, 4096);
-    const size_t kv   = Model::kv_cache_bytes(cfg, kv_ctx);
-    const size_t mam  = Model::mamba_state_bytes(cfg);
-    const bool hybrid = (cfg.arch == ModelConfig::ArchGranite);
-    const int act_T = hybrid ? 1 : (ctx > 0 ? ctx : 512);
-    const Model::MemoryPlan plan2 =
-        Model::plan_memory(cfg, 1, act_T, false, 1, fp16_cache_on, fp16_weights, quant_kind);
-    const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, act_T);
+    // Generator batches at most 1024 prompt tokens in its fast prefill path.
+    const int prefill_T = std::max(1, std::min(kv_ctx, 1024));
+    const size_t kv = Model::kv_cache_bytes(cfg, kv_ctx);
+    const Model::MemoryPlan plan =
+        Model::plan_memory(cfg, 1, prefill_T, false, 1,
+                           fp16_cache_on, fp16_weights, quant_kind);
+    const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, prefill_T);
     const size_t qscratch = quant_kind >= 0 ? (512ull << 20) : 0;
-    const size_t need = plan2.weights + plan2.fp16_cache + plan2.activations +
-                        kv + mam + wsp.gemm_bytes + wsp.moe_bytes + qscratch;
 
-    log_info(strfmt("[mem ] GPU plan: weights %s | fp16 cache %s | activations %s | "
-                    "kv %s | mamba %s | workspaces %s = %s of %s (%.0f%%)%s",
-                    human_bytes(plan2.weights).c_str(),
-                    human_bytes(plan2.fp16_cache).c_str(),
-                    human_bytes(plan2.activations).c_str(),
+    // CUDA attention currently materialises one B*H*T*T FP32 score matrix per call.
+    // It is a reusable per-layer workspace, so count it once, not once per layer.
+    const size_t attention_cells =
+        sat_mul(sat_mul(static_cast<size_t>(cfg.num_heads),
+                        static_cast<size_t>(prefill_T)),
+                static_cast<size_t>(prefill_T));
+    const size_t attention_workspace = sat_mul(attention_cells, sizeof(float));
+    const size_t workspaces = sat_add(
+        sat_add(wsp.gemm_bytes, wsp.moe_bytes),
+        sat_add(wsp.mamba_bytes, attention_workspace));
+
+    // plan.activations already includes the persistent Mamba recurrent-state allocation.
+    const size_t need = sat_add(
+        sat_add(plan.weights, plan.fp16_cache),
+        sat_add(plan.activations, sat_add(kv, sat_add(workspaces, qscratch))));
+
+    const size_t available = di.free_mem > 0 ? di.free_mem : di.total_mem;
+    const size_t reserve = available / 10; // Leave 10% headroom for CUDA/runtime allocations.
+    const size_t budget = available - reserve;
+    const double pct = budget > 0
+        ? 100.0 * static_cast<double>(need) / static_cast<double>(budget)
+        : 100.0;
+
+    log_info(strfmt("[mem ] GPU plan: weights %s | fp16 cache %s | activations %s "
+                    "(includes Mamba state) | KV %s | CUDA workspaces %s "
+                    "(GEMM %s, MoE %s, Mamba %s, attention scores %s) = %s "
+                    "of %s usable VRAM (%s free / %s total, %.0f%%)",
+                    human_bytes(plan.weights).c_str(),
+                    human_bytes(plan.fp16_cache).c_str(),
+                    human_bytes(plan.activations).c_str(),
                     human_bytes(kv).c_str(),
-                    human_bytes(mam).c_str(),
-                    human_bytes(wsp.gemm_bytes + wsp.moe_bytes).c_str(),
+                    human_bytes(workspaces).c_str(),
+                    human_bytes(wsp.gemm_bytes).c_str(),
+                    human_bytes(wsp.moe_bytes).c_str(),
+                    human_bytes(wsp.mamba_bytes).c_str(),
+                    human_bytes(attention_workspace).c_str(),
                     human_bytes(need).c_str(),
+                    human_bytes(budget).c_str(),
+                    human_bytes(available).c_str(),
                     human_bytes(di.total_mem).c_str(),
-                    100.0 * static_cast<double>(need) / static_cast<double>(di.total_mem),
-                    hybrid ? " [the hybrid prefills token by token]" : ""));
+                    pct));
 
-    if (need > di.total_mem) {
-        GAI_FAIL(strfmt("the model does not fit this GPU: it needs %s but the card has %s "
-                        "(%s of %s weights + %s of activations/KV). "
-                        "Options: --device cpu (slower, uses the host RAM), a smaller --ctx, "
-                        "--weight-f16 1 (the weights in half precision: %s instead of %s), "
-                        "or --no-fp16-cache (frees the fp16 copy).",
-                        human_bytes(need).c_str(), human_bytes(di.total_mem).c_str(),
-                        human_bytes(plan2.weights).c_str(),
-                        fp16_weights ? "half-precision" : "fp32",
-                        human_bytes(plan2.activations + kv).c_str(),
-                        human_bytes(Model::plan_memory(cfg, 1, act_T, false, 1,
-                                                       false, true).weights).c_str(),
-                        human_bytes(plan2.weights).c_str()));
+    if (need > budget) {
+        GAI_FAIL(strfmt("the model's estimated inference footprint is %s, but only %s of VRAM "
+                        "is available for this load after a 10%% safety reserve "
+                        "(%s free / %s total). Reduce --ctx, use --weight-f16 1, "
+                        "--weight-q4, or disable --fp16-cache.",
+                        human_bytes(need).c_str(),
+                        human_bytes(budget).c_str(),
+                        human_bytes(available).c_str(),
+                        human_bytes(di.total_mem).c_str()));
     }
 }
 
