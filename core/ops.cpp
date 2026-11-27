@@ -1,0 +1,1324 @@
+#include "core/ops.h"
+#include "core/ops_cpu.h"
+#include "core/common.h"
+
+#ifdef GAI_CUDA
+#include "cuda/cuda_ops.h"
+#endif
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+inline std::uint16_t load_u16(const std::uint8_t* p) {
+    std::uint16_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+}
+
+#ifdef GAI_CUDA
+#define GAI_DISPATCH(dev, call) \
+    do { if ((dev) == Device::CUDA) { cuda_ops::call; return; } cpu::call; } while (0)
+#define GAI_DISPATCH_RET(dev, call) \
+    do { if ((dev) == Device::CUDA) { return cuda_ops::call; } return cpu::call; } while (0)
+#else
+#define GAI_DISPATCH(dev, call) \
+    do { GAI_CHECK((dev) == Device::CPU, "CUDA tensor on CPU-only build"); cpu::call; } while (0)
+#define GAI_DISPATCH_RET(dev, call) \
+    do { GAI_CHECK((dev) == Device::CPU, "CUDA tensor on CPU-only build"); return cpu::call; } while (0)
+#endif
+
+namespace gai {
+namespace ops {
+
+static std::atomic<bool> g_gemm_fp16{true};
+static std::atomic<bool> g_fused_q4{true};
+
+static std::atomic<bool> g_gemm_bf16{false};
+static std::atomic<float> g_moe_jitter{0.0f};
+static std::atomic<u64> g_jitter_seed{0};
+static std::mutex g_fp16_weights_mutex;
+static std::unordered_map<const float*, std::pair<const u16*, i64>> g_fp16_weights;
+
+void set_moe_jitter(float j) {
+    if (j < 0.0f) j = 0.0f;
+    if (j > 0.5f) j = 0.5f;
+    g_moe_jitter.store(j, std::memory_order_relaxed);
+    cpu::set_moe_jitter_cpu(j);
+#ifdef GAI_CUDA
+    cuda_ops::set_moe_jitter(j);
+#endif
+}
+float moe_jitter() { return g_moe_jitter.load(std::memory_order_relaxed); }
+
+void set_moe_jitter_seed(u64 s) {
+    g_jitter_seed.store(s, std::memory_order_relaxed);
+    cpu::set_moe_jitter_seed_cpu(s);
+#ifdef GAI_CUDA
+    cuda_ops::set_moe_jitter_seed(s);
+#endif
+}
+void set_gemm_fp16(bool on) {
+    g_gemm_fp16.store(on, std::memory_order_relaxed);
+#ifdef GAI_CUDA
+    cuda_ops::set_fp16_gemm(on);
+#endif
+}
+
+bool gemm_fp16_enabled() { return g_gemm_fp16.load(std::memory_order_relaxed); }
+
+void set_gemm_bf16(bool on) {
+    g_gemm_bf16.store(on, std::memory_order_relaxed);
+#ifdef GAI_CUDA
+    cuda_ops::set_bf16_gemm(on);
+#endif
+}
+
+bool gemm_bf16_enabled() { return g_gemm_bf16.load(std::memory_order_relaxed); }
+
+static std::atomic<i64> g_mnk_threshold{1024LL * 1024LL};
+void set_gemm_fp16_mnk_threshold(i64 mnk) {
+    if (mnk < 0) mnk = 0;
+    g_mnk_threshold.store(mnk, std::memory_order_relaxed);
+}
+i64 gemm_fp16_mnk_threshold() { return g_mnk_threshold.load(std::memory_order_relaxed); }
+
+static std::atomic<u64> g_perf_gemm{0};
+static std::atomic<u64> g_perf_fp16{0};
+static std::atomic<u64> g_perf_h2d{0};
+static std::atomic<u64> g_perf_d2h{0};
+static std::atomic<u64> g_perf_moe_fwd{0};
+static std::atomic<u64> g_perf_moe_fwd_us{0};
+static std::atomic<u64> g_perf_moe_bwd{0};
+static std::atomic<u64> g_perf_moe_bwd_us{0};
+static std::atomic<u64> g_perf_sce{0};
+static std::atomic<u64> g_perf_sce_us{0};
+static std::atomic<u64> g_perf_sync{0};
+static std::atomic<u64> g_perf_opt{0};
+static std::atomic<u64> g_perf_opt_us{0};
+static std::atomic<u64> g_perf_muon_ns{0};
+static std::atomic<u64> g_perf_muon_ns_iters{0};
+static std::atomic<u64> g_perf_muon_ns_us{0};
+void perf_note_fp16_gemm() { g_perf_fp16.fetch_add(1, std::memory_order_relaxed); }
+void perf_note_h2d(size_t n) { g_perf_h2d.fetch_add(static_cast<u64>(n), std::memory_order_relaxed); }
+void perf_note_d2h(size_t n) { g_perf_d2h.fetch_add(static_cast<u64>(n), std::memory_order_relaxed); }
+void perf_note_sync() { g_perf_sync.fetch_add(1, std::memory_order_relaxed); }
+void perf_note_moe_fwd(u64 us) {
+    g_perf_moe_fwd.fetch_add(1, std::memory_order_relaxed);
+    g_perf_moe_fwd_us.fetch_add(us, std::memory_order_relaxed);
+}
+void perf_note_moe_bwd(u64 us) {
+    g_perf_moe_bwd.fetch_add(1, std::memory_order_relaxed);
+    g_perf_moe_bwd_us.fetch_add(us, std::memory_order_relaxed);
+}
+void perf_note_sce(u64 us) {
+    g_perf_sce.fetch_add(1, std::memory_order_relaxed);
+    g_perf_sce_us.fetch_add(us, std::memory_order_relaxed);
+}
+void perf_note_opt_step(u64 us) {
+    g_perf_opt.fetch_add(1, std::memory_order_relaxed);
+    g_perf_opt_us.fetch_add(us, std::memory_order_relaxed);
+}
+void perf_note_muon_ns(int iters, u64 us) {
+    g_perf_muon_ns.fetch_add(1, std::memory_order_relaxed);
+    g_perf_muon_ns_iters.fetch_add(static_cast<u64>(iters), std::memory_order_relaxed);
+    g_perf_muon_ns_us.fetch_add(us, std::memory_order_relaxed);
+}
+
+namespace {
+std::chrono::steady_clock::time_point g_load_t0{};
+double g_load_ms = 0.0;
+bool   g_load_open = false;
+}
+
+void phase_start(Device dev, TrainPhase ph) {
+    if (ph == TrainPhase::Load) {
+        g_load_t0 = std::chrono::steady_clock::now();
+        g_load_open = true;
+        return;
+    }
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) { cuda_ops::phase_start(static_cast<int>(ph)); return; }
+#else
+    (void)dev;
+#endif
+}
+void phase_stop(Device dev, TrainPhase ph) {
+    if (ph == TrainPhase::Load) {
+        if (g_load_open) {
+            g_load_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - g_load_t0).count();
+            g_load_open = false;
+        }
+        return;
+    }
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) { cuda_ops::phase_stop(static_cast<int>(ph)); return; }
+#else
+    (void)dev;
+#endif
+}
+void phase_reset(Device dev) {
+    g_load_ms = 0.0;
+    g_load_open = false;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) { cuda_ops::phase_reset(); return; }
+#else
+    (void)dev;
+#endif
+}
+std::string phase_report(Device dev) {
+    std::string s;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) s = cuda_ops::phase_report();
+#else
+    (void)dev;
+#endif
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), " load %.1fms", g_load_ms);
+    s += buf;
+    g_load_ms = 0.0;
+    g_load_open = false;
+    return s;
+}
+PerfCounters perf_counters() {
+    PerfCounters c;
+    c.gemm_calls      = g_perf_gemm.load(std::memory_order_relaxed);
+    c.gemm_fp16_calls = g_perf_fp16.load(std::memory_order_relaxed);
+    c.h2d_bytes       = g_perf_h2d.load(std::memory_order_relaxed);
+    c.d2h_bytes       = g_perf_d2h.load(std::memory_order_relaxed);
+    c.moe_fwd_calls   = g_perf_moe_fwd.load(std::memory_order_relaxed);
+    c.moe_bwd_calls   = g_perf_moe_bwd.load(std::memory_order_relaxed);
+    c.moe_fwd_us      = g_perf_moe_fwd_us.load(std::memory_order_relaxed);
+    c.moe_bwd_us      = g_perf_moe_bwd_us.load(std::memory_order_relaxed);
+    c.sce_calls       = g_perf_sce.load(std::memory_order_relaxed);
+    c.sce_us          = g_perf_sce_us.load(std::memory_order_relaxed);
+    c.sync_calls      = g_perf_sync.load(std::memory_order_relaxed);
+    c.opt_steps       = g_perf_opt.load(std::memory_order_relaxed);
+    c.opt_step_us     = g_perf_opt_us.load(std::memory_order_relaxed);
+    c.muon_ns_calls   = g_perf_muon_ns.load(std::memory_order_relaxed);
+    c.muon_ns_iters   = g_perf_muon_ns_iters.load(std::memory_order_relaxed);
+    c.muon_ns_us      = g_perf_muon_ns_us.load(std::memory_order_relaxed);
+    return c;
+}
+std::string perf_report() {
+    PerfCounters c = perf_counters();
+    auto ms = [](u64 us, u64 n) -> double { return n ? static_cast<double>(us) / 1000.0 / static_cast<double>(n) : 0.0; };
+    return strfmt("gemm=%s (fp16 %s) h2d=%s d2h=%s | moe fwd=%s (%.1fms) bwd=%s (%.1fms) | "
+                  "ce=%s (%.1fms) | sync=%s | opt=%s (%.1fms) | muon-ns=%s/%sit (%.1fms)",
+                  human_count(c.gemm_calls).c_str(),
+                  human_count(c.gemm_fp16_calls).c_str(),
+                  human_bytes(c.h2d_bytes).c_str(),
+                  human_bytes(c.d2h_bytes).c_str(),
+                  human_count(c.moe_fwd_calls).c_str(), ms(c.moe_fwd_us, c.moe_fwd_calls),
+                  human_count(c.moe_bwd_calls).c_str(), ms(c.moe_bwd_us, c.moe_bwd_calls),
+                  human_count(c.sce_calls).c_str(), ms(c.sce_us, c.sce_calls),
+                  human_count(c.sync_calls).c_str(),
+                  human_count(c.opt_steps).c_str(), ms(c.opt_step_us, c.opt_steps),
+                  human_count(c.muon_ns_calls).c_str(), human_count(c.muon_ns_iters).c_str(),
+                  ms(c.muon_ns_us, c.muon_ns_calls));
+}
+
+void gemm(Device dev, bool ta, bool tb, int M, int N, int K, float alpha,
+          const float* A, int lda, const float* B, int ldb,
+          float beta, float* C, int ldc) {
+    g_perf_gemm.fetch_add(1, std::memory_order_relaxed);
+    GAI_DISPATCH(dev, gemm(ta, tb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc));
+}
+
+void linear_forward(Device dev, const float* x, const float* w, float* y, int M, int K, int N) {
+    g_perf_gemm.fetch_add(1, std::memory_order_relaxed);
+    const u16* half = nullptr;
+    i64 count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_fp16_weights_mutex);
+        auto it = g_fp16_weights.find(w);
+        if (it != g_fp16_weights.end()) {
+            half = it->second.first;
+            count = it->second.second;
+        }
+    }
+    if (half && count == static_cast<i64>(K) * N) {
+        g_perf_fp16.fetch_add(1, std::memory_order_relaxed);
+        linear_forward_fp16(dev, x, half, y, M, K, N);
+        return;
+    }
+    GAI_DISPATCH(dev, linear_forward(x, w, y, M, K, N));
+}
+
+void linear_forward_fp16(Device dev, const float* x, const u16* w, float* y, int M, int K, int N) {
+    GAI_DISPATCH(dev, linear_forward_fp16(x, w, y, M, K, N));
+}
+
+void convert_f32_to_f16(Device dev, const float* src, u16* dst, i64 n) {
+    if (dev == Device::CPU) {
+        for (i64 i = 0; i < n; ++i) dst[i] = fp32_to_fp16(src[i]);
+        return;
+    }
+#ifdef GAI_CUDA
+    cuda_ops::convert_f32_to_f16(src, dst, n);
+#else
+    GAI_FAIL("convert_f32_to_f16: CUDA device requested but the build has no CUDA support");
+#endif
+}
+
+void convert_f16_to_f32(Device dev, const u16* src, float* dst, i64 n) {
+    if (dev == Device::CPU) {
+        for (i64 i = 0; i < n; ++i) dst[i] = fp16_to_fp32(src[i]);
+        return;
+    }
+#ifdef GAI_CUDA
+    cuda_ops::convert_f16_to_f32(src, dst, n);
+#else
+    GAI_FAIL("convert_f16_to_f32: CUDA device requested but the build has no CUDA support");
+#endif
+}
+
+static constexpr int kQuantSlots = 16;
+static thread_local std::vector<u16> g_qcpu[kQuantSlots];
+static std::mutex g_qcpu_mutex;
+
+const u16* quant_materialize(Device dev, const void* packed, int kind, i64 n, int slot) {
+    GAI_CHECK(packed != nullptr && n > 0, "quant_materialize: bad arguments");
+    if (slot < 0 || slot >= kQuantSlots) slot = 0;
+
+    if (dev == Device::CPU) {
+        std::lock_guard<std::mutex> lock(g_qcpu_mutex);
+        auto& buf = g_qcpu[static_cast<size_t>(slot)];
+        buf.resize(static_cast<size_t>(n));
+        const u8* p = reinterpret_cast<const u8*>(packed);
+        for (i64 i = 0; i < n; ++i) {
+            const i64 b = i >> 5;
+            const int j = static_cast<int>(i & 31);
+            float v;
+            if (kind == 0) {
+                const u8* blk = p + b * 18;
+                const float sc = fp16_to_fp32(load_u16(blk));
+                const u8 byte = blk[2 + (j & 15)];
+                const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+                v = static_cast<float>(q - 8) * sc;
+            } else if (kind == 1) {
+                const u8* blk = p + b * 20;
+                const float sc = fp16_to_fp32(load_u16(blk));
+                const float mn = fp16_to_fp32(load_u16(blk + 2));
+                const u8 byte = blk[4 + (j & 15)];
+                const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+                v = static_cast<float>(q) * sc + mn;
+            } else {
+                const u8* blk = p + b * 34;
+                const float sc = fp16_to_fp32(load_u16(blk));
+                v = static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[j]) * sc;
+            }
+            buf[static_cast<size_t>(i)] = fp32_to_fp16(v);
+        }
+        return buf.data();
+    }
+
+#ifdef GAI_CUDA
+    u16* dst = cuda_ops::quant_scratch(slot, n);
+    cuda_ops::dequantize_quant(static_cast<const u16*>(packed), dst, n, kind);
+    return dst;
+#else
+    GAI_FAIL("quant_materialize: CUDA device requested but the build has no CUDA support");
+#endif
+}
+
+void quant_scratch_free() {
+#ifdef GAI_CUDA
+    cuda_ops::free_quant_scratch();
+#endif
+    for (int i = 0; i < kQuantSlots; ++i) g_qcpu[static_cast<size_t>(i)].clear();
+}
+
+void set_fused_q4(bool on) { g_fused_q4.store(on, std::memory_order_relaxed); }
+bool fused_q4_enabled() { return g_fused_q4.load(std::memory_order_relaxed); }
+
+void linear_forward_q4(Device dev, const float* x, const void* w, float* y,
+                       int M, int K, int N, int kind) {
+    if (M <= 0 || N <= 0) return;
+    if (dev == Device::CPU) {
+        std::vector<float> row(static_cast<size_t>(K));
+        const u8* p = reinterpret_cast<const u8*>(w);
+        const int bpb = (kind == 0) ? 18 : (kind == 1) ? 20 : 34;
+        GAI_CHECK(K % 32 == 0, "linear_forward_q4: K must be a multiple of 32");
+        const size_t row_bytes = (static_cast<size_t>(K) / 32) * static_cast<size_t>(bpb);
+        for (int n = 0; n < N; ++n) {
+            const u8* wr = p + static_cast<size_t>(n) * row_bytes;
+            for (int k = 0; k < K; ++k) {
+                const u8* blk = wr + static_cast<size_t>(k >> 5) * bpb;
+                float v;
+                if (kind == 0) {
+                    const float d = fp16_to_fp32(load_u16(blk));
+                    const int j = k & 31;
+                    const u8 b = blk[2 + (j & 15)];
+                    const int q = (j < 16) ? (b & 0x0F) : (b >> 4);
+                    v = static_cast<float>(q - 8) * d;
+                } else if (kind == 1) {
+                    const float d = fp16_to_fp32(load_u16(blk));
+                    const float mn = fp16_to_fp32(load_u16(blk + 2));
+                    const u8 b = blk[4 + ((k & 31) & 15)];
+                    const int q = ((k & 31) < 16) ? (b & 0x0F) : (b >> 4);
+                    v = static_cast<float>(q) * d + mn;
+                } else {
+                    const float d = fp16_to_fp32(load_u16(blk));
+                    v = static_cast<float>(reinterpret_cast<const i8*>(blk + 2)[k & 31]) * d;
+                }
+                row[static_cast<size_t>(k)] = v;
+            }
+            for (int m = 0; m < M; ++m) {
+                const float* xa = x + static_cast<size_t>(m) * K;
+                float acc = 0.0f;
+                for (int k = 0; k < K; ++k) acc += xa[k] * row[static_cast<size_t>(k)];
+                y[static_cast<size_t>(m) * N + n] = acc;
+            }
+        }
+        return;
+    }
+#ifdef GAI_CUDA
+    cuda_ops::linear_forward_q4(x, static_cast<const u16*>(w), y, M, K, N, kind);
+#else
+    GAI_FAIL("linear_forward_q4: CUDA device requested but the build has no CUDA support");
+#endif
+}
+
+void register_fp16_weight(const float* master, const u16* half, i64 n) {
+    GAI_CHECK(master != nullptr && half != nullptr && n > 0, "invalid fp16 weight registration");
+    std::lock_guard<std::mutex> lock(g_fp16_weights_mutex);
+    g_fp16_weights[master] = {half, n};
+}
+
+void unregister_fp16_weight(const float* master) {
+    std::lock_guard<std::mutex> lock(g_fp16_weights_mutex);
+    g_fp16_weights.erase(master);
+}
+
+std::mutex& get_fp16_weights_mutex() {
+    return g_fp16_weights_mutex;
+}
+
+std::unordered_map<const float*, std::pair<const u16*, i64>>& get_fp16_weights_map() {
+    return g_fp16_weights;
+}
+
+void split_qkv(Device dev, const float* qkv, float* q, float* k, float* v,
+               i64 n, int qd, int kvd) {
+    GAI_DISPATCH(dev, split_qkv(qkv, q, k, v, n, qd, kvd));
+}
+
+void linear_backward(Device dev, const float* x, const float* w, const float* dy,
+                     float* dx, float* dw, int M, int K, int N) {
+
+    g_perf_gemm.fetch_add((dx ? 1u : 0u) + (dw ? 1u : 0u), std::memory_order_relaxed);
+    GAI_DISPATCH(dev, linear_backward(x, w, dy, dx, dw, M, K, N));
+}
+
+void linear_backward_half(Device dev, const float* x, const u16* w, const float* dy,
+                          float* dx, float* dw, int M, int K, int N) {
+    g_perf_gemm.fetch_add((dx ? 1u : 0u) + (dw ? 1u : 0u), std::memory_order_relaxed);
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::linear_backward_half(x, w, dy, dx, dw, M, K, N);
+        return;
+    }
+#endif
+    cpu::linear_backward_half(x, w, dy, dx, dw, M, K, N);
+}
+
+void add(Device dev, const float* a, const float* b, float* out, i64 n) {
+    GAI_DISPATCH(dev, add(a, b, out, n));
+}
+
+void add_inplace(Device dev, float* a, const float* b, i64 n) {
+    GAI_DISPATCH(dev, add_inplace(a, b, n));
+}
+
+void add_bias(Device dev, const float* b, float* y, i64 rows, int cols) {
+    GAI_DISPATCH(dev, add_bias(b, y, rows, cols));
+}
+
+void bias_backward(Device dev, const float* dy, float* db, i64 rows, int cols) {
+    GAI_DISPATCH(dev, bias_backward(dy, db, rows, cols));
+}
+
+void scale_inplace(Device dev, float* a, float s, i64 n) {
+    GAI_DISPATCH(dev, scale_inplace(a, s, n));
+}
+
+void zero(Device dev, float* a, i64 n) {
+
+    if (n <= 0) return;
+    GAI_CHECK(a != nullptr, "ops::zero on null pointer (missing scratch?)");
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) { cuda_ops::zero(a, n); return; }
+#endif
+    (void)dev;
+    std::memset(a, 0, sizeof(float) * static_cast<size_t>(n));
+}
+
+void copy(Device dev, float* dst, const float* src, i64 n) {
+    if (n <= 0) return;
+    GAI_CHECK(dst != nullptr && src != nullptr, "ops::copy on null pointer");
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) { cuda_ops::copy(dst, src, n); return; }
+#endif
+    (void)dev;
+    std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(n));
+}
+
+void embedding_forward(Device dev, const i32* ids, const float* table, float* out,
+                       i64 ntok, int dim, int vocab) {
+    GAI_DISPATCH(dev, embedding_forward(ids, table, out, ntok, dim, vocab));
+}
+
+void embedding_forward_half(Device dev, const i32* ids, const u16* table, float* out,
+                            i64 ntok, int dim, int vocab) {
+    GAI_DISPATCH(dev, embedding_forward_half(ids, table, out, ntok, dim, vocab));
+}
+
+void embedding_backward(Device dev, const i32* ids, const float* dout, float* dtable,
+                        i64 ntok, int dim, int vocab) {
+    GAI_DISPATCH(dev, embedding_backward(ids, dout, dtable, ntok, dim, vocab));
+}
+
+void rmsnorm_forward(Device dev, const float* x, const float* weight, float* out,
+                     float* rrms, i64 rows, int dim, float eps) {
+    GAI_DISPATCH(dev, rmsnorm_forward(x, weight, out, rrms, rows, dim, eps));
+}
+
+void rmsnorm_backward(Device dev, const float* x, const float* weight, const float* dout,
+                      const float* rrms, float* dx, float* dweight,
+                      i64 rows, int dim) {
+    GAI_DISPATCH(dev, rmsnorm_backward(x, weight, dout, rrms, dx, dweight, rows, dim));
+}
+
+void rope_backward(Device dev, float* dq, float* dk, const i32* pos,
+                   i64 ntok, int n_heads, int n_kv, int head_dim, float theta) {
+    GAI_DISPATCH(dev, rope_backward(dq, dk, pos, ntok, n_heads, n_kv, head_dim, theta));
+}
+
+void rope_forward_ex(Device dev, float* q, float* k, const i32* pos,
+                     i64 ntok, int n_heads, int n_kv, int head_dim, float theta,
+                     int rope_type, float yarn_low, float yarn_high, float yarn_scale) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::rope_forward_ex(q, k, pos, ntok, n_heads, n_kv, head_dim, theta,
+                                  rope_type, yarn_low, yarn_high, yarn_scale);
+        return;
+    }
+#endif
+    cpu::rope_forward_ex(q, k, pos, ntok, n_heads, n_kv, head_dim, theta,
+                         rope_type, yarn_low, yarn_high, yarn_scale);
+}
+
+void rope_backward_ex(Device dev, float* dq, float* dk, const i32* pos,
+                      i64 ntok, int n_heads, int n_kv, int head_dim, float theta,
+                      int rope_type, float yarn_low, float yarn_high, float yarn_scale) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::rope_backward_ex(dq, dk, pos, ntok, n_heads, n_kv, head_dim, theta,
+                                   rope_type, yarn_low, yarn_high, yarn_scale);
+        return;
+    }
+#endif
+    cpu::rope_backward_ex(dq, dk, pos, ntok, n_heads, n_kv, head_dim, theta,
+                          rope_type, yarn_low, yarn_high, yarn_scale);
+}
+
+void rope_forward_cached(Device dev, float* q, float* k, const i32* pos,
+                         const float* inv_freq, i64 ntok, int n_heads, int n_kv,
+                         int head_dim, int rope_type) {
+    GAI_DISPATCH(dev, rope_forward_cached(q, k, pos, inv_freq, ntok, n_heads, n_kv,
+                                          head_dim, rope_type));
+}
+
+void rope_backward_cached(Device dev, float* dq, float* dk, const i32* pos,
+                          const float* inv_freq, i64 ntok, int n_heads, int n_kv,
+                          int head_dim, int rope_type) {
+    GAI_DISPATCH(dev, rope_backward_cached(dq, dk, pos, inv_freq, ntok, n_heads, n_kv,
+                                           head_dim, rope_type));
+}
+
+void swiglu_forward(Device dev, const float* g, const float* u, float* out, i64 n) {
+    GAI_DISPATCH(dev, swiglu_forward(g, u, out, n));
+}
+
+void swiglu_backward(Device dev, const float* g, const float* u, const float* dout,
+                     float* dg, float* du, i64 n) {
+    GAI_DISPATCH(dev, swiglu_backward(g, u, dout, dg, du, n));
+}
+
+void gelu_forward(Device dev, const float* in, float* out, i64 n) {
+    GAI_DISPATCH(dev, gelu_forward(in, out, n));
+}
+
+void gelu_backward(Device dev, const float* in, const float* dout, float* din, i64 n) {
+    GAI_DISPATCH(dev, gelu_backward(in, dout, din, n));
+}
+
+void mamba2_forward(Device dev,
+                    const float* x,
+                    const float* w_in,
+                    const float* conv_w,
+                    const float* conv_b,
+                    const float* dt_bias,
+                    const float* a_log,
+                    const float* D,
+                    const float* norm_w,
+                    const float* w_out,
+                    float* state,
+                    float* out,
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps,
+                    const int32_t* segment_ids, float* conv_state) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::mamba2_forward(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                                  norm_w, w_out, state, out,
+                                  B, T, d, d_inner, conv_dim, n_heads,
+                                  d_head, d_state, k, eps, segment_ids, conv_state);
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::mamba2_forward(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                        state, out, B, T, d, d_inner, conv_dim, n_heads,
+                        d_head, d_state, k, eps, segment_ids, conv_state);
+}
+
+void mamba2_forward_half(Device dev,
+                    const float* x,
+                    const u16* w_in,
+                    const float* conv_w,
+                    const float* conv_b,
+                    const float* dt_bias,
+                    const float* a_log,
+                    const float* D,
+                    const float* norm_w,
+                    const u16* w_out,
+                    float* state,
+                    float* out,
+                    int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                    int d_head, int d_state, int k, float eps, int qkind,
+                    const int32_t* segment_ids, float* conv_state) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::mamba2_forward_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                                      norm_w, w_out, state, out,
+                                      B, T, d, d_inner, conv_dim, n_heads,
+                                      d_head, d_state, k, eps, qkind, segment_ids, conv_state);
+        return;
+    }
+#endif
+    if (qkind >= 0) {
+        const int proj = d_inner + conv_dim + n_heads;
+        const u16* wi = quant_materialize(dev, w_in, qkind, (i64)proj * d, 0);
+        const u16* wo = quant_materialize(dev, w_out, qkind, (i64)d * d_inner, 1);
+        cpu::mamba2_forward_half(x, wi, conv_w, conv_b, dt_bias, a_log, D, norm_w, wo,
+                                 state, out, B, T, d, d_inner, conv_dim, n_heads,
+                                 d_head, d_state, k, eps, segment_ids, conv_state);
+        return;
+    }
+    (void)dev;
+    cpu::mamba2_forward_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                             state, out, B, T, d, d_inner, conv_dim, n_heads,
+                             d_head, d_state, k, eps, segment_ids, conv_state);
+}
+
+void mamba2_step(Device dev,
+                 const float* x,
+                 const float* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const float* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps) {
+#ifdef GAI_CUDA
+    GAI_CHECK(dev == Device::CUDA, "mamba2_step is a CUDA-only decode kernel");
+    cuda_ops::mamba2_step(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                          conv_state, ssm_state, out, d, d_inner, conv_dim, n_heads,
+                          d_head, d_state, k, eps);
+#else
+    (void)x; (void)w_in; (void)conv_w; (void)conv_b; (void)dt_bias; (void)a_log;
+    (void)D; (void)norm_w; (void)w_out; (void)conv_state; (void)ssm_state; (void)out;
+    (void)d; (void)d_inner; (void)conv_dim; (void)n_heads; (void)d_head;
+    (void)d_state; (void)k; (void)eps; (void)dev;
+    GAI_FAIL("mamba2_step: CUDA support not compiled in");
+#endif
+}
+
+void mamba2_step_half(Device dev,
+                 const float* x,
+                 const u16* w_in, const float* conv_w, const float* conv_b,
+                 const float* dt_bias, const float* a_log, const float* D,
+                 const float* norm_w, const u16* w_out,
+                 float* conv_state, float* ssm_state, float* out,
+                 int d, int d_inner, int conv_dim, int n_heads,
+                 int d_head, int d_state, int k, float eps, int qkind) {
+#ifdef GAI_CUDA
+    GAI_CHECK(dev == Device::CUDA, "mamba2_step_half is a CUDA-only decode kernel");
+    cuda_ops::mamba2_step_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                               conv_state, ssm_state, out, d, d_inner, conv_dim, n_heads,
+                               d_head, d_state, k, eps, qkind);
+#else
+    (void)x; (void)w_in; (void)conv_w; (void)conv_b; (void)dt_bias; (void)a_log;
+    (void)D; (void)norm_w; (void)w_out; (void)conv_state; (void)ssm_state; (void)out;
+    (void)d; (void)d_inner; (void)conv_dim; (void)n_heads; (void)d_head;
+    (void)d_state; (void)k; (void)eps; (void)dev; (void)qkind;
+    GAI_FAIL("mamba2_step_half: CUDA support not compiled in");
+#endif
+}
+
+void mamba2_backward_half(Device dev,
+                     const float* x,
+                     const u16* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const u16* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     float* dbc_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps,
+                     const i32* segment_ids) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::mamba2_backward_half(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                                       norm_w, w_out, dout, dx, dw_in, dconv_w, dconv_b,
+                                       ddt_bias, da_log, dD, dnorm_w, dw_out, dbc_out,
+                                       B, T, d, d_inner, conv_dim, n_heads,
+                                       d_head, d_state, k, eps, segment_ids);
+        return;
+    }
+#endif
+    (void)dev;
+    const i64 nin = static_cast<i64>(d_inner + conv_dim + n_heads) * d;
+    const i64 nout = static_cast<i64>(d) * d_inner;
+    std::vector<float> wi(static_cast<size_t>(nin)), wo(static_cast<size_t>(nout));
+    for (i64 i = 0; i < nin; ++i) wi[static_cast<size_t>(i)] = fp16_to_fp32(w_in[i]);
+    for (i64 i = 0; i < nout; ++i) wo[static_cast<size_t>(i)] = fp16_to_fp32(w_out[i]);
+    cpu::mamba2_backward(x, wi.data(), conv_w, conv_b, dt_bias, a_log, D, norm_w, wo.data(),
+                         dout, dx, dw_in, dconv_w, dconv_b, ddt_bias, da_log, dD,
+                         dnorm_w, dw_out, dbc_out, B, T, d, d_inner, conv_dim, n_heads,
+                         d_head, d_state, k, eps, segment_ids);
+}
+
+void mamba2_backward(Device dev,
+                     const float* x,
+                     const float* w_in,
+                     const float* conv_w,
+                     const float* conv_b,
+                     const float* dt_bias,
+                     const float* a_log,
+                     const float* D,
+                     const float* norm_w,
+                     const float* w_out,
+                     const float* dout,
+                     float* dx,
+                     float* dw_in,
+                     float* dconv_w,
+                     float* dconv_b,
+                     float* ddt_bias,
+                     float* da_log,
+                     float* dD,
+                     float* dnorm_w,
+                     float* dw_out,
+                     float* dbc_out,
+                     int B, int T, int d, int d_inner, int conv_dim, int n_heads,
+                     int d_head, int d_state, int k, float eps,
+                     const i32* segment_ids) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::mamba2_backward(x, w_in, conv_w, conv_b, dt_bias, a_log, D,
+                                  norm_w, w_out, dout, dx, dw_in, dconv_w, dconv_b,
+                                  ddt_bias, da_log, dD, dnorm_w, dw_out, dbc_out,
+                                  B, T, d, d_inner, conv_dim, n_heads,
+                                  d_head, d_state, k, eps, segment_ids);
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::mamba2_backward(x, w_in, conv_w, conv_b, dt_bias, a_log, D, norm_w, w_out,
+                         dout, dx, dw_in, dconv_w, dconv_b, ddt_bias, da_log, dD,
+                         dnorm_w, dw_out, dbc_out, B, T, d, d_inner, conv_dim, n_heads,
+                         d_head, d_state, k, eps, segment_ids);
+}
+
+void attention_decode_ring(Device dev,
+                           const float* q, const float* kcache, const float* vcache,
+                           float* out, int H, int KV, int hd, int ring_start,
+                           int pinned_prefix, int cur_len, int cache_max,
+                           float scale, float* scratch, int window) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::attention_decode_ring(q, kcache, vcache, out, H, KV, hd, ring_start,
+                                        pinned_prefix, cur_len, cache_max, scale,
+                                        scratch, window);
+        return;
+    }
+#endif
+    cpu::attention_decode_ring(q, kcache, vcache, out, H, KV, hd, ring_start,
+                               pinned_prefix, cur_len, cache_max, scale,
+                               scratch, window);
+}
+
+void attention_decode_ring_fp16(Device dev,
+                                 const float* q, const u16* kcache, const u16* vcache,
+                                 float* out, int H, int KV, int hd, int ring_start,
+                                 int pinned_prefix, int cur_len, int cache_max,
+                                 float scale, float* scratch, int window) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::attention_decode_ring_fp16(q, kcache, vcache, out, H, KV, hd, ring_start,
+                                             pinned_prefix, cur_len, cache_max, scale,
+                                             scratch, window);
+        return;
+    }
+#endif
+    cpu::attention_decode_ring_fp16(q, kcache, vcache, out, H, KV, hd, ring_start,
+                                    pinned_prefix, cur_len, cache_max, scale,
+                                    scratch, window);
+}
+
+void attention_forward_ex(Device dev,
+                          const float* q, const float* k, const float* v,
+                          float* out, float* probs,
+                          int B, int T, int H, int KV, int hd, float scale, int window,
+                          const i32* segment_ids) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::attention_forward_ex(q, k, v, out, probs, B, T, H, KV, hd, scale, window,
+                                       segment_ids);
+        return;
+    }
+#endif
+    cpu::attention_forward_ex(q, k, v, out, probs, B, T, H, KV, hd, scale, window,
+                              segment_ids);
+}
+
+void attention_backward_ex(Device dev,
+                           const float* q, const float* k, const float* v,
+                           const float* probs, const float* dout,
+                           float* dq, float* dk, float* dv,
+                           int B, int T, int H, int KV, int hd, float scale, int window) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::attention_backward_ex(q, k, v, probs, dout, dq, dk, dv, B, T, H, KV, hd, scale, window);
+        return;
+    }
+#endif
+    cpu::attention_backward_ex(q, k, v, probs, dout, dq, dk, dv, B, T, H, KV, hd, scale, window);
+}
+
+void moe_forward(Device dev,
+                 const float* x, const float* router_w,
+                 const float* gates, const float* ups, const float* downs,
+                 const float* sh_g, const float* sh_u, const float* sh_d,
+                 float* out,
+                 float* probs_cache, i32* idx_cache, float* w_cache,
+                 float* s_gate, float* s_up, float* s_act,
+                 i64 N, int d, int E, int ne, int K, int SH) {
+    Timer t;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_forward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                              out, probs_cache, idx_cache, w_cache,
+                              s_gate, s_up, s_act, N, d, E, ne, K, SH);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::moe_forward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                     out, probs_cache, idx_cache, w_cache,
+                     s_gate, s_up, s_act, N, d, E, ne, K, SH);
+    perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+}
+
+void moe_forward_bias(Device dev,
+                      const float* x, const float* router_w, const float* router_bias,
+                      const float* gates, const float* ups, const float* downs,
+                      const float* sh_g, const float* sh_u, const float* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH) {
+    if (!router_bias) {
+
+        moe_forward(dev, x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
+                    probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K, SH);
+        return;
+    }
+    Timer t;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_forward_bias(x, router_w, router_bias, gates, ups, downs, sh_g, sh_u, sh_d,
+                                   out, probs_cache, idx_cache, w_cache,
+                                   s_gate, s_up, s_act, N, d, E, ne, K, SH);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::moe_forward_bias(x, router_w, router_bias, gates, ups, downs, sh_g, sh_u, sh_d,
+                          out, probs_cache, idx_cache, w_cache,
+                          s_gate, s_up, s_act, N, d, E, ne, K, SH);
+    perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+}
+
+void moe_forward_half(Device dev,
+                      const float* x, const float* router_w,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind) {
+    Timer t;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_forward_half(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                                   out, probs_cache, idx_cache, w_cache,
+                                   s_gate, s_up, s_act, N, d, E, ne, K, SH, qkind);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+#endif
+    if (qkind >= 0) {
+        const u16* g0 = quant_materialize(dev, gates, qkind, (i64)ne * E * d, 0);
+        const u16* u0 = quant_materialize(dev, ups,   qkind, (i64)ne * E * d, 1);
+        const u16* d0 = quant_materialize(dev, downs, qkind, (i64)ne * E * d, 2);
+        const u16* sg = sh_g ? quant_materialize(dev, sh_g, qkind, (i64)SH * d, 3) : nullptr;
+        const u16* su = sh_u ? quant_materialize(dev, sh_u, qkind, (i64)SH * d, 4) : nullptr;
+        const u16* sd = sh_d ? quant_materialize(dev, sh_d, qkind, (i64)d * SH, 5) : nullptr;
+        cpu::moe_forward_half(x, router_w, g0, u0, d0, sg, su, sd,
+                              out, probs_cache, idx_cache, w_cache,
+                              s_gate, s_up, s_act, N, d, E, ne, K, SH);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+    (void)dev;
+    cpu::moe_forward_half(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                          out, probs_cache, idx_cache, w_cache,
+                          s_gate, s_up, s_act, N, d, E, ne, K, SH);
+    perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+}
+
+void moe_forward_bias_half(Device dev,
+                      const float* x, const float* router_w, const float* router_bias,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind) {
+    if (!router_bias) {
+        moe_forward_half(dev, x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
+                         probs_cache, idx_cache, w_cache, s_gate, s_up, s_act,
+                         N, d, E, ne, K, SH, qkind);
+        return;
+    }
+    Timer t;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_forward_bias_half(x, router_w, router_bias, gates, ups, downs,
+                                        sh_g, sh_u, sh_d,
+                                        out, probs_cache, idx_cache, w_cache,
+                                        s_gate, s_up, s_act, N, d, E, ne, K, SH, qkind);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+#endif
+    if (qkind >= 0) {
+        const u16* g0 = quant_materialize(dev, gates, qkind, (i64)ne * E * d, 0);
+        const u16* u0 = quant_materialize(dev, ups,   qkind, (i64)ne * E * d, 1);
+        const u16* d0 = quant_materialize(dev, downs, qkind, (i64)ne * E * d, 2);
+        const u16* sg = sh_g ? quant_materialize(dev, sh_g, qkind, (i64)SH * d, 3) : nullptr;
+        const u16* su = sh_u ? quant_materialize(dev, sh_u, qkind, (i64)SH * d, 4) : nullptr;
+        const u16* sd = sh_d ? quant_materialize(dev, sh_d, qkind, (i64)d * SH, 5) : nullptr;
+        cpu::moe_forward_bias_half(x, router_w, router_bias, g0, u0, d0, sg, su, sd,
+                                   out, probs_cache, idx_cache, w_cache,
+                                   s_gate, s_up, s_act, N, d, E, ne, K, SH);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+    (void)dev;
+    cpu::moe_forward_bias_half(x, router_w, router_bias, gates, ups, downs,
+                               sh_g, sh_u, sh_d,
+                               out, probs_cache, idx_cache, w_cache,
+                               s_gate, s_up, s_act, N, d, E, ne, K, SH);
+    perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
+}
+
+void moe_backward_half(Device dev,
+                  const float* x, const float* router_w,
+                  const u16* gates, const u16* ups, const u16* downs,
+                  const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                  const float* probs, const i32* idx, const float* tw,
+                  const float* s_gate, const float* s_up, const float* s_act,
+                  const float* aux_frac, float aux_scale,
+                  const float* dout, float* dx,
+                  float* drouter_w, float* dgates, float* dups, float* ddowns,
+                  float* dsh_g, float* dsh_u, float* dsh_d,
+                  float* s_dact,
+                  i64 N, int d, int E, int ne, int K, int SH) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_backward_half(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                                    probs, idx, tw, s_gate, s_up, s_act,
+                                    aux_frac, aux_scale, dout, dx,
+                                    drouter_w, dgates, dups, ddowns,
+                                    dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
+        return;
+    }
+#endif
+    const i64 ng = static_cast<i64>(ne) * E * d;
+    const i64 nd = static_cast<i64>(ne) * d * E;
+    const i64 ns = static_cast<i64>(SH) * d;
+    auto widen = [](const u16* src, i64 n) {
+        std::vector<float> v(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; ++i) v[static_cast<size_t>(i)] = fp16_to_fp32(src[i]);
+        return v;
+    };
+    std::vector<float> gf = widen(gates, ng), uf = widen(ups, ng), df = widen(downs, nd);
+    std::vector<float> sf = sh_g ? widen(sh_g, ns) : std::vector<float>();
+    std::vector<float> su = sh_u ? widen(sh_u, ns) : std::vector<float>();
+    std::vector<float> sd = sh_d ? widen(sh_d, ns) : std::vector<float>();
+    cpu::moe_backward(x, router_w, gf.data(), uf.data(), df.data(),
+                      sh_g ? sf.data() : nullptr, sh_u ? su.data() : nullptr,
+                      sh_d ? sd.data() : nullptr,
+                      probs, idx, tw, s_gate, s_up, s_act,
+                      aux_frac, aux_scale, dout, dx,
+                      drouter_w, dgates, dups, ddowns,
+                      dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
+}
+
+void moe_backward(Device dev,
+                  const float* x, const float* router_w,
+                  const float* gates, const float* ups, const float* downs,
+                  const float* sh_g, const float* sh_u, const float* sh_d,
+                  const float* probs, const i32* idx, const float* tw,
+                  const float* s_gate, const float* s_up, const float* s_act,
+                  const float* aux_frac, float aux_scale,
+                  const float* dout,
+                  float* dx,
+                  float* drouter_w, float* dgates, float* dups, float* ddowns,
+                  float* dsh_g, float* dsh_u, float* dsh_d,
+                  float* s_dact,
+                  i64 N, int d, int E, int ne, int K, int SH) {
+    Timer t;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_backward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                               probs, idx, tw, s_gate, s_up, s_act,
+                               aux_frac, aux_scale, dout, dx,
+                               drouter_w, dgates, dups, ddowns,
+                               dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
+        perf_note_moe_bwd(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::moe_backward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                      probs, idx, tw, s_gate, s_up, s_act,
+                      aux_frac, aux_scale, dout, dx,
+                      drouter_w, dgates, dups, ddowns,
+                      dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
+    perf_note_moe_bwd(static_cast<u64>(t.elapsed_us()));
+}
+
+bool moe_aux_gpu(Device dev,
+                 const float* probs, const i32* idx, float* frac_dev,
+                 float* h_frac, float* h_psum,
+                 i64 N, int K, int ne, double* d_raw_accum) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_aux_frac_gpu(probs, idx, frac_dev, h_frac, h_psum, N, K, ne,
+                                   d_raw_accum);
+        return true;
+    }
+#endif
+    (void)dev; (void)probs; (void)idx; (void)frac_dev;
+    (void)h_frac; (void)h_psum; (void)N; (void)K; (void)ne; (void)d_raw_accum;
+    return false;
+}
+
+double* moe_aux_begin(Device dev) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) return cuda_ops::moe_aux_begin();
+#endif
+    (void)dev;
+    return nullptr;
+}
+
+double moe_aux_end(Device dev) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) return cuda_ops::moe_aux_end();
+#endif
+    (void)dev;
+    return 0.0;
+}
+
+void softmax_cross_entropy(Device dev, const float* logits, const i32* targets,
+                           float* dlogits, i64 n, int V,
+                           double* out_loss_sum, i64* out_count,
+                           float z_scale) {
+
+    Timer t;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::softmax_cross_entropy(logits, targets, dlogits, n, V, out_loss_sum, out_count, z_scale);
+        perf_note_sce(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::softmax_cross_entropy(logits, targets, dlogits, n, V, out_loss_sum, out_count, z_scale);
+    perf_note_sce(static_cast<u64>(t.elapsed_us()));
+}
+
+void sce_acc_begin(Device dev) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::sce_acc_begin();
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::sce_acc_begin();
+}
+
+void sce_accumulate(Device dev,
+                    const float* logits, const i32* targets, float* dlogits,
+                    i64 n, int V, float z_scale) {
+    Timer t;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::sce_accumulate(logits, targets, dlogits, n, V, z_scale);
+        perf_note_sce(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::sce_accumulate(logits, targets, dlogits, n, V, z_scale);
+    perf_note_sce(static_cast<u64>(t.elapsed_us()));
+}
+
+void sce_acc_end(Device dev, double* out_loss_sum, i64* out_count) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::sce_acc_end(out_loss_sum, out_count);
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::sce_acc_end(out_loss_sum, out_count);
+}
+
+void moe_count_slots(Device dev, const i32* idx, float* acc, i64 NK, int ne) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_count_slots(idx, acc, NK, ne);
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::moe_count_slots(idx, acc, NK, ne);
+}
+
+void adamw_step(Device dev, float* w, const float* g, float* m, float* v, i64 n,
+                float lr, float b1, float b2, float eps, float wd,
+                float bc1, float bc2, float grad_scale) {
+    GAI_DISPATCH(dev, adamw_step(w, g, m, v, n, lr, b1, b2, eps, wd, bc1, bc2, grad_scale));
+}
+
+void lion_step(Device dev, float* w, const float* g, float* m, i64 n,
+               float lr, float b1, float b2, float wd, float grad_scale) {
+    GAI_DISPATCH(dev, lion_step(w, g, m, n, lr, b1, b2, wd, grad_scale));
+}
+
+double global_sq_norm(Device dev, const float* g, i64 n) {
+    GAI_DISPATCH_RET(dev, global_sq_norm(g, n));
+}
+
+void topk_select(Device dev, const float* logits, int V, int K,
+                 float* out_vals, i32* out_ids) {
+    GAI_DISPATCH(dev, topk_select(logits, V, K, out_vals, out_ids));
+}
+
+i32 argmax_token(Device dev, const float* logits, int V) {
+    GAI_DISPATCH_RET(dev, argmax_token(logits, V));
+}
+
+void apply_rep_penalties(Device dev, float* logits, int V,
+                         const i32* hist, int hist_n,
+                         float rep, float freq, float pres) {
+    GAI_DISPATCH(dev, apply_rep_penalties(logits, V, hist, hist_n, rep, freq, pres));
+}
+
+double global_sq_norm_multi(Device dev,
+                            const std::vector<std::pair<const float*, i64>>& parts) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) return cuda_ops::global_sq_norm_multi(parts);
+#endif
+    (void)dev;
+    return cpu::global_sq_norm_multi(parts);
+}
+
+void layernorm_forward(Device dev, const float* x, const float* w, const float* b,
+                       float* y, int rows, int dim, float eps) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::layernorm_forward(x, w, b, y, rows, dim, eps);
+        return;
+    }
+#endif
+    GAI_CHECK(dev == Device::CPU, "CUDA tensor on CPU-only build");
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static) if(rows > 4)
+#endif
+    for (int r = 0; r < rows; ++r) {
+        const float* xr = x + static_cast<size_t>(r) * dim;
+        float* yr       = y + static_cast<size_t>(r) * dim;
+        double mean = 0.0;
+        for (int i = 0; i < dim; ++i) mean += xr[i];
+        mean /= dim;
+        double var = 0.0;
+        for (int i = 0; i < dim; ++i) {
+            const double d = static_cast<double>(xr[i]) - mean;
+            var += d * d;
+        }
+        var /= dim;
+        const float inv = 1.0f / std::sqrt(static_cast<float>(var) + eps);
+        for (int i = 0; i < dim; ++i) {
+            float v = (xr[i] - static_cast<float>(mean)) * inv;
+            if (w) v *= w[i];
+            if (b) v += b[i];
+            yr[i] = v;
+        }
+    }
+}
+
+void vit_extract_patches(Device dev, const float* pixels_chw, float* patches,
+                         int image_size, int patch_size, int channels) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::vit_extract_patches(pixels_chw, patches, image_size, patch_size, channels);
+        return;
+    }
+#endif
+    GAI_CHECK(dev == Device::CPU, "CUDA tensor on CPU-only build");
+    const int pps = image_size / patch_size;
+    const int P   = pps * pps;
+    const int pd  = channels * patch_size * patch_size;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int p = 0; p < P; ++p) {
+        const int py = (p / pps) * patch_size;
+        const int px = (p % pps) * patch_size;
+        float* dst = patches + static_cast<size_t>(p) * pd;
+        int k = 0;
+        for (int c = 0; c < channels; ++c) {
+            for (int y = 0; y < patch_size; ++y) {
+                for (int x_coord = 0; x_coord < patch_size; ++x_coord) {
+                    dst[k++] = pixels_chw[(static_cast<size_t>(c) * image_size + (py + y)) * image_size + (px + x_coord)];
+                }
+            }
+        }
+    }
+}
+
+void vit_spatial_pool_2x2(Device dev, const float* in_patches, float* out_pooled, int S, int D) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::vit_spatial_pool_2x2(in_patches, out_pooled, S, D);
+        return;
+    }
+#endif
+    GAI_CHECK(dev == Device::CPU, "CUDA tensor on CPU-only build");
+    const int S_out = S / 2;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int oy = 0; oy < S_out; ++oy) {
+        for (int ox = 0; ox < S_out; ++ox) {
+            const int out_idx = oy * S_out + ox;
+            float* dst = out_pooled + static_cast<size_t>(out_idx) * D;
+            const int p00 = (oy * 2) * S + (ox * 2);
+            const int p01 = (oy * 2) * S + (ox * 2 + 1);
+            const int p10 = (oy * 2 + 1) * S + (ox * 2);
+            const int p11 = (oy * 2 + 1) * S + (ox * 2 + 1);
+            const float* s00 = in_patches + static_cast<size_t>(p00) * D;
+            const float* s01 = in_patches + static_cast<size_t>(p01) * D;
+            const float* s10 = in_patches + static_cast<size_t>(p10) * D;
+            const float* s11 = in_patches + static_cast<size_t>(p11) * D;
+#ifdef GAI_OPENMP
+            #pragma omp simd
+#endif
+            for (int d = 0; d < D; ++d) {
+                dst[d] = 0.25f * (s00[d] + s01[d] + s10[d] + s11[d]);
+            }
+        }
+    }
+}
+
+void vit_attention_forward(Device dev, const float* qkv, float* scores_buf, float* ctx,
+                           int P, int H, int hd, float scale) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::vit_attention_forward(qkv, scores_buf, ctx, P, H, hd, scale);
+        return;
+    }
+#endif
+    GAI_CHECK(dev == Device::CPU, "CUDA tensor on CPU-only build");
+    const int D = H * hd;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(dynamic)
+#endif
+    for (int hh = 0; hh < H; ++hh) {
+        float* local_scores = scores_buf + static_cast<size_t>(hh) * (static_cast<size_t>(P) * P);
+        const float* qh = qkv + static_cast<size_t>(hh) * hd;
+        const float* kh = qkv + D + static_cast<size_t>(hh) * hd;
+        const float* vh = qkv + 2 * D + static_cast<size_t>(hh) * hd;
+
+        cpu::gemm(false, true, P, P, hd, scale,
+                  qh, 3 * D, kh, 3 * D, 0.0f, local_scores, P);
+
+        for (int r = 0; r < P; ++r) {
+            float* row = local_scores + static_cast<size_t>(r) * P;
+            float mx = row[0];
+            for (int i = 1; i < P; ++i) if (row[i] > mx) mx = row[i];
+            double sum = 0.0;
+            for (int i = 0; i < P; ++i) {
+                row[i] = std::exp(row[i] - mx);
+                sum += row[i];
+            }
+            const float inv = (sum > 0.0) ? static_cast<float>(1.0 / sum) : 0.0f;
+            for (int i = 0; i < P; ++i) row[i] *= inv;
+        }
+
+        cpu::gemm(false, false, P, hd, P, 1.0f,
+                  local_scores, P, vh, 3 * D, 0.0f, ctx + static_cast<size_t>(hh) * hd, D);
+    }
+}
+
+}
+}

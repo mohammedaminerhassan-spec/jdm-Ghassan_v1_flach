@@ -1,0 +1,443 @@
+#include "training/distributed.h"
+#include "core/ops.h"
+
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <thread>
+
+#ifdef GAI_NCCL
+#include <nccl.h>
+#include <cuda_runtime.h>
+#include "cuda/cuda_utils.h"
+
+#define NCCL_CHECK(x) do { ncclResult_t _r = (x); if (_r != ncclSuccess) \
+    GAI_FAIL(std::string("NCCL ") + #x + ": " + ncclGetErrorString(_r)); } while (0)
+#define CU_RT_CHECK(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) \
+    GAI_FAIL(std::string("CUDA ") + #x + ": " + cudaGetErrorString(_e)); } while (0)
+#endif
+
+#ifdef GAI_MPI
+#include <mpi.h>
+#include "core/dtype.h"
+#include <vector>
+
+namespace {
+void mpi_allreduce_f16_inplace(void* buffer, size_t numel) {
+    std::vector<float> tmp(numel);
+    const u16* h = static_cast<const u16*>(buffer);
+    for (size_t i = 0; i < numel; ++i) tmp[i] = fp16_to_fp32(h[i]);
+    MPI_Allreduce(MPI_IN_PLACE, tmp.data(), static_cast<int>(numel),
+                  MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+    u16* out = static_cast<u16*>(buffer);
+    for (size_t i = 0; i < numel; ++i) out[i] = fp32_to_fp16(tmp[i]);
+}
+}
+#endif
+
+namespace gai {
+
+DistributedContext::~DistributedContext() {
+    finalize();
+}
+
+bool DistributedContext::init(const Config& cfg) {
+    if (initialized_) return true;
+
+    config_ = cfg;
+    global_rank_ = cfg.global_rank;
+    local_rank_ = cfg.local_rank;
+    world_size_ = cfg.world_size;
+
+    if (world_size_ <= 1) {
+        initialized_ = true;
+        log_info("[dist] Single GPU mode (world_size=1)");
+        return true;
+    }
+
+#ifdef GAI_NCCL
+
+    CU_RT_CHECK(cudaSetDevice(local_rank_));
+    CU_RT_CHECK(cudaStreamCreate(&stream_));
+
+    CU_RT_CHECK(cudaEventCreateWithFlags(&fence_event_, cudaEventDisableTiming));
+
+    CU_RT_CHECK(cudaMalloc(&barrier_dev_, sizeof(int)));
+    CU_RT_CHECK(cudaMemset(barrier_dev_, 0, sizeof(int)));
+
+    const char* env_file = std::getenv("GAI_NCCL_ID_FILE");
+    std::string id_file = env_file ? env_file
+        : (std::filesystem::temp_directory_path() / ("gai_nccl_" + std::to_string(config_.master_port) + ".id")).string();
+
+    ncclUniqueId nccl_id;
+    std::memset(&nccl_id, 0, sizeof(nccl_id));
+    if (global_rank_ == 0) {
+
+        {
+            std::error_code ec;
+            std::filesystem::remove(id_file, ec);
+        }
+        NCCL_CHECK(ncclGetUniqueId(&nccl_id));
+        const std::string tmp_file = id_file + ".tmp";
+        {
+            std::ofstream f(tmp_file, std::ios::binary | std::ios::trunc);
+            if (!f.good()) GAI_FAIL("NCCL: cannot publish ID file " + tmp_file);
+            f.write(reinterpret_cast<const char*>(&nccl_id), sizeof(nccl_id));
+            f.flush();
+            if (!f.good()) GAI_FAIL("NCCL: failed writing ID file " + tmp_file);
+        }
+        {
+            std::error_code ec;
+            std::filesystem::rename(tmp_file, id_file, ec);
+            if (ec) GAI_FAIL("NCCL: atomic publish failed for " + id_file + ": " + ec.message());
+        }
+    } else {
+
+        bool seen = false;
+        for (int i = 0; i < 3000; ++i) {
+            std::error_code ec;
+            if (std::filesystem::exists(id_file, ec) &&
+                std::filesystem::file_size(id_file, ec) == sizeof(nccl_id)) {
+                seen = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!seen) GAI_FAIL("NCCL: rank 0 did not publish " + id_file + " within 30s");
+        std::ifstream f(id_file, std::ios::binary);
+        if (!f.good()) GAI_FAIL("NCCL: cannot read ID file " + id_file);
+        f.read(reinterpret_cast<char*>(&nccl_id), sizeof(nccl_id));
+        if (!f.good()) GAI_FAIL("NCCL: truncated ID file " + id_file);
+        f.close();
+    }
+
+    NCCL_CHECK(ncclCommInitRank(&comm_, world_size_, nccl_id, global_rank_));
+    id_file_ = id_file;
+
+    initialized_ = true;
+    log_info(strfmt("[dist] NCCL initialized: rank %d/%d on GPU %d",
+                    global_rank_, world_size_, local_rank_));
+    return true;
+#elif defined(GAI_MPI)
+
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    if (!mpi_initialized) {
+        MPI_Init(nullptr, nullptr);
+    }
+    MPI_Comm_rank(MPI_COMM_WORLD, &global_rank_);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
+
+    if (global_rank_ != cfg.global_rank || world_size_ != cfg.world_size) {
+        GAI_FAIL(strfmt("MPI rank/size mismatch: expected rank %d world %d, got rank %d world %d",
+                        cfg.global_rank, cfg.world_size, global_rank_, world_size_));
+    }
+
+    initialized_ = true;
+    log_info(strfmt("[dist] MPI initialized: rank %d/%d (CPU DDP)",
+                    global_rank_, world_size_));
+    return true;
+#else
+    GAI_FAIL("Multi-GPU/CPU requested but neither NCCL nor MPI available (build with -DGAI_ENABLE_NCCL=ON or -DGAI_ENABLE_MPI=ON)");
+    return false;
+#endif
+}
+
+void DistributedContext::finalize() {
+    if (!initialized_) return;
+
+#ifdef GAI_NCCL
+    if (comm_) {
+        ncclCommDestroy(comm_);
+        comm_ = nullptr;
+    }
+    if (barrier_dev_) {
+        cudaFree(barrier_dev_);
+        barrier_dev_ = nullptr;
+    }
+    if (coll_dev_) {
+        cudaFree(coll_dev_);
+        coll_dev_ = nullptr;
+        coll_dev_bytes_ = 0;
+    }
+    if (stream_) {
+        cudaStreamDestroy(stream_);
+        stream_ = nullptr;
+    }
+    if (fence_event_) {
+        cudaEventDestroy(fence_event_);
+        fence_event_ = nullptr;
+    }
+
+    if (global_rank_ == 0 && !id_file_.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(id_file_, ec);
+        id_file_.clear();
+    }
+#elif defined(GAI_MPI)
+#endif
+
+    initialized_ = false;
+    log_info("[dist] Finalized");
+}
+
+#ifdef GAI_NCCL
+void DistributedContext::wait_for_compute() {
+
+    CU_RT_CHECK(cudaEventRecord(fence_event_, 0));
+    CU_RT_CHECK(cudaStreamWaitEvent(stream_, fence_event_, 0));
+}
+
+void* DistributedContext::collective_staging(void* p, size_t nbytes, bool* copy_back) {
+    *copy_back = false;
+    if (cuda::is_device_memory(p)) return p;
+    if (!coll_dev_ || coll_dev_bytes_ < nbytes) {
+        if (coll_dev_) CU_RT_CHECK(cudaFree(coll_dev_));
+        coll_dev_bytes_ = nbytes < 256 ? 256 : nbytes;
+        CU_RT_CHECK(cudaMalloc(&coll_dev_, coll_dev_bytes_));
+    }
+    CU_RT_CHECK(cudaMemcpy(coll_dev_, p, nbytes, cudaMemcpyHostToDevice));
+    *copy_back = true;
+    return coll_dev_;
+}
+#endif
+
+void DistributedContext::all_reduce_sum(float* buffer, size_t numel) {
+    all_reduce_sum(static_cast<void*>(buffer), numel, sizeof(float));
+}
+
+void DistributedContext::all_reduce_sum_i64(int64_t* buffer, size_t numel) {
+    if (world_size_ <= 1) return;
+
+#ifdef GAI_NCCL
+
+    wait_for_compute();
+    const size_t nbytes = numel * sizeof(int64_t);
+    bool back = false;
+    void* dev = collective_staging(buffer, nbytes, &back);
+    log_debug(strfmt("[dist] all_reduce_i64 numel=%zu bytes=%zu staged=%d rank=%d",
+                     numel, nbytes, back ? 1 : 0, global_rank_));
+    NCCL_CHECK(ncclAllReduce(dev, dev, numel, ncclInt64, ncclSum, comm_, stream_));
+    CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, numel * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    ops::perf_note_sync();
+#elif defined(GAI_MPI)
+    MPI_Allreduce(MPI_IN_PLACE, buffer, static_cast<int>(numel), MPI_INT64_T, MPI_SUM, MPI_COMM_WORLD);
+    ops::perf_note_sync();
+#else
+    (void)buffer; (void)numel;
+#endif
+}
+
+void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_size) {
+    if (world_size_ <= 1) return;
+
+#ifdef GAI_NCCL
+
+    if (config_.grad_compression && dtype_size == 4 && numel >= 4096) {
+        GAI_FAIL("ddp_grad_compression=true is unsupported with loss scaling: scaled "
+                 "grads overflow fp16 and corrupt training. Set "
+                 "training.ddp_grad_compression=false (exact fp32 all-reduce).");
+    }
+
+    ncclDataType_t nccl_dtype = ncclFloat32;
+    if (dtype_size == 2) nccl_dtype = ncclFloat16;
+    else if (dtype_size == 4) nccl_dtype = ncclFloat32;
+    else if (dtype_size == 8) nccl_dtype = ncclFloat64;
+    else if (dtype_size == 1) nccl_dtype = ncclInt8;
+
+    const size_t nbytes = numel * static_cast<size_t>(dtype_size);
+    bool back = false;
+    void* dev = collective_staging(buffer, nbytes, &back);
+    log_debug(strfmt("[dist] all_reduce numel=%zu dtype=%d bytes=%zu staged=%d rank=%d",
+                     numel, dtype_size, nbytes, back ? 1 : 0, global_rank_));
+
+    wait_for_compute();
+    NCCL_CHECK(ncclAllReduce(dev, dev, numel, nccl_dtype, ncclSum, comm_, stream_));
+    CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));
+    ops::perf_note_sync();
+#elif defined(GAI_MPI)
+
+    if (dtype_size == 2) {
+        mpi_allreduce_f16_inplace(buffer, numel);
+    } else {
+        MPI_Datatype mpi_type = MPI_BYTE;
+        if (dtype_size == 1) mpi_type = MPI_INT8_T;
+        else if (dtype_size == 4) mpi_type = MPI_FLOAT;
+        else if (dtype_size == 8) mpi_type = MPI_DOUBLE;
+        else GAI_FAIL("MPI all_reduce: unsupported dtype_size " + std::to_string(dtype_size));
+        MPI_Allreduce(MPI_IN_PLACE, buffer, static_cast<int>(numel), mpi_type, MPI_SUM, MPI_COMM_WORLD);
+    }
+    ops::perf_note_sync();
+#else
+    (void)buffer; (void)numel; (void)dtype_size;
+#endif
+}
+
+void DistributedContext::all_reduce_sum_nosync(void* buffer, size_t numel, int dtype_size) {
+    if (world_size_ <= 1) return;
+
+#ifdef GAI_NCCL
+    ncclDataType_t nccl_dtype = ncclFloat32;
+    if (dtype_size == 2) nccl_dtype = ncclFloat16;
+    else if (dtype_size == 4) nccl_dtype = ncclFloat32;
+    else if (dtype_size == 8) nccl_dtype = ncclFloat64;
+    else if (dtype_size == 1) nccl_dtype = ncclInt8;
+
+    const size_t nbytes = numel * static_cast<size_t>(dtype_size);
+    bool back = false;
+    void* dev = collective_staging(buffer, nbytes, &back);
+
+    if (back) GAI_FAIL("all_reduce_sum_nosync: host buffer needs copy-back; "
+                       "use the syncing all_reduce_sum for host-side results");
+    wait_for_compute();
+    NCCL_CHECK(ncclAllReduce(dev, dev, numel, nccl_dtype, ncclSum, comm_, stream_));
+#elif defined(GAI_MPI)
+
+    if (dtype_size == 2) {
+        mpi_allreduce_f16_inplace(buffer, numel);
+    } else {
+        MPI_Datatype mpi_type = MPI_BYTE;
+        if (dtype_size == 1) mpi_type = MPI_INT8_T;
+        else if (dtype_size == 4) mpi_type = MPI_FLOAT;
+        else if (dtype_size == 8) mpi_type = MPI_DOUBLE;
+        else GAI_FAIL("MPI all_reduce_nosync: unsupported dtype_size " + std::to_string(dtype_size));
+        MPI_Allreduce(MPI_IN_PLACE, buffer, static_cast<int>(numel), mpi_type, MPI_SUM, MPI_COMM_WORLD);
+    }
+#else
+    (void)buffer; (void)numel; (void)dtype_size;
+#endif
+}
+
+void DistributedContext::begin_group() {
+    if (world_size_ <= 1) return;
+#ifdef GAI_NCCL
+    NCCL_CHECK(ncclGroupStart());
+#endif
+}
+
+void DistributedContext::end_group() {
+    if (world_size_ <= 1) return;
+#ifdef GAI_NCCL
+    NCCL_CHECK(ncclGroupEnd());
+#endif
+}
+
+void DistributedContext::sync_stream() {
+    if (world_size_ <= 1) return;
+#ifdef GAI_NCCL
+    CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    ops::perf_note_sync();
+#endif
+}
+
+void DistributedContext::broadcast(void* buffer, size_t numel, int dtype_size, int root) {
+    if (world_size_ <= 1) return;
+
+#ifdef GAI_NCCL
+    ncclDataType_t nccl_dtype = ncclFloat32;
+    if (dtype_size == 2) nccl_dtype = ncclFloat16;
+    else if (dtype_size == 4) nccl_dtype = ncclFloat32;
+    else if (dtype_size == 8) nccl_dtype = ncclFloat64;
+    else if (dtype_size == 1) nccl_dtype = ncclInt8;
+
+    const size_t nbytes = numel * static_cast<size_t>(dtype_size);
+    bool back = false;
+    void* dev = collective_staging(buffer, nbytes, &back);
+    log_debug(strfmt("[dist] broadcast numel=%zu dtype=%d bytes=%zu staged=%d root=%d rank=%d",
+                     numel, dtype_size, nbytes, back ? 1 : 0, root, global_rank_));
+
+    wait_for_compute();
+    NCCL_CHECK(ncclBroadcast(dev, dev, numel, nccl_dtype, root, comm_, stream_));
+    CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));
+    ops::perf_note_sync();
+#elif defined(GAI_MPI)
+
+    MPI_Datatype mpi_type = MPI_BYTE;
+    size_t count = numel;
+    if (dtype_size == 2) count = numel * 2;
+    else if (dtype_size == 4) mpi_type = MPI_FLOAT;
+    else if (dtype_size == 8) mpi_type = MPI_DOUBLE;
+    else if (dtype_size != 1)
+        GAI_FAIL("MPI broadcast: unsupported dtype_size " + std::to_string(dtype_size));
+
+    MPI_Bcast(buffer, static_cast<int>(count), mpi_type, root, MPI_COMM_WORLD);
+    ops::perf_note_sync();
+#else
+    (void)buffer; (void)numel; (void)dtype_size; (void)root;
+#endif
+}
+
+void DistributedContext::barrier() {
+    if (world_size_ <= 1) return;
+
+#ifdef GAI_NCCL
+
+    if (!barrier_dev_ || !comm_) return;
+
+    wait_for_compute();
+    NCCL_CHECK(ncclAllReduce(barrier_dev_, barrier_dev_, 1, ncclInt32, ncclSum, comm_, stream_));
+    CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    ops::perf_note_sync();
+#elif defined(GAI_MPI)
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    ops::perf_note_sync();
+#endif
+}
+
+DistributedContext::Config distributed_config_from_env(int default_world_size) {
+    DistributedContext::Config cfg;
+
+    if (const char* slurm_ntasks = std::getenv("SLURM_NTASKS")) {
+        cfg.world_size = std::atoi(slurm_ntasks);
+    }
+    if (const char* slurm_proc_id = std::getenv("SLURM_PROCID")) {
+        cfg.global_rank = std::atoi(slurm_proc_id);
+    }
+    if (const char* slurm_local_id = std::getenv("SLURM_LOCALID")) {
+        cfg.local_rank = std::atoi(slurm_local_id);
+    }
+
+    if (const char* world_size = std::getenv("WORLD_SIZE")) {
+        cfg.world_size = std::atoi(world_size);
+    }
+    if (const char* rank = std::getenv("RANK")) {
+        cfg.global_rank = std::atoi(rank);
+    }
+    if (const char* local_rank = std::getenv("LOCAL_RANK")) {
+        cfg.local_rank = std::atoi(local_rank);
+    }
+
+    if (const char* master_addr = std::getenv("MASTER_ADDR")) {
+        cfg.master_addr = master_addr;
+    }
+    if (const char* master_port = std::getenv("MASTER_PORT")) {
+        cfg.master_port = std::atoi(master_port);
+    }
+
+    const bool have_world = (std::getenv("WORLD_SIZE") != nullptr) ||
+                            (std::getenv("SLURM_NTASKS") != nullptr);
+    if (cfg.world_size <= 0 || !have_world) cfg.world_size = 1;
+    if (cfg.global_rank < 0) cfg.global_rank = 0;
+    if (cfg.local_rank < 0) cfg.local_rank = 0;
+
+    if (cfg.world_size > 1 && !std::getenv("RANK") && !std::getenv("SLURM_PROCID")) {
+        GAI_FAIL("[dist] world_size=" + std::to_string(cfg.world_size) +
+                 " but neither RANK nor SLURM_PROCID is set: launch one process "
+                 "per GPU (e.g. RANK=0 LOCAL_RANK=0 WORLD_SIZE=2 and "
+                 "RANK=1 LOCAL_RANK=1 WORLD_SIZE=2).");
+    }
+
+    return cfg;
+}
+
+
+}

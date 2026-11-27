@@ -1,0 +1,1308 @@
+#include "cuda/cuda_ops.h"
+#include "cuda/cuda_utils.h"
+
+#include <cuda_runtime.h>
+#include <cfloat>
+#include <cmath>
+#include <type_traits>
+#include <vector>
+
+namespace gai {
+namespace cuda_ops {
+
+#define CU_CHECK(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) \
+    GAI_FAIL(std::string("CUDA ") + #x + ": " + cudaGetErrorString(_e)); } while (0)
+
+template <typename W, bool HALF>
+__device__ __forceinline__ float moe_wval(const W* w, i64 pos) {
+    if constexpr (HALF) return __half2float(*reinterpret_cast<const __half*>(w + pos));
+    else return w[pos];
+}
+
+template <typename W, bool HALF>
+__global__ void k_moe_slot_gate_up(const float* x, const i32* idx,
+                                   const W* gates, const W* ups,
+                                   float* G, float* U, float* s_gate, float* s_up,
+                                   int NK, int d, int E, int ne, int K) {
+    const int s = blockIdx.x;
+    const int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (s >= NK || j >= E) return;
+    const i64 o = (i64)s * E + j;
+    const int e = idx[s];
+    if (e < 0 || e >= ne) {
+        G[o] = 0; U[o] = 0;
+        if (s_gate) s_gate[o] = 0;
+        if (s_up) s_up[o] = 0;
+        return;
+    }
+    const float* xt = x + (i64)(s / K) * d;
+    const i64 wp = (i64)e * E * d + (i64)j * d;
+    float g = 0, u = 0;
+    #pragma unroll 4
+    for (int l = 0; l < d; ++l) {
+        const float xv = xt[l];
+        g += xv * moe_wval<W, HALF>(gates, wp + l);
+        u += xv * moe_wval<W, HALF>(ups, wp + l);
+    }
+    G[o] = g; U[o] = u;
+    if (s_gate) s_gate[o] = g;
+    if (s_up) s_up[o] = u;
+}
+
+__global__ void k_moe_slot_swiglu(const float* G, const float* U,
+                                  float* A, float* s_act, i64 n) {
+    const i64 i = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float gv = G[i];
+    const float a = (gv / (1.0f + expf(-gv))) * U[i];
+    A[i] = a;
+    if (s_act) s_act[i] = a;
+}
+
+template <typename W, bool HALF>
+__global__ void k_moe_slot_down(const i32* idx, const W* downs,
+                                const float* A, float* X,
+                                int NK, int d, int E, int ne) {
+    const int s = blockIdx.x;
+    const int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (s >= NK || j >= d) return;
+    const i64 o = (i64)s * d + j;
+    const int e = idx[s];
+    if (e < 0 || e >= ne) { X[o] = 0; return; }
+    const i64 wp = (i64)e * d * E + (i64)j * E;
+    float acc = 0;
+    #pragma unroll 4
+    for (int l = 0; l < E; ++l) acc += A[(i64)s * E + l] * moe_wval<W, HALF>(downs, wp + l);
+    X[o] = acc;
+}
+
+__global__ void k_moe_slot_scatter(float* out, const float* X, const float* w,
+                                   int NK, int d, int K) {
+    const int s = blockIdx.x;
+    const int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (s >= NK || j >= d) return;
+    const int t = s / K, k = s % K;
+    atomicAdd(&out[(i64)t * d + j], w[(i64)t * K + k] * X[(i64)s * d + j]);
+}
+
+template <typename W>
+static inline const W* expert_offset(const W* base, i64 elems, int qkind) {
+    if (qkind < 0) return base + elems;
+    const int bpb = (qkind == 0) ? 9 : (qkind == 1) ? 10 : 17;
+    return reinterpret_cast<const W*>(reinterpret_cast<const u16*>(base) +
+                                      ((elems + 31) / 32) * bpb);
+}
+
+template <typename W>
+static inline void moe_linear(const float* x, const W* w, float* y, int M, int K, int N,
+                              int qkind = -1) {
+    if (qkind >= 0) {
+        linear_forward_q4(x, reinterpret_cast<const u16*>(w), y, M, K, N, qkind);
+        return;
+    }
+    if constexpr (std::is_same<W, u16>::value) {
+        linear_forward_fp16(x, w, y, M, K, N);
+    } else {
+        linear_forward(x, w, y, M, K, N);
+    }
+}
+
+template <typename W>
+static inline void moe_gemm_nn(const float* A, const W* B, float* C,
+                               int M, int N, int K) {
+    if constexpr (std::is_same<W, u16>::value) {
+        gemm_nn_half(A, B, C, M, N, K);
+    } else {
+        gemm(false, false, M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
+    }
+}
+
+template <typename W>
+static inline void moe_linear_bwd(const float* x, const W* w, const float* dy,
+                                  float* dx, float* dw, int M, int K, int N) {
+    if constexpr (std::is_same<W, u16>::value) {
+        linear_backward_half(x, w, dy, dx, dw, M, K, N);
+    } else {
+        linear_backward(x, w, dy, dx, dw, M, K, N);
+    }
+}
+
+static inline int grid_for(i64 n, int block) {
+    i64 g = (n + block - 1) / block;
+    if (g < 1) g = 1;
+    if (g > 65535 * 64) g = 65535 * 64;
+    return static_cast<int>(g);
+}
+
+static constexpr size_t kWsAlign = 16;
+static inline uint8_t* carve16(uint8_t*& ws, size_t bytes) {
+    uint8_t* p = ws;
+    ws += (bytes + kWsAlign - 1) / kWsAlign * kWsAlign;
+    return p;
+}
+
+static inline size_t ws_pad_for(int blocks) {
+    return static_cast<size_t>(blocks) * kWsAlign;
+}
+
+__device__ __forceinline__ bool f4_ok(const void* p) {
+    return (reinterpret_cast<uintptr_t>(p) & (uintptr_t)(kWsAlign - 1)) == 0;
+}
+
+static thread_local void*  g_moe_ws = nullptr;
+static thread_local size_t g_moe_ws_bytes = 0;
+
+static size_t moe_round(size_t bytes) {
+    const size_t chunk = (64ull << 20);
+    return ((bytes + chunk - 1) / chunk) * chunk;
+}
+
+static void* moe_workspace(size_t bytes) {
+    if (bytes == 0) return nullptr;
+    if (bytes <= g_moe_ws_bytes) return g_moe_ws;
+    size_t want = moe_round(bytes);
+    if (want <= g_moe_ws_bytes) return g_moe_ws;
+    if (g_moe_ws) CU_CHECK(cudaFree(g_moe_ws));
+    gai::cuda::check_free_vram(want, "MoE workspace");
+    CU_CHECK(cudaMalloc(&g_moe_ws, want));
+    g_moe_ws_bytes = want;
+    return g_moe_ws;
+}
+
+void moe_reserve_workspace(size_t bytes) {
+    if (bytes == 0) return;
+    moe_workspace(bytes);
+}
+
+static thread_local i32*   g_grp_grouped = nullptr;
+static thread_local size_t g_grp_grouped_cap = 0;
+static thread_local int*   g_grp_cnt = nullptr;
+static thread_local int*   g_grp_cur = nullptr;
+static thread_local int*   g_grp_off = nullptr;
+
+static thread_local int    g_grp_ne_cap = 0;
+
+static float g_moe_jitter = 0.0f;
+static thread_local unsigned long long g_moe_jitter_seed = 0;
+void set_moe_jitter(float j) { g_moe_jitter = (j<0?0:(j>0.5f?0.5f:j)); }
+void set_moe_jitter_seed(u64 s) { g_moe_jitter_seed = s; }
+
+static void grp_ensure(size_t nk, int ne) {
+    if (nk > g_grp_grouped_cap) {
+
+        size_t want = nk + nk / 8 + 1024;
+        if (g_grp_grouped) CU_CHECK(cudaFree(g_grp_grouped));
+        gai::cuda::check_free_vram(sizeof(i32) * want, "MoE grouped slots");
+        CU_CHECK(cudaMalloc(&g_grp_grouped, sizeof(i32) * (want > 0 ? want : 1)));
+        g_grp_grouped_cap = want;
+    }
+    if (ne > g_grp_ne_cap) {
+        if (g_grp_cnt) { CU_CHECK(cudaFree(g_grp_cnt)); g_grp_cnt = nullptr; }
+        if (g_grp_cur) { CU_CHECK(cudaFree(g_grp_cur)); g_grp_cur = nullptr; }
+        if (g_grp_off) { CU_CHECK(cudaFree(g_grp_off)); g_grp_off = nullptr; }
+        g_grp_ne_cap = 0;
+        gai::cuda::check_free_vram(sizeof(int) * (size_t)(ne + 1), "MoE group counters");
+        CU_CHECK(cudaMalloc(&g_grp_cnt, sizeof(int) * (size_t)ne));
+        CU_CHECK(cudaMalloc(&g_grp_cur, sizeof(int) * (size_t)(ne + 1)));
+        CU_CHECK(cudaMalloc(&g_grp_off, sizeof(int) * (size_t)(ne + 1)));
+        g_grp_ne_cap = ne;
+    }
+}
+
+size_t moe_pool_bytes() { return g_moe_ws_bytes; }
+
+__device__ __forceinline__ float jitter_u(i64 t, int e, unsigned long long seed) {
+
+    uint64_t h = (uint64_t)t * 0x9E3779B97F4A7C15ULL;
+    h ^= (uint64_t)e * 0xC2B2AE3D27D4EB4FULL;
+    h ^= (seed + 0x9E3779B97F4A7C15ULL);
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+
+    return ((h >> 40) & 0xFFFFFF) / (float)(1 << 24) - 0.5f;
+}
+
+__global__ void k_route(const float* logits, float* probs, i32* idx, float* w,
+                        i64 N, int ne, int K, float jitter, unsigned long long seed) {
+    const i64 t = (i64)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const int W = (int)blockDim.x;
+    if (t >= N) return;
+
+    const float* lg = logits + t * ne;
+    const bool train = (probs != nullptr);
+    __shared__ float smax[256];
+    __shared__ float ssum[256];
+
+    float lmx = -FLT_MAX;
+    for (int e = tid; e < ne; e += W) {
+        float v = lg[e];
+        if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
+        if (v > lmx) lmx = v;
+    }
+    smax[tid] = lmx;
+    __syncthreads();
+    float mx = smax[0];
+    for (int i = 1; i < W; ++i) mx = fmaxf(mx, smax[i]);
+
+    float lsum = 0.0f;
+    for (int e = tid; e < ne; e += W) {
+        float v = lg[e];
+        if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
+        lsum += expf(v - mx);
+    }
+    ssum[tid] = lsum;
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = 0; i < W; ++i) sum += ssum[i];
+    const float inv = sum > 1e-8f ? (1.0f / sum) : 0.0f;
+
+    if (probs) {
+        float* pr = probs + t * ne;
+        for (int e = tid; e < ne; e += W) {
+            float v = lg[e];
+            if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
+            pr[e] = expf(v - mx) * inv;
+        }
+    }
+    if (tid == 0) {
+        constexpr int MAX_ROUTER_TOP_K = 16;
+        i32 picked[MAX_ROUTER_TOP_K];
+        float picked_w[MAX_ROUTER_TOP_K];
+        float sum_w = 0.0f;
+        const int k_max = (K <= MAX_ROUTER_TOP_K) ? K : MAX_ROUTER_TOP_K;
+        for (int k = 0; k < k_max; ++k) {
+            int best = -1;
+            float bv = -FLT_MAX;
+            for (int e = 0; e < ne; ++e) {
+                bool taken = false;
+                for (int j = 0; j < k; ++j) if (picked[j] == e) { taken = true; break; }
+                if (taken) continue;
+                float v = lg[e];
+                if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
+                float p = expf(v - mx) * inv;
+                if (p > bv) { bv = p; best = e; }
+            }
+            if (best < 0) best = 0;
+            picked[k] = best;
+            if (idx) idx[t * K + k] = best;
+            float vb = lg[best];
+            if (train && jitter > 0.0f) vb *= (1.0f + jitter * 2.0f * jitter_u(t, best, seed));
+            float pw = expf(vb - mx) * inv;
+            picked_w[k] = pw;
+            sum_w += pw;
+        }
+        if (w) {
+            if (sum_w > 1e-8f) {
+                const float inv_w = 1.0f / sum_w;
+                for (int k = 0; k < k_max; ++k) w[t * K + k] = picked_w[k] * inv_w;
+            } else {
+                const float uniform = 1.0f / static_cast<float>(k_max > 0 ? k_max : 1);
+                for (int k = 0; k < k_max; ++k) w[t * K + k] = uniform;
+            }
+        }
+    }
+}
+
+__global__ void k_route_bias(const float* logits, const float* bias,
+                             float* probs, i32* idx, float* w,
+                             i64 N, int ne, int K, float jitter, unsigned long long seed) {
+    const i64 t = (i64)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const int W = (int)blockDim.x;
+    if (t >= N) return;
+    const float* lg = logits + t * ne;
+    const bool train = (probs != nullptr);
+    __shared__ float smax[256];
+    __shared__ float ssum[256];
+    float lmx = -FLT_MAX;
+    for (int e = tid; e < ne; e += W) {
+        float v = lg[e];
+        if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
+        if (v > lmx) lmx = v;
+    }
+    smax[tid] = lmx;
+    __syncthreads();
+    float mx = smax[0];
+    for (int i = 1; i < W; ++i) mx = fmaxf(mx, smax[i]);
+    float lsum = 0.0f;
+    for (int e = tid; e < ne; e += W) {
+        float v = lg[e];
+        if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
+        lsum += expf(v - mx);
+    }
+    ssum[tid] = lsum;
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = 0; i < W; ++i) sum += ssum[i];
+    const float inv = sum > 1e-8f ? (1.0f / sum) : 0.0f;
+    if (probs) {
+        float* pr = probs + t * ne;
+        for (int e = tid; e < ne; e += W) {
+            float v = lg[e];
+            if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
+            pr[e] = expf(v - mx) * inv;
+        }
+    }
+    if (tid == 0) {
+        constexpr int MAX_ROUTER_TOP_K = 16;
+        i32 picked[MAX_ROUTER_TOP_K];
+        float picked_w[MAX_ROUTER_TOP_K];
+        float sum_w = 0.0f;
+        const int k_max = (K <= MAX_ROUTER_TOP_K) ? K : MAX_ROUTER_TOP_K;
+        for (int k = 0; k < k_max; ++k) {
+            int best = -1;
+            float bv = -FLT_MAX;
+            for (int e = 0; e < ne; ++e) {
+                bool taken = false;
+                for (int j = 0; j < k; ++j) if (picked[j] == e) { taken = true; break; }
+                if (taken) continue;
+                float v = lg[e];
+                if (train && jitter > 0.0f) v *= (1.0f + jitter * 2.0f * jitter_u(t, e, seed));
+                float p = expf(v - mx) * inv + (bias ? bias[e] : 0.0f);
+                if (p > bv) { bv = p; best = e; }
+            }
+            if (best < 0) best = 0;
+            picked[k] = best;
+            if (idx) idx[t * K + k] = best;
+            float vb = lg[best];
+            if (train && jitter > 0.0f) vb *= (1.0f + jitter * 2.0f * jitter_u(t, best, seed));
+            float pw = expf(vb - mx) * inv;
+            picked_w[k] = pw;
+            sum_w += pw;
+        }
+        if (w) {
+            if (sum_w > 1e-8f) {
+                const float inv_w = 1.0f / sum_w;
+                for (int k = 0; k < k_max; ++k) w[t * K + k] = picked_w[k] * inv_w;
+            } else {
+                const float uniform = 1.0f / static_cast<float>(k_max > 0 ? k_max : 1);
+                for (int k = 0; k < k_max; ++k) w[t * K + k] = uniform;
+            }
+        }
+    }
+}
+
+__global__ void k_scatter_copy(const float* src, const i32* slots, float* dst,
+                               i64 nslots, int rowlen) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
+        const float* r = src + s * rowlen;
+        float* o = dst + (i64)slots[s] * rowlen;
+        if ((rowlen & 3) == 0 && f4_ok(r) && f4_ok(o)) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            float4* o4 = reinterpret_cast<float4*>(o);
+            for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
+        } else {
+            for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+        }
+    }
+}
+
+__global__ void k_scatter_add(float* dst, const float* src, const i32* slots,
+                              const float* w, i64 nslots, int d, int K) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
+        i32 slot = slots[s];
+        i32 t = slot / K;
+        i32 k = slot % K;
+        float wv = w ? w[(i64)t * K + k] : 1.0f;
+        float* o = dst + (i64)t * d;
+        const float* r = src + s * d;
+        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            for (int j = 0; j < d / 4; ++j) {
+                float4 v = r4[j];
+                atomicAdd(&o[j * 4 + 0], wv * v.x);
+                atomicAdd(&o[j * 4 + 1], wv * v.y);
+                atomicAdd(&o[j * 4 + 2], wv * v.z);
+                atomicAdd(&o[j * 4 + 3], wv * v.w);
+            }
+        } else {
+            for (int j = 0; j < d; ++j) atomicAdd(&o[j], wv * r[j]);
+        }
+    }
+}
+
+__global__ void k_pack_all(const float* x, const i32* grouped, float* out,
+                           i64 NK, int d, int K) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i32 t = grouped[s] / K;
+        const float* r = x + (i64)t * d;
+        float* o = out + s * d;
+        int j = 0;
+        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            float4* o4 = reinterpret_cast<float4*>(o);
+            for (; j < d / 4; ++j) o4[j] = r4[j];
+        } else {
+            for (; j < d; ++j) o[j] = r[j];
+        }
+    }
+}
+
+__global__ void k_save3_all(const float* G, const float* U, const float* A,
+                            const i32* grouped,
+                            float* s_gate, float* s_up, float* s_act,
+                            i64 NK, int E) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i64 slot = grouped[s];
+        const float* g = G + s * E;
+        const float* u = U + s * E;
+        const float* a = A + s * E;
+        float* og = s_gate + slot * E;
+        float* ou = s_up + slot * E;
+        float* oa = s_act + slot * E;
+        int j = 0;
+        if ((E & 3) == 0 && f4_ok(g) && f4_ok(u) && f4_ok(a) && f4_ok(og) && f4_ok(ou) && f4_ok(oa)) {
+            const float4* g4 = reinterpret_cast<const float4*>(g);
+            const float4* u4 = reinterpret_cast<const float4*>(u);
+            const float4* a4 = reinterpret_cast<const float4*>(a);
+            float4* og4 = reinterpret_cast<float4*>(og);
+            float4* ou4 = reinterpret_cast<float4*>(ou);
+            float4* oa4 = reinterpret_cast<float4*>(oa);
+            for (; j < E / 4; ++j) { og4[j] = g4[j]; ou4[j] = u4[j]; oa4[j] = a4[j]; }
+        } else {
+            for (; j < E; ++j) { og[j] = g[j]; ou[j] = u[j]; oa[j] = a[j]; }
+        }
+    }
+}
+
+__global__ void k_scatter_add_all(float* out, const float* Y, const i32* grouped,
+                                  const float* w, i64 NK, int d, int K) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i32 slot = grouped[s];
+        i32 t = slot / K;
+        i32 k = slot % K;
+        float wv = w ? w[(i64)t * K + k] : 1.0f;
+        float* o = out + (i64)t * d;
+        const float* r = Y + s * d;
+        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            for (int j = 0; j < d / 4; ++j) {
+                float4 v = r4[j];
+                atomicAdd(&o[j * 4 + 0], wv * v.x);
+                atomicAdd(&o[j * 4 + 1], wv * v.y);
+                atomicAdd(&o[j * 4 + 2], wv * v.z);
+                atomicAdd(&o[j * 4 + 3], wv * v.w);
+            }
+        } else {
+            for (int j = 0; j < d; ++j) atomicAdd(&o[j], wv * r[j]);
+        }
+    }
+}
+
+__global__ void k_gather3_all(const float* s_gate, const float* s_up, const float* s_act,
+                              const i32* grouped, float* G, float* U, float* A,
+                              i64 NK, int E) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i64 slot = grouped[s];
+        const float* g = s_gate + slot * E;
+        const float* u = s_up + slot * E;
+        const float* a = s_act + slot * E;
+        float* og = G + s * E;
+        float* ou = U + s * E;
+        float* oa = A + s * E;
+        int j = 0;
+        if ((E & 3) == 0 && f4_ok(g) && f4_ok(u) && f4_ok(a) && f4_ok(og) && f4_ok(ou) && f4_ok(oa)) {
+            const float4* g4 = reinterpret_cast<const float4*>(g);
+            const float4* u4 = reinterpret_cast<const float4*>(u);
+            const float4* a4 = reinterpret_cast<const float4*>(a);
+            float4* og4 = reinterpret_cast<float4*>(og);
+            float4* ou4 = reinterpret_cast<float4*>(ou);
+            float4* oa4 = reinterpret_cast<float4*>(oa);
+            for (; j < E / 4; ++j) { og4[j] = g4[j]; ou4[j] = u4[j]; oa4[j] = a4[j]; }
+        } else {
+            for (; j < E; ++j) { og[j] = g[j]; ou[j] = u[j]; oa[j] = a[j]; }
+        }
+    }
+}
+
+__global__ void k_scale_all(const float* dout, const float* w, const i32* grouped,
+                            float* S, i64 NK, int d, int K) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i64 slot = grouped[s];
+        i64 t = slot / K;
+        i64 k = slot % K;
+        float wv = w ? w[t * K + k] : 1.0f;
+        const float* r = dout + t * d;
+        float* o = S + s * d;
+        int j = 0;
+        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            float4* o4 = reinterpret_cast<float4*>(o);
+            for (; j < d / 4; ++j) {
+                float4 v = r4[j];
+                v.x *= wv; v.y *= wv; v.z *= wv; v.w *= wv;
+                o4[j] = v;
+            }
+        } else {
+            for (; j < d; ++j) o[j] = r[j] * wv;
+        }
+    }
+}
+
+__global__ void k_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
+    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (; s < NK; s += stride) {
+        int e = idx[s];
+        if (e >= 0 && e < ne) atomicAdd(&acc[e], 1.0f);
+    }
+}
+
+void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
+    if (NK <= 0 || ne <= 0) return;
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe_count_slots: ne out of kernel range [1,64]");
+    k_count_slots<<<grid_for(NK, 256), 256>>>(idx, acc, NK, ne);
+    CU_CHECK(cudaGetLastError());
+}
+
+__device__ __forceinline__ float silu_f(float v) {
+    return v / (1.0f + expf(-v));
+}
+
+__global__ void k_swiglu(const float* g, const float* u, float* o, i64 n) {
+    i64 i = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) o[i] = silu_f(g[i]) * u[i];
+}
+
+__global__ void k_swiglu_bwd_assign(const float* g, const float* u, const float* dout,
+                             float* dg, float* du, i64 n) {
+    i64 i = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) {
+        float gv = g[i];
+        float s = 1.0f / (1.0f + expf(-gv));
+        dg[i] = dout[i] * (s * (1.0f + gv * (1.0f - s))) * u[i];
+        du[i] = dout[i] * s * gv;
+    }
+}
+
+__global__ void k_dp_dot(const float* dout, const float* eout, const i32* slots,
+                         float* dp, i64 nslots, int d, int K) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
+        i32 t = slots[s] / K;
+        const float* a = dout + (i64)t * d;
+        const float* b = eout + s * d;
+        float acc = 0.0f;
+        for (int j = 0; j < d; ++j) acc += a[j] * b[j];
+        dp[s] = acc;
+    }
+}
+
+__global__ void k_router_dl(const float* x, const float* router_w,
+                            const float* probs, const float* dp_slots,
+                            const i32* idx, const float* aux_frac,
+                            float aux_coef, float jitter, unsigned long long seed,
+                            float* DL, float* dx,
+                            i64 N, int d, int ne, int K) {
+    const i64 t = (i64)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const int W = (int)blockDim.x;
+    if (t >= N) return;
+    (void)x;
+    const float* pt = probs + t * ne;
+    __shared__ float sdp[64];
+    __shared__ float sdl[64];
+
+    if (tid == 0) {
+        for (int e = 0; e < ne; ++e)
+            sdp[e] = aux_frac ? aux_coef * aux_frac[e] : 0.0f;
+
+        float sum_p = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            int e = idx[t * K + k];
+            if (e >= 0 && e < ne) sum_p += pt[e];
+        }
+        float inv_S = sum_p > 1e-8f ? (1.0f / sum_p) : 0.0f;
+        float bar_g = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            int e = idx[t * K + k];
+            float wk = (e >= 0 && e < ne) ? pt[e] * inv_S : 0.0f;
+            bar_g += dp_slots[t * K + k] * wk;
+        }
+        for (int k = 0; k < K; ++k) {
+            int e = idx[t * K + k];
+            if (e >= 0 && e < ne) {
+                sdp[e] += (dp_slots[t * K + k] - bar_g) * inv_S;
+            }
+        }
+        float pdot = 0.0f;
+        for (int e = 0; e < ne; ++e) pdot += pt[e] * sdp[e];
+        for (int e = 0; e < ne; ++e) {
+            float dl = pt[e] * (sdp[e] - pdot);
+
+            if (jitter > 0.0f) {
+                uint64_t hh = (uint64_t)t * 0x9E3779B97F4A7C15ULL;
+                hh ^= (uint64_t)e * 0xC2B2AE3D27D4EB4FULL;
+                hh ^= (seed + 0x9E3779B97F4A7C15ULL);
+                hh ^= hh >> 33; hh *= 0xff51afd7ed558ccdULL;
+                hh ^= hh >> 33; hh *= 0xc4ceb9fe1a85ec53ULL;
+                hh ^= hh >> 33;
+                float u = ((hh >> 40) & 0xFFFFFF) / (float)(1 << 24) - 0.5f;
+                dl *= (1.0f + jitter * 2.0f * u);
+            }
+            sdl[e] = dl;
+        }
+    }
+    __syncthreads();
+
+    float* DLt = DL + t * ne;
+    for (int e = tid; e < ne; e += W) DLt[e] = sdl[e];
+
+    float* dxt = dx + t * d;
+    for (int j = tid; j < d; j += W) {
+        float acc = 0.0f;
+        for (int e = 0; e < ne; ++e) acc += sdl[e] * router_w[(i64)e * d + j];
+        dxt[j] += acc;
+    }
+}
+
+__global__ void k_group_hist(const i32* idx, int* cnt, i64 NK, int ne) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        int e = idx[s];
+        if (e >= 0 && e < ne) atomicAdd(&cnt[e], 1);
+    }
+}
+
+__global__ void k_group_offsets(const int* cnt, int* offsets, int* cursors, int ne) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int running = 0;
+    for (int e = 0; e < ne; ++e) {
+        offsets[e] = running;
+        cursors[e] = running;
+        running += cnt[e] < 0 ? 0 : cnt[e];
+    }
+    offsets[ne] = running;
+}
+
+__global__ void k_group_fill(const i32* idx, i32* grouped, int* cursors,
+                             i64 NK, int ne) {
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        int e = idx[s];
+        if (e < 0 || e >= ne) continue;
+        int pos = atomicAdd(&cursors[e], 1);
+        grouped[pos] = (i32)s;
+    }
+}
+
+static thread_local int*  g_h_offsets_pinned = nullptr;
+static thread_local int   g_h_offsets_cap = 0;
+static thread_local cudaEvent_t g_offsets_event = nullptr;
+static thread_local cudaEvent_t g_route_event = nullptr;
+static thread_local cudaStream_t g_group_stream = nullptr;
+
+static void ensure_group_resources() {
+    if (!g_offsets_event) CU_CHECK(cudaEventCreate(&g_offsets_event));
+    if (!g_route_event) CU_CHECK(cudaEventCreate(&g_route_event));
+    if (!g_group_stream) CU_CHECK(cudaStreamCreateWithFlags(&g_group_stream, cudaStreamNonBlocking));
+}
+
+static void ensure_offsets_pinned(int ne) {
+    ensure_group_resources();
+    if (ne <= g_h_offsets_cap) return;
+    if (g_h_offsets_pinned) CU_CHECK(cudaFreeHost(g_h_offsets_pinned));
+    CU_CHECK(cudaMallocHost(&g_h_offsets_pinned, sizeof(int) * (size_t)(ne + 1)));
+    g_h_offsets_cap = ne;
+}
+
+static void moe_route_ready_on_stream0() {
+    ensure_group_resources();
+    CU_CHECK(cudaEventRecord(g_route_event, 0));
+    CU_CHECK(cudaStreamWaitEvent(g_group_stream, g_route_event, 0));
+}
+
+static void moe_build_groups_launch(const i32* d_idx, i64 N, int K, int ne,
+                                    i32** grouped_out) {
+    const i64 NK = N * K;
+    GAI_CHECK(ne > 0 && ne <= 64, "moe grouping: ne out of range");
+    grp_ensure((size_t)(NK > 0 ? NK : 1), ne);
+    ensure_offsets_pinned(ne);
+    *grouped_out = g_grp_grouped;
+    if (NK <= 0) return;
+    const cudaStream_t gs = g_group_stream ? g_group_stream : (cudaStream_t)0;
+    CU_CHECK(cudaMemsetAsync(g_grp_cnt, 0, sizeof(int) * (size_t)ne, gs));
+    k_group_hist<<<grid_for(NK, 256), 256, 0, gs>>>(d_idx, g_grp_cnt, NK, ne);
+
+    k_group_offsets<<<1, 1, 0, gs>>>(g_grp_cnt, g_grp_off, g_grp_cur, ne);
+    CU_CHECK(cudaGetLastError());
+    k_group_fill<<<grid_for(NK, 256), 256, 0, gs>>>(d_idx, g_grp_grouped, g_grp_cur, NK, ne);
+    CU_CHECK(cudaGetLastError());
+
+    CU_CHECK(cudaMemcpyAsync(g_h_offsets_pinned, g_grp_off,
+                             sizeof(int) * (size_t)(ne + 1),
+                             cudaMemcpyDeviceToHost, gs));
+    CU_CHECK(cudaEventRecord(g_offsets_event, gs));
+}
+
+static void moe_build_groups_sync(i64 NK, int ne, int* h_counts, int* h_offsets) {
+    for (int e = 0; e < ne; ++e) h_counts[e] = 0;
+    for (int e = 0; e <= ne; ++e) h_offsets[e] = 0;
+    if (NK <= 0) return;
+
+    cudaError_t q = cudaEventQuery(g_offsets_event);
+    if (q == cudaErrorNotReady) {
+        CU_CHECK(cudaEventSynchronize(g_offsets_event));
+    } else {
+        CU_CHECK(q);
+    }
+    for (int e = 0; e <= ne; ++e) h_offsets[e] = g_h_offsets_pinned[e];
+    for (int e = 0; e < ne; ++e) {
+        int c = h_offsets[e + 1] - h_offsets[e];
+        h_counts[e] = c < 0 ? 0 : c;
+    }
+}
+
+template <typename W>
+static void moe_forward_impl(const float* x, const float* router_w,
+                 const W* gates, const W* ups, const W* downs,
+                 const W* sh_g, const W* sh_u, const W* sh_d,
+                 float* out,
+                 float* probs_cache, i32* idx_cache, float* w_cache,
+                 float* s_gate, float* s_up, float* s_act,
+                  i64 N, int d, int E, int ne, int K, int SH, int qkind = -1) {
+    if (N <= 0) return;
+
+    GAI_CHECK(N <= 2147483647LL, "moe forward: N exceeds INT_MAX (B*T too large)");
+    GAI_CHECK(K >= 1 && K <= 8, "moe forward: top_k out of kernel range [1,8]");
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe forward: num_experts out of kernel range [1,64]");
+    const i64 NK = N * K;
+
+    uint8_t* ws = (uint8_t*)moe_workspace(
+        sizeof(float) * (size_t)N * ne +
+        sizeof(i32) * (size_t)NK +
+        sizeof(float) * (size_t)NK +
+        sizeof(float) * (size_t)NK * E * 3 +
+        sizeof(float) * (size_t)NK * d +
+        sizeof(float) * (size_t)N * SH * 3 +
+        ws_pad_for(7));
+    float* rlogits = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
+    i32*   tmp_idx = (i32*)carve16(ws, sizeof(i32) * (size_t)NK);
+    float* tmp_w   = (float*)carve16(ws, sizeof(float) * (size_t)NK);
+    float* Gblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ublk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ablk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Xblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
+    float* Sg = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* Su = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* Sa = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+
+    linear_forward_f32(x, router_w, rlogits, (int)N, d, ne);
+
+    i32* idx_use = idx_cache ? idx_cache : tmp_idx;
+    float* w_use = w_cache ? w_cache : tmp_w;
+
+    k_route<<<(unsigned)N, 32>>>(rlogits, probs_cache, idx_use, w_use, N, ne, K, g_moe_jitter, g_moe_jitter_seed);
+    CU_CHECK(cudaGetLastError());
+
+    if (sh_g && sh_u && sh_d) {
+        moe_linear(x, sh_g, Sg, (int)N, d, SH, qkind);
+        moe_linear(x, sh_u, Su, (int)N, d, SH, qkind);
+        k_swiglu<<<grid_for(N * SH, 256), 256>>>(Sg, Su, Sa, N * SH);
+        CU_CHECK(cudaGetLastError());
+        moe_linear(Sa, sh_d, out, (int)N, SH, d, qkind);
+    } else {
+        CU_CHECK(cudaMemset(out, 0, sizeof(float) * (size_t)N * d));
+    }
+
+    if (qkind < 0 && NK > 0) {
+        constexpr bool HALF = std::is_same<W, u16>::value;
+        dim3 gu((unsigned)NK, (unsigned)((E + 255) / 256));
+        k_moe_slot_gate_up<W, HALF><<<gu, 256>>>(x, idx_use, gates, ups,
+                                                 Gblk, Ublk, s_gate, s_up,
+                                                 (int)NK, d, E, ne, K);
+        CU_CHECK(cudaGetLastError());
+        k_moe_slot_swiglu<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Ablk, s_act, NK * E);
+        CU_CHECK(cudaGetLastError());
+        dim3 dn((unsigned)NK, (unsigned)((d + 255) / 256));
+        k_moe_slot_down<W, HALF><<<dn, 256>>>(idx_use, downs, Ablk, Xblk,
+                                              (int)NK, d, E, ne);
+        CU_CHECK(cudaGetLastError());
+        dim3 sc((unsigned)NK, (unsigned)((d + 255) / 256));
+        k_moe_slot_scatter<<<sc, 256>>>(out, Xblk, w_use, (int)NK, d, K);
+        CU_CHECK(cudaGetLastError());
+        return;
+    }
+
+    moe_route_ready_on_stream0();
+    i32* grouped = nullptr;
+    int h_cnt[64], h_off[65];
+    moe_build_groups_launch(idx_use, N, K, ne, &grouped);
+    moe_build_groups_sync(NK, ne, h_cnt, h_off);
+    if (h_off[ne] <= 0) return;
+
+    k_pack_all<<<grid_for(NK, 256), 256>>>(x, grouped, Xblk, NK, d, K);
+    CU_CHECK(cudaGetLastError());
+    for (int e = 0; e < ne; ++e) {
+        i64 ns = (i64)h_cnt[e];
+        if (ns == 0) continue;
+        const W* ge = expert_offset(gates, (i64)e * E * d, qkind);
+        const W* ue = expert_offset(ups,   (i64)e * E * d, qkind);
+        moe_linear(Xblk + (size_t)h_off[e] * d, ge, Gblk + (size_t)h_off[e] * E, (int)ns, d, E, qkind);
+        moe_linear(Xblk + (size_t)h_off[e] * d, ue, Ublk + (size_t)h_off[e] * E, (int)ns, d, E, qkind);
+    }
+    k_swiglu<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Ablk, NK * E);
+    CU_CHECK(cudaGetLastError());
+    k_save3_all<<<grid_for(NK, 256), 256>>>(Gblk, Ublk, Ablk, grouped, s_gate, s_up, s_act, NK, E);
+    CU_CHECK(cudaGetLastError());
+    for (int e = 0; e < ne; ++e) {
+        i64 ns = (i64)h_cnt[e];
+        if (ns == 0) continue;
+        const W* de = expert_offset(downs, (i64)e * d * E, qkind);
+        moe_linear(Ablk + (size_t)h_off[e] * E, de, Xblk + (size_t)h_off[e] * d, (int)ns, E, d, qkind);
+    }
+    k_scatter_add_all<<<grid_for(NK, 256), 256>>>(out, Xblk, grouped, w_use, NK, d, K);
+    CU_CHECK(cudaGetLastError());
+}
+
+template <typename W>
+static void moe_forward_bias_impl(const float* x, const float* router_w, const float* router_bias,
+                      const W* gates, const W* ups, const W* downs,
+                      const W* sh_g, const W* sh_u, const W* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind = -1) {
+    if (N <= 0) return;
+    if (!router_bias) {
+        moe_forward_impl<W>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
+                            probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K, SH,
+                            qkind);
+        return;
+    }
+
+    GAI_CHECK(N <= 2147483647LL, "moe forward bias: N exceeds INT_MAX (B*T too large)");
+    GAI_CHECK(K >= 1 && K <= 8, "moe routing bias: top_k out of kernel range [1,8]");
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe routing bias: ne out of kernel range [1,64]");
+    const i64 NK = N * K;
+
+    uint8_t* ws = (uint8_t*)moe_workspace(
+        sizeof(float) * (size_t)N * ne +
+        sizeof(i32) * (size_t)NK +
+        sizeof(float) * (size_t)NK +
+        sizeof(float) * (size_t)NK * E * 3 +
+        sizeof(float) * (size_t)NK * d +
+        sizeof(float) * (size_t)N * SH * 3 +
+        ws_pad_for(7));
+    float* rlogits = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
+    i32*   tmp_idx = (i32*)carve16(ws, sizeof(i32) * (size_t)NK);
+    float* tmp_w   = (float*)carve16(ws, sizeof(float) * (size_t)NK);
+    float* Gblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ublk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ablk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Xblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
+    float* Sg = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* Su = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* Sa = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+
+    linear_forward_f32(x, router_w, rlogits, (int)N, d, ne);
+
+    i32* idx_use = idx_cache ? idx_cache : tmp_idx;
+    float* w_use = w_cache ? w_cache : tmp_w;
+
+    k_route_bias<<<(unsigned)N, 32>>>(rlogits, router_bias, probs_cache, idx_use, w_use,
+                                     N, ne, K, g_moe_jitter, g_moe_jitter_seed);
+    CU_CHECK(cudaGetLastError());
+
+    if (sh_g && sh_u && sh_d) {
+        moe_linear(x, sh_g, Sg, (int)N, d, SH, qkind);
+        moe_linear(x, sh_u, Su, (int)N, d, SH, qkind);
+        k_swiglu<<<grid_for(N * SH, 256), 256>>>(Sg, Su, Sa, N * SH);
+        CU_CHECK(cudaGetLastError());
+        moe_linear(Sa, sh_d, out, (int)N, SH, d, qkind);
+    } else {
+        CU_CHECK(cudaMemset(out, 0, sizeof(float) * (size_t)N * d));
+    }
+
+    if (qkind < 0 && NK > 0) {
+        constexpr bool HALF = std::is_same<W, u16>::value;
+        dim3 gu((unsigned)NK, (unsigned)((E + 255) / 256));
+        k_moe_slot_gate_up<W, HALF><<<gu, 256>>>(x, idx_use, gates, ups,
+                                                 Gblk, Ublk, s_gate, s_up,
+                                                 (int)NK, d, E, ne, K);
+        CU_CHECK(cudaGetLastError());
+        k_moe_slot_swiglu<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Ablk, s_act, NK * E);
+        CU_CHECK(cudaGetLastError());
+        dim3 dn((unsigned)NK, (unsigned)((d + 255) / 256));
+        k_moe_slot_down<W, HALF><<<dn, 256>>>(idx_use, downs, Ablk, Xblk,
+                                              (int)NK, d, E, ne);
+        CU_CHECK(cudaGetLastError());
+        dim3 sc((unsigned)NK, (unsigned)((d + 255) / 256));
+        k_moe_slot_scatter<<<sc, 256>>>(out, Xblk, w_use, (int)NK, d, K);
+        CU_CHECK(cudaGetLastError());
+        return;
+    }
+
+    moe_route_ready_on_stream0();
+    i32* grouped = nullptr;
+    int h_cnt[64], h_off[65];
+    moe_build_groups_launch(idx_use, N, K, ne, &grouped);
+    moe_build_groups_sync(NK, ne, h_cnt, h_off);
+    if (h_off[ne] <= 0) return;
+
+    k_pack_all<<<grid_for(NK, 256), 256>>>(x, grouped, Xblk, NK, d, K);
+    CU_CHECK(cudaGetLastError());
+    for (int e = 0; e < ne; ++e) {
+        i64 ns = (i64)h_cnt[e];
+        if (ns == 0) continue;
+        const W* ge = expert_offset(gates, (i64)e * E * d, qkind);
+        const W* ue = expert_offset(ups,   (i64)e * E * d, qkind);
+        moe_linear(Xblk + (size_t)h_off[e] * d, ge, Gblk + (size_t)h_off[e] * E, (int)ns, d, E, qkind);
+        moe_linear(Xblk + (size_t)h_off[e] * d, ue, Ublk + (size_t)h_off[e] * E, (int)ns, d, E, qkind);
+    }
+    k_swiglu<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Ablk, NK * E);
+    CU_CHECK(cudaGetLastError());
+    k_save3_all<<<grid_for(NK, 256), 256>>>(Gblk, Ublk, Ablk, grouped, s_gate, s_up, s_act, NK, E);
+    CU_CHECK(cudaGetLastError());
+    for (int e = 0; e < ne; ++e) {
+        i64 ns = (i64)h_cnt[e];
+        if (ns == 0) continue;
+        const W* de = expert_offset(downs, (i64)e * d * E, qkind);
+        moe_linear(Ablk + (size_t)h_off[e] * E, de, Xblk + (size_t)h_off[e] * d, (int)ns, E, d, qkind);
+    }
+    k_scatter_add_all<<<grid_for(NK, 256), 256>>>(out, Xblk, grouped, w_use, NK, d, K);
+    CU_CHECK(cudaGetLastError());
+}
+
+void moe_forward(const float* x, const float* router_w,
+                 const float* gates, const float* ups, const float* downs,
+                 const float* sh_g, const float* sh_u, const float* sh_d,
+                 float* out,
+                 float* probs_cache, i32* idx_cache, float* w_cache,
+                 float* s_gate, float* s_up, float* s_act,
+                  i64 N, int d, int E, int ne, int K, int SH) {
+    moe_forward_impl<float>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
+                            probs_cache, idx_cache, w_cache, s_gate, s_up, s_act,
+                            N, d, E, ne, K, SH);
+}
+
+void moe_forward_half(const float* x, const float* router_w,
+                 const u16* gates, const u16* ups, const u16* downs,
+                 const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                 float* out,
+                 float* probs_cache, i32* idx_cache, float* w_cache,
+                 float* s_gate, float* s_up, float* s_act,
+                  i64 N, int d, int E, int ne, int K, int SH, int qkind) {
+    moe_forward_impl<u16>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
+                          probs_cache, idx_cache, w_cache, s_gate, s_up, s_act,
+                          N, d, E, ne, K, SH, qkind);
+}
+
+void moe_forward_bias(const float* x, const float* router_w, const float* router_bias,
+                      const float* gates, const float* ups, const float* downs,
+                      const float* sh_g, const float* sh_u, const float* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH) {
+    moe_forward_bias_impl<float>(x, router_w, router_bias, gates, ups, downs,
+                                 sh_g, sh_u, sh_d, out,
+                                 probs_cache, idx_cache, w_cache,
+                                 s_gate, s_up, s_act, N, d, E, ne, K, SH);
+}
+
+void moe_forward_bias_half(const float* x, const float* router_w, const float* router_bias,
+                      const u16* gates, const u16* ups, const u16* downs,
+                      const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K, int SH, int qkind) {
+    moe_forward_bias_impl<u16>(x, router_w, router_bias, gates, ups, downs,
+                               sh_g, sh_u, sh_d, out,
+                               probs_cache, idx_cache, w_cache,
+                               s_gate, s_up, s_act, N, d, E, ne, K, SH, qkind);
+}
+
+template <typename W>
+static void moe_backward_impl(const float* x, const float* router_w,
+                  const W* gates, const W* ups, const W* downs,
+                  const W* sh_g, const W* sh_u, const W* sh_d,
+                  const float* probs, const i32* idx, const float* tw,
+                  const float* s_gate, const float* s_up, const float* s_act,
+                  const float* aux_frac, float aux_scale,
+                  const float* dout,
+                  float* dx,
+                  float* drouter_w, float* dgates, float* dups, float* ddowns,
+                  float* dsh_g, float* dsh_u, float* dsh_d,
+                  float* s_dact,
+                  i64 N, int d, int E, int ne, int K, int SH) {
+    if (N <= 0) return;
+    GAI_CHECK(N <= 2147483647LL, "moe backward: N exceeds INT_MAX (B*T too large)");
+    GAI_CHECK(K >= 1 && K <= 8, "moe backward: top_k out of kernel range [1,8]");
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe backward: num_experts out of kernel range [1,64]");
+    const i64 NK = N * K;
+    const float aux_coef = (aux_frac && aux_scale != 0.0f)
+        ? aux_scale * (float)ne / (float)N : 0.0f;
+    (void)s_dact;
+
+    uint8_t* ws = (uint8_t*)moe_workspace(
+        sizeof(float) * (size_t)N * SH * 3 +
+        sizeof(float) * (size_t)N * SH * 3 +
+        sizeof(float) * (size_t)NK +
+        sizeof(float) * (size_t)NK * E * 4 +
+        sizeof(float) * (size_t)NK * d * 2 +
+        sizeof(float) * (size_t)NK +
+        sizeof(float) * (size_t)N * ne +
+        ws_pad_for(15));
+
+    float* shg = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* shu = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* sha = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* shdg = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* shdu = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* shda = (float*)carve16(ws, sizeof(float) * (size_t)N * SH);
+    float* dpfull = (float*)carve16(ws, sizeof(float) * (size_t)NK);
+    float* Gblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ublk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ablk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Dblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Xblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
+    float* Sblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
+    float* Pblk = (float*)carve16(ws, sizeof(float) * (size_t)NK);
+    float* DLblk = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
+
+    if (sh_g && sh_u && sh_d) {
+        moe_linear(x, sh_g, shg, (int)N, d, SH);
+        moe_linear(x, sh_u, shu, (int)N, d, SH);
+        k_swiglu<<<grid_for(N * SH, 256), 256>>>(shg, shu, sha, N * SH);
+        CU_CHECK(cudaGetLastError());
+
+        moe_gemm_nn(dout, sh_d, shda, (int)N, SH, d);
+    k_swiglu_bwd_assign<<<grid_for(N * SH, 256), 256>>>(shg, shu, shda, shdg, shdu, N * SH);
+        CU_CHECK(cudaGetLastError());
+        moe_linear_bwd(sha, sh_d, dout, nullptr, dsh_d, (int)N, SH, d);
+        moe_linear_bwd(x, sh_g, shdg, dx, dsh_g, (int)N, d, SH);
+        moe_linear_bwd(x, sh_u, shdu, dx, dsh_u, (int)N, d, SH);
+    }
+
+    CU_CHECK(cudaMemset(dpfull, 0, sizeof(float) * (size_t)NK));
+
+    moe_route_ready_on_stream0();
+
+    i32* grouped = nullptr;
+    int h_cnt[64], h_off[65];
+    moe_build_groups_launch(idx, N, K, ne, &grouped);
+
+    CU_CHECK(cudaStreamWaitEvent(0, g_offsets_event, 0));
+
+    k_gather3_all<<<grid_for(NK, 256), 256>>>(s_gate, s_up, s_act, grouped, Gblk, Ublk, Ablk, NK, E);
+    CU_CHECK(cudaGetLastError());
+    k_pack_all<<<grid_for(NK, 256), 256>>>(x, grouped, Xblk, NK, d, K);
+    CU_CHECK(cudaGetLastError());
+    k_scale_all<<<grid_for(NK, 256), 256>>>(dout, tw, grouped, Sblk, NK, d, K);
+    CU_CHECK(cudaGetLastError());
+
+    moe_build_groups_sync(NK, ne, h_cnt, h_off);
+    for (int e = 0; e < ne; ++e) {
+        i64 ns = (i64)h_cnt[e];
+        if (ns == 0) continue;
+        const W* de = downs + (size_t)e * d * E;
+
+        moe_gemm_nn(Sblk + (size_t)h_off[e] * d, de,
+                    Dblk + (size_t)h_off[e] * E, (int)ns, E, d);
+    }
+    k_swiglu_bwd_assign<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Dblk,
+                                                        Gblk, Ublk, NK * E);
+    CU_CHECK(cudaGetLastError());
+
+    for (int e = 0; e < ne; ++e) {
+        i64 ns = (i64)h_cnt[e];
+        if (ns == 0) continue;
+        i32* d_slots = grouped + h_off[e];
+        const W* ge = gates + (size_t)e * E * d;
+        const W* ue = ups   + (size_t)e * E * d;
+        const W* de = downs + (size_t)e * d * E;
+        float* dge = dgates ? dgates + (size_t)e * E * d : nullptr;
+        float* due = dups   ? dups   + (size_t)e * E * d : nullptr;
+        float* dde = ddowns ? ddowns + (size_t)e * d * E : nullptr;
+        const float* Gp = Gblk + (size_t)h_off[e] * E;
+        const float* Up = Ublk + (size_t)h_off[e] * E;
+        const float* Ap = Ablk + (size_t)h_off[e] * E;
+        const float* Xp = Xblk + (size_t)h_off[e] * d;
+        const float* Sp = Sblk + (size_t)h_off[e] * d;
+
+        moe_linear_bwd(Ap, de, Sp, nullptr, dde, (int)ns, E, d);
+
+        zero(Sblk + (size_t)h_off[e] * d, (i64)ns * d);
+        moe_linear_bwd(Xp, ge, Gp, Sblk + (size_t)h_off[e] * d, dge, (int)ns, d, E);
+        k_scatter_add<<<grid_for(ns, 256), 256>>>(dx, Sblk + (size_t)h_off[e] * d, d_slots,
+                                                  nullptr, ns, d, K);
+        CU_CHECK(cudaGetLastError());
+
+        zero(Sblk + (size_t)h_off[e] * d, (i64)ns * d);
+        moe_linear_bwd(Xp, ue, Up, Sblk + (size_t)h_off[e] * d, due, (int)ns, d, E);
+        k_scatter_add<<<grid_for(ns, 256), 256>>>(dx, Sblk + (size_t)h_off[e] * d, d_slots,
+                                                  nullptr, ns, d, K);
+        CU_CHECK(cudaGetLastError());
+
+        moe_linear(Ap, de, Sblk + (size_t)h_off[e] * d, (int)ns, E, d);
+        k_dp_dot<<<grid_for(ns, 256), 256>>>(dout, Sblk + (size_t)h_off[e] * d, d_slots, Pblk, ns, d, K);
+        k_scatter_copy<<<grid_for(ns, 256), 256>>>(Pblk, d_slots, dpfull, ns, 1);
+        CU_CHECK(cudaGetLastError());
+    }
+
+    GAI_CHECK(K >= 1 && K <= 8, "moe routing backward: top_k out of kernel range [1,8]");
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe routing backward: num_experts out of kernel range [1,64]");
+    k_router_dl<<<(unsigned)N, 32>>>(x, router_w, probs, dpfull, idx, aux_frac,
+                                    aux_coef, g_moe_jitter, g_moe_jitter_seed, DLblk, dx, N, d, ne, K);
+    CU_CHECK(cudaGetLastError());
+    if (drouter_w)
+        gemm(true, false, ne, d, (int)N, 1.0f, DLblk, ne, x, d, 1.0f, drouter_w, d);
+}
+
+void moe_backward(const float* x, const float* router_w,
+                  const float* gates, const float* ups, const float* downs,
+                  const float* sh_g, const float* sh_u, const float* sh_d,
+                  const float* probs, const i32* idx, const float* tw,
+                  const float* s_gate, const float* s_up, const float* s_act,
+                  const float* aux_frac, float aux_scale,
+                  const float* dout, float* dx,
+                  float* drouter_w, float* dgates, float* dups, float* ddowns,
+                  float* dsh_g, float* dsh_u, float* dsh_d,
+                  float* s_dact,
+                  i64 N, int d, int E, int ne, int K, int SH) {
+    moe_backward_impl<float>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                             probs, idx, tw, s_gate, s_up, s_act, aux_frac, aux_scale,
+                             dout, dx, drouter_w, dgates, dups, ddowns,
+                             dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
+}
+
+void moe_backward_half(const float* x, const float* router_w,
+                  const u16* gates, const u16* ups, const u16* downs,
+                  const u16* sh_g, const u16* sh_u, const u16* sh_d,
+                  const float* probs, const i32* idx, const float* tw,
+                  const float* s_gate, const float* s_up, const float* s_act,
+                  const float* aux_frac, float aux_scale,
+                  const float* dout, float* dx,
+                  float* drouter_w, float* dgates, float* dups, float* ddowns,
+                  float* dsh_g, float* dsh_u, float* dsh_d,
+                  float* s_dact,
+                  i64 N, int d, int E, int ne, int K, int SH) {
+    moe_backward_impl<u16>(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
+                           probs, idx, tw, s_gate, s_up, s_act, aux_frac, aux_scale,
+                           dout, dx, drouter_w, dgates, dups, ddowns,
+                           dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K, SH);
+}
+
+__global__ void k_aux_accum(const float* probs, const i32* idx,
+                            int* cnt, float* psum,
+                            i64 N, int K, int ne) {
+    i64 t = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= N) return;
+    for (int k = 0; k < K; ++k) {
+        int e = idx[t * K + k];
+        if (e >= 0 && e < ne) atomicAdd(&cnt[e], 1);
+    }
+    const float* pt = probs + t * ne;
+    for (int e = 0; e < ne; ++e) atomicAdd(&psum[e], pt[e]);
+}
+
+__global__ void k_aux_finalize(const int* cnt, float* frac,
+                               i64 N, int K, int ne) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= ne) return;
+    float denom = (float)((double)N * (double)K);
+    frac[e] = denom > 0.0f ? (float)cnt[e] / denom : 0.0f;
+}
+
+static thread_local int*   g_aux_cnt = nullptr;
+static thread_local float* g_aux_psum = nullptr;
+static thread_local int    g_aux_cap = 0;
+
+static void aux_ensure(int ne) {
+    if (ne <= g_aux_cap) return;
+    if (g_aux_cnt) { cudaFree(g_aux_cnt); g_aux_cnt = nullptr; }
+    if (g_aux_psum) { cudaFree(g_aux_psum); g_aux_psum = nullptr; }
+    CU_CHECK(cudaMalloc(&g_aux_cnt, sizeof(int) * (size_t)ne));
+    CU_CHECK(cudaMalloc(&g_aux_psum, sizeof(float) * (size_t)ne));
+    g_aux_cap = ne;
+}
+
+static thread_local double* g_aux_raw = nullptr;
+
+double* moe_aux_begin() {
+    if (!g_aux_raw) CU_CHECK(cudaMalloc(&g_aux_raw, sizeof(double)));
+    CU_CHECK(cudaMemset(g_aux_raw, 0, sizeof(double)));
+    return g_aux_raw;
+}
+
+double moe_aux_end() {
+    if (!g_aux_raw) return 0.0;
+    double h = 0.0;
+    CU_CHECK(cudaMemcpy(&h, g_aux_raw, sizeof(double), cudaMemcpyDeviceToHost));
+    return h;
+}
+
+__global__ void k_aux_raw_add(const float* psum, const float* frac,
+                              double* accum, i64 N, int ne) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    double raw = 0.0;
+    for (int e = 0; e < ne; ++e) {
+        double m = N > 0 ? (double)psum[e] / (double)N : 0.0;
+        raw += m * (double)frac[e];
+    }
+    raw *= (double)ne;
+    *accum += raw;
+}
+
+void moe_aux_frac_gpu(const float* probs, const i32* idx, float* frac,
+                      float* h_frac, float* h_psum,
+                      i64 N, int K, int ne, double* d_raw_accum) {
+    if (N <= 0 || ne <= 0) {
+        if (frac && ne > 0) CU_CHECK(cudaMemset(frac, 0, sizeof(float) * (size_t)ne));
+        if (h_frac) for (int e = 0; e < ne; ++e) h_frac[e] = 0.0f;
+        if (h_psum) for (int e = 0; e < ne; ++e) h_psum[e] = 0.0f;
+        return;
+    }
+    aux_ensure(ne);
+    CU_CHECK(cudaMemset(g_aux_cnt, 0, sizeof(int) * (size_t)ne));
+    CU_CHECK(cudaMemset(g_aux_psum, 0, sizeof(float) * (size_t)ne));
+    k_aux_accum<<<grid_for(N, 256), 256>>>(probs, idx, g_aux_cnt, g_aux_psum, N, K, ne);
+    CU_CHECK(cudaGetLastError());
+    k_aux_finalize<<<(ne + 255) / 256, 256>>>(g_aux_cnt, frac, N, K, ne);
+    CU_CHECK(cudaGetLastError());
+
+    if (d_raw_accum && N > 0 && ne > 0) {
+        k_aux_raw_add<<<1, 1>>>(g_aux_psum, frac, d_raw_accum, N, ne);
+        CU_CHECK(cudaGetLastError());
+    }
+
+    if (h_frac) CU_CHECK(cudaMemcpy(h_frac, frac, sizeof(float) * (size_t)ne,
+                                    cudaMemcpyDeviceToHost));
+    if (h_psum) CU_CHECK(cudaMemcpy(h_psum, g_aux_psum, sizeof(float) * (size_t)ne,
+                                    cudaMemcpyDeviceToHost));
+}
+
+void moe_free_workspace() {
+    cudaDeviceSynchronize();
+    if (g_moe_ws) { cudaFree(g_moe_ws); g_moe_ws = nullptr; g_moe_ws_bytes = 0; }
+    if (g_grp_grouped) { cudaFree(g_grp_grouped); g_grp_grouped = nullptr; g_grp_grouped_cap = 0; }
+    if (g_grp_cnt) { cudaFree(g_grp_cnt); g_grp_cnt = nullptr; }
+    if (g_grp_cur) { cudaFree(g_grp_cur); g_grp_cur = nullptr; }
+    if (g_grp_off) { cudaFree(g_grp_off); g_grp_off = nullptr; }
+    g_grp_ne_cap = 0;
+    if (g_aux_cnt) { cudaFree(g_aux_cnt); g_aux_cnt = nullptr; }
+    if (g_aux_psum) { cudaFree(g_aux_psum); g_aux_psum = nullptr; }
+    g_aux_cap = 0;
+    if (g_aux_raw) { cudaFree(g_aux_raw); g_aux_raw = nullptr; }
+    if (g_offsets_event) { cudaEventDestroy(g_offsets_event); g_offsets_event = nullptr; }
+    if (g_route_event) { cudaEventDestroy(g_route_event); g_route_event = nullptr; }
+    if (g_group_stream) { cudaStreamDestroy(g_group_stream); g_group_stream = nullptr; }
+    if (g_h_offsets_pinned) { cudaFreeHost(g_h_offsets_pinned); g_h_offsets_pinned = nullptr; }
+    g_h_offsets_cap = 0;
+}
+
+}
+}

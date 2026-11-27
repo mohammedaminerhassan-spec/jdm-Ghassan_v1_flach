@@ -1,0 +1,268 @@
+#include "inference/sampler.h"
+#include "core/config.h"
+
+#include <cmath>
+#include <algorithm>
+#include <unordered_map>
+
+namespace gai {
+
+Sampler::Sampler(SamplingConfig cfg) : cfg_(cfg) {
+    cfg_.validate();
+    rng_.seed_with(cfg.seed != 0 ? cfg.seed
+                                 : static_cast<u64>(std::chrono::steady_clock::now()
+                                       .time_since_epoch().count()));
+}
+
+void SamplingConfig::validate() {
+
+    if (!std::isfinite(temperature) || temperature < 0.0f) temperature = 0.0f;
+    if (temperature > 5.0f) temperature = 5.0f;
+
+    if (!std::isfinite(top_p) || top_p < 0.0f) top_p = 1.0f;
+    if (top_p > 1.0f) top_p = 1.0f;
+    if (!std::isfinite(min_p) || min_p < 0.0f) min_p = 0.0f;
+    if (min_p >= 1.0f) min_p = 0.0f;
+    if (top_k < 0) top_k = 0;
+
+    if (top_k > 2048) {
+        static bool warned_topk = false;
+        if (!warned_topk) {
+            warned_topk = true;
+            log_warn("[sample] top_k huge; clamping to 2048 (full-sort per token otherwise)");
+        }
+        top_k = 2048;
+    }
+
+    if (!std::isfinite(repetition_penalty) || repetition_penalty <= 0.0f)
+        repetition_penalty = 1.0f;
+    if (repetition_penalty > 5.0f) repetition_penalty = 5.0f;
+    if (!std::isfinite(frequency_penalty)) frequency_penalty = 0.0f;
+    if (!std::isfinite(presence_penalty)) presence_penalty = 0.0f;
+    if (frequency_penalty < -5.0f) frequency_penalty = -5.0f;
+    if (frequency_penalty > 5.0f) frequency_penalty = 5.0f;
+    if (presence_penalty < -5.0f) presence_penalty = -5.0f;
+    if (presence_penalty > 5.0f) presence_penalty = 5.0f;
+    if (repetition_window < 0) repetition_window = 0;
+    if (repetition_window > 8192) repetition_window = 8192;
+
+    if (no_repeat_ngram < 0) no_repeat_ngram = 0;
+    if (no_repeat_ngram == 1) no_repeat_ngram = 2;
+    if (no_repeat_ngram > 8) no_repeat_ngram = 8;
+}
+
+void Sampler::apply_penalties(float* logits, int vocab, const std::vector<i32>& hist) const {
+    if (hist.empty()) return;
+    const bool rep  = cfg_.repetition_penalty != 1.0f;
+    const bool freq = cfg_.frequency_penalty != 0.0f;
+    const bool pres = cfg_.presence_penalty != 0.0f;
+    if (!rep && !freq && !pres) return;
+
+    size_t window = cfg_.repetition_window > 0
+                  ? std::min(hist.size(), static_cast<size_t>(cfg_.repetition_window))
+                  : hist.size();
+
+    thread_local std::vector<i32> win_buf;
+    win_buf.clear();
+    win_buf.reserve(window);
+    for (size_t i = hist.size() - window; i < hist.size(); ++i) {
+        i32 t = hist[i];
+        if (t >= 0 && t < vocab) win_buf.push_back(t);
+    }
+    if (win_buf.empty()) return;
+    std::sort(win_buf.begin(), win_buf.end());
+    for (size_t i = 0; i < win_buf.size();) {
+        size_t j = i + 1;
+        while (j < win_buf.size() && win_buf[j] == win_buf[i]) ++j;
+        const int n = static_cast<int>(j - i);
+        float& l = logits[win_buf[i]];
+        if (rep) {
+            l = (l > 0.0f) ? l / cfg_.repetition_penalty : l * cfg_.repetition_penalty;
+        }
+        if (freq) l -= cfg_.frequency_penalty * static_cast<float>(n);
+        if (pres) l -= cfg_.presence_penalty;
+        i = j;
+    }
+}
+
+static void ban_no_repeat_ngram(float* logits, int vocab,
+                                  const std::vector<i32>& hist, int n) {
+    if (n <= 0 || vocab <= 0 || hist.size() < static_cast<size_t>(n - 1)) return;
+
+    const size_t m = hist.size();
+    const size_t pre = static_cast<size_t>(n - 1);
+    for (size_t i = 0; i + static_cast<size_t>(n) <= m; ++i) {
+        bool match = true;
+        for (size_t k = 0; k < pre; ++k) {
+            if (hist[i + k] != hist[m - pre + k]) { match = false; break; }
+        }
+        if (!match) continue;
+        i32 nxt = hist[i + pre];
+        if (nxt >= 0 && nxt < vocab) logits[nxt] = -1e30f;
+    }
+}
+
+i32 Sampler::sample(float* logits, int vocab, const std::vector<i32>& history) {
+    GAI_CHECK(vocab > 0, "empty vocabulary");
+    apply_penalties(logits, vocab, history);
+    if (cfg_.no_repeat_ngram > 0) ban_no_repeat_ngram(logits, vocab, history, cfg_.no_repeat_ngram);
+
+    if (cfg_.greedy || cfg_.temperature <= 0.0f || cfg_.top_k == 1) {
+        int best = -1;
+        float bv = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < vocab; ++i) {
+            const float v = logits[i];
+            if (std::isfinite(v) && (best < 0 || v > bv)) { bv = v; best = i; }
+        }
+        if (best < 0) {
+            best = 0;
+            for (int i = 1; i < vocab; ++i) if (logits[i] > logits[best]) best = i;
+        }
+        return best;
+    }
+
+    const bool no_filter = (cfg_.top_k <= 0 || cfg_.top_k >= vocab) &&
+                           (cfg_.top_p <= 0.0f || cfg_.top_p >= 1.0f) &&
+                           cfg_.min_p <= 0.0f;
+    if (no_filter) {
+        scratch_.clear();
+        scratch_.reserve(static_cast<size_t>(vocab));
+        for (int i = 0; i < vocab; ++i) scratch_.emplace_back(logits[i], i);
+
+        size_t bi = 0;
+        for (size_t i = 1; i < scratch_.size(); ++i)
+            if (scratch_[i].first > scratch_[bi].first) bi = i;
+        if (bi != 0) std::swap(scratch_[0], scratch_[bi]);
+
+        const float inv_t = 1.0f / cfg_.temperature;
+
+        float mx = scratch_[0].first;
+        probs_buf_.resize(scratch_.size());
+        double sum = 0.0;
+        for (size_t i = 0; i < scratch_.size(); ++i) {
+            double p = std::exp(static_cast<double>((scratch_[i].first - mx) * inv_t));
+            probs_buf_[i] = p; sum += p;
+        }
+        if (!std::isfinite(sum) || sum <= 0.0) return scratch_[0].second;
+        double r = (double)rng_.uniform() * sum, acc = 0.0;
+        for (size_t i = 0; i < scratch_.size(); ++i) {
+            acc += probs_buf_[i];
+            if (r <= acc) return scratch_[i].second;
+        }
+        return scratch_.back().second;
+    }
+
+    int k = (cfg_.top_k > 0 && cfg_.top_k < vocab) ? cfg_.top_k : vocab;
+
+    if (cfg_.top_k > 0 && cfg_.top_k < vocab && k > 2048) {
+        static bool warned_topk = false;
+        if (!warned_topk) {
+            warned_topk = true;
+            log_warn("[sample] top_k huge; clamping to 2048 (full-sort per token otherwise)");
+        }
+        k = 2048;
+    }
+    if (k < vocab && k <= 1024) {
+        scratch_.clear();
+        scratch_.reserve(static_cast<size_t>(k));
+        for (int i = 0; i < vocab; ++i) {
+            const float val = logits[i];
+            if (!std::isfinite(val)) continue;
+            if (static_cast<int>(scratch_.size()) < k) {
+                scratch_.emplace_back(val, i);
+                if (static_cast<int>(scratch_.size()) == k) {
+                    std::make_heap(scratch_.begin(), scratch_.end(),
+                                   [](const auto& a, const auto& b) { return a.first > b.first; });
+                }
+            } else if (val > scratch_.front().first) {
+                std::pop_heap(scratch_.begin(), scratch_.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+                scratch_.back() = {val, i};
+                std::push_heap(scratch_.begin(), scratch_.end(),
+                               [](const auto& a, const auto& b) { return a.first > b.first; });
+            }
+        }
+        std::sort(scratch_.begin(), scratch_.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        return draw_from_scratch();
+    }
+
+    scratch_.clear();
+    scratch_.reserve(static_cast<size_t>(vocab));
+    for (int i = 0; i < vocab; ++i) scratch_.emplace_back(logits[i], i);
+
+    if (k < vocab) {
+        std::partial_sort(scratch_.begin(), scratch_.begin() + k, scratch_.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        scratch_.resize(static_cast<size_t>(k));
+    } else {
+        std::sort(scratch_.begin(), scratch_.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+    }
+
+    return draw_from_scratch();
+}
+
+i32 Sampler::sample_candidates(const float* vals, const i32* ids, int K) {
+    GAI_CHECK(K > 0 && vals && ids, "sample_candidates: empty set");
+
+    scratch_.clear();
+    scratch_.reserve(static_cast<size_t>(K));
+    for (int i = 0; i < K; ++i) scratch_.emplace_back(vals[i], ids[i]);
+    std::sort(scratch_.begin(), scratch_.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    return draw_from_scratch();
+}
+
+i32 Sampler::draw_from_scratch() {
+    GAI_CHECK(!scratch_.empty(), "sampler: empty candidate set");
+    if (!(cfg_.temperature > 0.0f)) return scratch_[0].second;
+
+    const float inv_t = 1.0f / cfg_.temperature;
+
+    float mx = scratch_[0].first;
+    double sum = 0.0;
+
+    probs_buf_.resize(scratch_.size());
+    double* probs = probs_buf_.data();
+    for (size_t i = 0; i < scratch_.size(); ++i) {
+        double p = std::exp(static_cast<double>((scratch_[i].first - mx) * inv_t));
+        probs[i] = p;
+        sum += p;
+    }
+
+    if (!std::isfinite(sum) || sum <= 0.0) return scratch_[0].second;
+    for (size_t i = 0; i < scratch_.size(); ++i) probs[i] /= sum;
+
+    const size_t nprob = scratch_.size();
+    size_t limit = nprob;
+    if (cfg_.min_p > 0.0f) {
+        double thresh = cfg_.min_p * probs[0];
+        size_t n = 0;
+        while (n < nprob && probs[n] >= thresh) ++n;
+        limit = std::max<size_t>(1, n);
+    }
+
+    if (cfg_.top_p > 0.0f && cfg_.top_p < 1.0f) {
+        double cum = 0.0;
+        size_t n = 0;
+        while (n < limit) {
+            cum += probs[n];
+            ++n;
+            if (cum >= static_cast<double>(cfg_.top_p)) break;
+        }
+        limit = std::max<size_t>(1, n);
+    }
+
+    double renorm = 0.0;
+    for (size_t i = 0; i < limit; ++i) renorm += probs[i];
+    double r = static_cast<double>(rng_.uniform()) * renorm;
+    double acc = 0.0;
+    for (size_t i = 0; i < limit; ++i) {
+        acc += probs[i];
+        if (r <= acc) return scratch_[i].second;
+    }
+    return scratch_[limit - 1].second;
+}
+
+}

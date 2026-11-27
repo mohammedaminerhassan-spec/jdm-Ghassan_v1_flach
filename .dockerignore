@@ -1,0 +1,15 @@
+.git
+.github
+build
+build_*
+*.gbin
+*.gguf
+*.bin
+*.ckpt
+*.safetensors
+*.log
+data_prepared
+checkpoints
+tmp
+Testing
+AUDIT_*.md

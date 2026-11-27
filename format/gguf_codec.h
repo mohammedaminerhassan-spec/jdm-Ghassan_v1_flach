@@ -1,0 +1,283 @@
+#pragma once
+
+#include "core/tensor.h"
+#include "model/model.h"
+#include "tokenizer/tokenizer.h"
+#include <cstdint>
+#include <functional>
+#include <istream>
+#include <map>
+#include <ostream>
+#include <string>
+#include <vector>
+
+namespace gai {
+
+constexpr uint32_t GGUF_MAGIC = 0x46554747u;
+constexpr uint32_t GGUF_VERSION = 3;
+
+enum class GGUFType : uint32_t {
+    UINT8   = 0,
+    INT8    = 1,
+    UINT16  = 2,
+    INT16   = 3,
+    UINT32  = 4,
+    INT32   = 5,
+    FLOAT32 = 6,
+    BOOL    = 7,
+    STRING  = 8,
+    ARRAY   = 9,
+    UINT64  = 10,
+    INT64   = 11,
+    FLOAT64 = 12,
+};
+
+enum class GGMLType : uint32_t {
+    F32  = 0,
+    F16  = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    Q2_K = 10,
+    Q3_K = 11,
+    Q4_K = 12,
+    Q5_K = 13,
+    Q6_K = 14,
+    Q8_K = 15,
+};
+
+struct GGUFMetadataValue {
+    GGUFType type;
+    std::vector<uint8_t> data;
+};
+
+struct GGUFTensorInfo {
+    std::string name;
+    std::vector<uint64_t> dimensions;
+    GGMLType type = GGMLType::F16;
+    uint64_t offset = 0;
+    uint64_t nbytes = 0;
+};
+
+class GGUFWriter {
+public:
+    explicit GGUFWriter(const std::string& path);
+
+    void set_arch(const std::string& arch);
+    void set_model_name(const std::string& name);
+    void set_vocab_size(uint32_t v);
+    void set_hidden_size(uint32_t h);
+    void set_num_layers(uint32_t l);
+    void set_num_heads(uint32_t h);
+    void set_num_kv_heads(uint32_t kv);
+    void set_intermediate_size(uint32_t f);
+    void set_moe_config(bool use_moe, uint32_t num_experts, uint32_t top_k,
+                        uint32_t expert_dim, bool shared);
+    void set_max_seq_len(uint32_t ctx);
+    void set_rope_theta(float theta);
+    void set_rope_scaling(const std::map<std::string, std::string>& scaling);
+    void set_rms_eps(float eps);
+    void set_tie_embeddings(bool tie);
+    void set_norm_type(const std::string& type);
+    void set_ffn_type(const std::string& type);
+    void set_attn_type(const std::string& type);
+    void set_tokenizer_model(const std::string& model);
+    void set_tokenizer_tokens(const std::vector<std::string>& tokens);
+    void set_tokenizer_scores(const std::vector<float>& scores);
+    void set_tokenizer_token_types(const std::vector<int32_t>& types);
+    void set_tokenizer_merges(const std::vector<std::string>& merges);
+    void set_tokenizer_pre(const std::string& pre);
+    void set_tokenizer_chat_template(const std::string& tmpl);
+
+    void add_custom_metadata(const std::string& key, const std::string& value);
+    void add_custom_metadata(const std::string& key, uint64_t value);
+    void add_custom_metadata(const std::string& key, float value);
+    void add_custom_metadata(const std::string& key, bool value);
+
+    void set_quantization_version(uint32_t v);
+    void set_size_label(const std::string& s);
+    void set_u32(const std::string& key, uint32_t v);
+    void set_general_type(const std::string& t);
+
+    void set_tokenizer_bos_id(uint32_t id);
+    void set_tokenizer_eos_id(uint32_t id);
+    void set_tokenizer_unk_id(uint32_t id);
+    void set_tokenizer_pad_id(uint32_t id);
+    void set_tokenizer_add_bos(bool add);
+    void set_tokenizer_add_eos(bool add);
+    void set_quantization_profile(const std::string& profile);
+    void set_file_type(uint32_t type);
+    void set_description(const std::string& desc);
+
+    void add_tensor(const std::string& name, const Tensor& t, GGMLType dtype = GGMLType::F16);
+    void add_tensor_deferred(const std::string& name, const std::vector<i64>& shape,
+                             GGMLType dtype, std::function<Tensor()> produce);
+    void write();
+
+    struct TensorError {
+        std::string name;
+        GGMLType    type = GGMLType::F32;
+        double      rel_rmse = 0.0;
+        double      max_rel = 0.0;
+        u64         numel = 0;
+    };
+    const std::vector<TensorError>& tensor_errors() const { return errors_; }
+
+private:
+    std::string path_;
+    std::map<std::string, GGUFMetadataValue> metadata_;
+    struct PendingTensor {
+        std::string name;
+        std::vector<i64> shape;
+        GGMLType dtype = GGMLType::F16;
+        Tensor direct;
+        std::function<Tensor()> produce;
+    };
+    std::vector<PendingTensor> tensors_;
+    std::vector<GGUFTensorInfo> tensor_infos_;
+    std::vector<TensorError> errors_;
+
+    static uint64_t align_up(uint64_t x, uint64_t alignment = 32);
+    template<typename T> static void write_pod(std::ostream& os, const T& v);
+    static void write_string(std::ostream& os, const std::string& s);
+    static void write_array(std::ostream& os, const std::vector<uint8_t>& data);
+};
+
+class GGUFReader {
+public:
+    bool open(const std::string& path);
+
+    const std::map<std::string, GGUFMetadataValue>& metadata() const { return metadata_; }
+    std::string get_string(const std::string& key, const std::string& def = "") const;
+    uint64_t get_uint(const std::string& key, uint64_t def = 0) const;
+    int64_t get_int(const std::string& key, int64_t def = 0) const;
+    float get_float(const std::string& key, float def = 0.0f) const;
+    bool get_bool(const std::string& key, bool def = false) const;
+
+    std::vector<i32> eos_ids() const;
+
+    ModelConfig model_config() const;
+    bool has_tokenizer() const;
+    bool load_tokenizer(Tokenizer& tk) const;
+
+    const std::vector<GGUFTensorInfo>& tensors() const { return tensor_infos_; }
+    const GGUFTensorInfo* find_tensor(const std::string& name) const;
+
+    const GGUFTensorInfo* find_weight(const std::string& internal) const;
+
+    Tensor read_tensor_f32(const std::string& name) const;
+    Tensor read_tensor_raw(const std::string& name) const;
+    Tensor read_tensor_quant(const std::string& name, DType target) const;
+
+    const std::string& path() const { return path_; }
+    uint64_t file_size() const { return file_size_; }
+
+private:
+    std::string path_;
+    std::map<std::string, GGUFMetadataValue> metadata_;
+    std::vector<GGUFTensorInfo> tensor_infos_;
+    std::vector<std::string> tokenizer_tokens_;
+    std::vector<std::string> tokenizer_merges_;
+    std::vector<float> tokenizer_scores_;
+    std::vector<int32_t> tokenizer_token_types_;
+    uint64_t file_size_ = 0;
+
+    uint64_t data_start_ = 0;
+
+    bool read_metadata(std::istream& is, uint64_t metadata_count);
+    bool read_tensor_info(std::istream& is, uint64_t tensor_count);
+    static bool read_string(std::istream& is, std::string& out);
+    static bool read_array(std::istream& is, std::vector<uint8_t>& out, uint64_t count);
+    template<typename T> static bool read_pod(std::istream& is, T& v);
+};
+
+bool load_model_from_gguf(const std::string& path, Model& model, int quant_kind = -1);
+
+struct ExportProfileGGUF {
+    GGMLType default_type = GGMLType::Q8_0;
+    GGMLType embedding_type = GGMLType::Q8_0;
+    GGMLType norm_type = GGMLType::F32;
+    GGMLType output_type = GGMLType::Q8_0;
+    GGMLType sensitive_type = GGMLType::Q8_0;
+    GGMLType recurrence_type = GGMLType::F16;
+    bool hybrid = false;
+    std::string name = "q8_k";
+};
+
+GGMLType gguf_dtype_for(const std::string& name, const ExportProfileGGUF& profile);
+
+ExportProfileGGUF gguf_profile_for(const std::string& name);
+
+void export_model_gguf(const std::string& path, Model& model,
+                      const Tokenizer&    tokenizer,
+                      const ExportProfileGGUF& profile,
+                      const std::map<std::string, std::string>& extra_meta = {},
+                      const std::string& compat = "native");
+
+bool llama_compat_ok(const ModelConfig& cfg, std::string* reason);
+
+std::string llama_tensor_name(const std::string& internal);
+
+bool llama_moe_compat_ok(const ModelConfig& cfg, std::string* reason);
+std::vector<i32> gguf_stop_ids(const class GGUFReader& r);
+std::string llama_moe_tensor_name(const std::string& internal);
+
+inline uint64_t GGUFWriter::align_up(uint64_t x, uint64_t alignment) {
+    return (x + alignment - 1) & ~(alignment - 1);
+}
+
+template<typename T>
+void GGUFWriter::write_pod(std::ostream& os, const T& v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+
+inline void GGUFWriter::write_string(std::ostream& os, const std::string& s) {
+    uint64_t len = static_cast<uint64_t>(s.size());
+    os.write(reinterpret_cast<const char*>(&len), 8);
+    os.write(s.data(), static_cast<std::streamsize>(len));
+}
+
+inline void GGUFWriter::write_array(std::ostream& os, const std::vector<uint8_t>& data) {
+    uint64_t len = static_cast<uint64_t>(data.size());
+    os.write(reinterpret_cast<const char*>(&len), 8);
+    os.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(len));
+}
+
+template<typename T>
+bool GGUFReader::read_pod(std::istream& is, T& v) {
+    return static_cast<bool>(is.read(reinterpret_cast<char*>(&v), sizeof(T)));
+}
+
+namespace gguf_detail {
+inline uint64_t remaining_bytes(std::istream& is) {
+    const auto cur = is.tellg();
+    if (cur == std::istream::pos_type(-1)) return 0;
+    is.seekg(0, std::ios::end);
+    const auto end = is.tellg();
+    is.seekg(cur, std::ios::beg);
+    if (end == std::istream::pos_type(-1) || end < cur) return 0;
+    return static_cast<uint64_t>(end - cur);
+}
+}
+
+inline bool GGUFReader::read_string(std::istream& is, std::string& out) {
+    uint64_t len = 0;
+    if (!is.read(reinterpret_cast<char*>(&len), 8)) return false;
+
+    if (len > (1ull << 28)) return false;
+    if (len > gguf_detail::remaining_bytes(is)) return false;
+    out.resize(static_cast<size_t>(len));
+    return static_cast<bool>(is.read(out.data(), static_cast<std::streamsize>(len)));
+}
+
+inline bool GGUFReader::read_array(std::istream& is, std::vector<uint8_t>& out, uint64_t count) {
+    if (count > (1ull << 30)) return false;
+    if (count > gguf_detail::remaining_bytes(is)) return false;
+    out.resize(static_cast<size_t>(count));
+    return static_cast<bool>(is.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(count)));
+}
+
+}

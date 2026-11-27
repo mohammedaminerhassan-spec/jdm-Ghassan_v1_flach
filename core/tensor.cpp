@@ -1,0 +1,183 @@
+#include "core/tensor.h"
+#include "core/device.h"
+#include "quantization/quantize.h"
+
+#include <cstring>
+#include <numeric>
+#include <sstream>
+
+namespace gai {
+
+const char* device_name(Device d) {
+    switch (d) {
+        case Device::CPU:    return "cpu";
+        case Device::CUDA:   return "cuda";
+    }
+    return "unknown";
+}
+
+i64 numel_of(const std::vector<i64>& shape) {
+
+    static constexpr i64 kMaxNumel = (1LL << 40);
+    i64 n = 1;
+    for (i64 s : shape) {
+        GAI_CHECK(s >= 0, "negative dimension");
+        GAI_CHECK(s <= kMaxNumel, "dimension exceeds 1T (likely corrupt shape)");
+        if (s != 0) GAI_CHECK(n <= kMaxNumel / s, "tensor numel overflow (>1T elements)");
+        n *= s;
+    }
+    return n;
+}
+
+Storage::Storage(size_t nbytes, Device dev, DType dt) : nbytes_(nbytes), device_(dev) {
+    if (nbytes == 0) return;
+    ptr_   = device_alloc(nbytes, dev, dt);
+    owned_ = true;
+}
+
+Storage::Storage(void* ptr, size_t nbytes, Device dev, std::shared_ptr<void> owner)
+    : ptr_(ptr), nbytes_(nbytes), device_(dev), owned_(false),
+      external_(true), owner_(std::move(owner)) {
+    GAI_CHECK(ptr_ != nullptr || nbytes_ == 0, "wrap of null pointer");
+    GAI_CHECK(dev == Device::CPU, "external views are CPU-readable memory only");
+}
+
+Storage::~Storage() {
+
+    try {
+        if (owned_ && ptr_) device_free(ptr_, device_);
+    } catch (const std::exception& e) {
+        log_error(std::string("[storage] device_free failed in ~Storage: ") + e.what());
+    } catch (...) {
+        log_error("[storage] device_free failed in ~Storage with unknown exception");
+    }
+    ptr_ = nullptr;
+}
+
+Tensor::Tensor(std::vector<i64> shape, DType dt, Device dev)
+    : shape_(std::move(shape)), dtype_(dt), device_(dev) {
+    numel_   = numel_of(shape_);
+    size_t nb = dtype_nbytes(dt, static_cast<size_t>(numel_));
+    storage_ = std::make_shared<Storage>(nb, dev, dt);
+}
+
+Tensor Tensor::zeros(std::vector<i64> shape, DType dt, Device dev) {
+    Tensor t(std::move(shape), dt, dev);
+    t.zero_();
+    return t;
+}
+
+Tensor Tensor::empty(std::vector<i64> shape, DType dt, Device dev) {
+    return Tensor(std::move(shape), dt, dev);
+}
+
+Tensor Tensor::view(std::vector<i64> shape) const {
+    GAI_CHECK(defined(), "view of undefined tensor");
+    Tensor t;
+    t.storage_ = storage_;
+    t.shape_   = std::move(shape);
+    t.numel_   = numel_of(t.shape_);
+    t.dtype_   = dtype_;
+    t.device_  = device_;
+    t.name_    = name_;
+    GAI_CHECK(t.numel_ == numel_, "view must preserve element count");
+    return t;
+}
+
+Tensor Tensor::to(Device dev) const {
+    if (!defined()) return {};
+    if (dev == device_) return *this;
+    Tensor out(shape_, dtype_, dev);
+    device_copy(out.data_ptr(), dev, data_ptr(), device_, nbytes());
+    out.name_ = name_;
+    return out;
+}
+
+Tensor Tensor::clone() const {
+    if (!defined()) return {};
+    Tensor out(shape_, dtype_, device_);
+    device_copy(out.data_ptr(), device_, data_ptr(), device_, nbytes());
+    out.name_ = name_;
+    return out;
+}
+
+void Tensor::zero_() {
+    if (!defined() || nbytes() == 0) return;
+
+    GAI_CHECK(!is_external(), "zero_ on read-only external view (mmap weight?)");
+
+    try {
+        device_memset_zero(data_ptr(), nbytes(), device_);
+    } catch (const std::exception& e) {
+        throw Error(std::string(e.what()) + " | tensor='" + (name_.empty() ? "<unnamed>" : name_) +
+                    "' shape=" + shape_str() + " dev=" + device_name(device_) +
+                    " bytes=" + std::to_string(nbytes()));
+    }
+}
+
+void Tensor::copy_from(const Tensor& src) {
+    GAI_CHECK(defined() && src.defined(), "copy_from on undefined tensor");
+    GAI_CHECK(src.dtype() == dtype_, "copy_from dtype mismatch");
+    GAI_CHECK(src.numel() == numel_, "copy_from numel mismatch");
+    GAI_CHECK(src.nbytes() == nbytes(), "copy_from nbytes mismatch (quant block misalign?)");
+    GAI_CHECK(!is_external(), "copy_from into read-only external view (mmap weight?)");
+    device_copy(data_ptr(), device_, src.data_ptr(), src.device(), nbytes());
+}
+
+void Tensor::copy_from_f32(const Tensor& src) {
+    GAI_CHECK(defined() && src.defined(), "copy_from_f32 on undefined tensor");
+    GAI_CHECK(src.dtype() == DType::F32, "copy_from_f32: the source must be fp32");
+    GAI_CHECK(src.numel() == numel_, "copy_from_f32 numel mismatch");
+    GAI_CHECK(!is_external(), "copy_from_f32 into read-only external view (mmap weight?)");
+    if (dtype_ == DType::F32) {
+        device_copy(data_ptr(), device_, src.data_ptr(), src.device(), nbytes());
+        return;
+    }
+    GAI_CHECK(src.device() == Device::CPU,
+              "copy_from_f32: the source must live on the host");
+    if (dtype_ == DType::F16) {
+        thread_local std::vector<u16> half;
+        half.resize(static_cast<size_t>(numel_));
+        const float* src_f = src.f32();
+        for (i64 i = 0; i < numel_; ++i) half[static_cast<size_t>(i)] = fp32_to_fp16(src_f[i]);
+        device_copy(data_ptr(), device_, half.data(), Device::CPU,
+                    half.size() * sizeof(u16));
+        return;
+    }
+    if (dtype_ == DType::BF16) {
+        thread_local std::vector<u16> bf;
+        bf.resize(static_cast<size_t>(numel_));
+        const float* src_f = src.f32();
+        for (i64 i = 0; i < numel_; ++i) bf[static_cast<size_t>(i)] = fp32_to_bf16(src_f[i]);
+        device_copy(data_ptr(), device_, bf.data(), Device::CPU,
+                    bf.size() * sizeof(u16));
+        return;
+    }
+    if (dtype_ == DType::Q4_0 || dtype_ == DType::Q4_1 || dtype_ == DType::Q8_0) {
+        Tensor q = quant::quantize(src, dtype_);
+        device_copy(data_ptr(), device_, q.data_ptr(), Device::CPU, nbytes());
+        return;
+    }
+    GAI_FAIL("copy_from_f32: unsupported destination dtype: " + std::string(dtype_name(dtype_)));
+}
+
+std::string Tensor::shape_str() const {
+    std::ostringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < shape_.size(); ++i) {
+        if (i) ss << ", ";
+        ss << shape_[i];
+    }
+    ss << "]";
+    return ss.str();
+}
+
+std::string Tensor::describe() const {
+    std::ostringstream ss;
+    ss << (name_.empty() ? "tensor" : name_) << " " << shape_str()
+       << " " << dtype_name(dtype_) << " " << device_name(device_)
+       << " " << human_bytes(nbytes());
+    return ss.str();
+}
+
+}
