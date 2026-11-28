@@ -87,6 +87,13 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
         cache_.set_pinned_prefix(0);
 
     const int d = c.hidden_size;
+    bool has_moe_layer = false;
+    bool has_dense_layer = false;
+    for (int l = 0; l < c.num_layers; ++l) {
+        if (model_.layer(l).has_moe()) has_moe_layer = true;
+        else has_dense_layer = true;
+    }
+
     x_          = Tensor::empty({d}, DType::F32, dev);
     xb_         = Tensor::empty({d}, DType::F32, dev);
     q_          = Tensor::empty({c.q_dim()}, DType::F32, dev);
@@ -97,10 +104,12 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     }
     attn_       = Tensor::empty({c.q_dim()}, DType::F32, dev);
     proj_       = Tensor::empty({d}, DType::F32, dev);
-    gate_       = Tensor::empty({c.intermediate_size}, DType::F32, dev);
-    up_         = Tensor::empty({c.intermediate_size}, DType::F32, dev);
-    act_        = Tensor::empty({c.intermediate_size}, DType::F32, dev);
-    if (c.use_moe) {
+    if (has_dense_layer) {
+        gate_ = Tensor::empty({c.intermediate_size}, DType::F32, dev);
+        up_   = Tensor::empty({c.intermediate_size}, DType::F32, dev);
+        act_  = Tensor::empty({c.intermediate_size}, DType::F32, dev);
+    }
+    if (has_moe_layer) {
         const i64 nke = static_cast<i64>(c.moe_top_k) * c.moe_expert_dim;
         moe_gate_ = Tensor::empty({nke}, DType::F32, dev);
         moe_up_   = Tensor::empty({nke}, DType::F32, dev);
@@ -146,9 +155,12 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
             c.arch == ModelConfig::ArchGranite &&
             std::any_of(c.layer_types.begin(), c.layer_types.end(),
                         [](int k) { return k == 0; });
-        if (has_mamba) {
-            mamba_proj_dev_   = Tensor::empty({(i64)proj}, DType::F32, dev);
-            mamba_norm_dev_   = Tensor::empty({(i64)d_inner}, DType::F32, dev);
+        const bool cuda_step_native = (dev == Device::CUDA && c.mamba_n_groups == 1);
+        if (has_mamba && !cuda_step_native) {
+            // These staging tensors/vectors are used only by the CPU recurrent-step
+            // fallback. Native CUDA decode consumes device weights and recurrent state.
+            mamba_proj_dev_   = Tensor::empty({static_cast<i64>(proj)}, DType::F32, dev);
+            mamba_norm_dev_   = Tensor::empty({static_cast<i64>(d_inner)}, DType::F32, dev);
             mamba_proj_host_.assign(static_cast<size_t>(proj), 0.0f);
             mamba_normed_host_.assign(static_cast<size_t>(d_inner), 0.0f);
             mamba_bc_out_host_.assign(static_cast<size_t>(conv_dim), 0.0f);
@@ -163,7 +175,6 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
             if (!is_mamba) continue;
             const LayerParams& L = model_.layer(l);
             MambaState st;
-            const bool cuda_step_native = (dev == Device::CUDA && c.mamba_n_groups == 1);
             if (dev == Device::CPU || !cuda_step_native) {
                 // n_groups != 1 currently uses the CPU recurrent-step fallback even
                 // after a CUDA prefill, so it needs a synchronized host state mirror.
