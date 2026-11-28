@@ -47,31 +47,13 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
     const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, prefill_T);
     const size_t qscratch = quant_kind >= 0 ? (512ull << 20) : 0;
 
-    // Chunked prefill materialises B*H*Tq*Tk FP32 scores, where Tq is capped
-    // at prefill_T and Tk is bounded by the configured context length.
-    const size_t attention_cells =
-        sat_mul(sat_mul(static_cast<size_t>(cfg.num_heads),
-                        static_cast<size_t>(prefill_T)),
-                static_cast<size_t>(kv_ctx));
-    // Match attn_pool_ensure's 12.5% growth margin and fixed allocation slack.
-    const size_t attention_alloc_cells = sat_add(
-        attention_cells, sat_add(attention_cells / 8, static_cast<size_t>(1024)));
-    const size_t attention_workspace = sat_mul(attention_alloc_cells, sizeof(float));
-
-    // F16 KV cache is converted to a reusable FP32 staging pair before the
-    // current CUDA chunked GEMMs. The QK GEMM may also allocate an FP16 mirror
-    // containing both Q and K operands; reserve that even if its threshold is
-    // disabled at runtime so this estimate stays conservative.
-    const size_t kv_cells = sat_mul(static_cast<size_t>(kv_ctx),
-                                    static_cast<size_t>(cfg.kv_dim()));
-    const size_t kv_stage_bytes = sat_mul(sat_mul(kv_cells, 2), sizeof(float));
-    const size_t q_cells = sat_mul(static_cast<size_t>(prefill_T),
-                                   static_cast<size_t>(cfg.q_dim()));
-    const size_t gemm_mirror_elems = sat_add(q_cells, kv_cells);
-    const size_t gemm_mirror_alloc_elems = sat_add(
-        gemm_mirror_elems,
-        sat_add(gemm_mirror_elems / 8, static_cast<size_t>(1024)));
-    const size_t gemm_mirror_bytes = sat_mul(gemm_mirror_alloc_elems, sizeof(u16));
+    // Cached inference prefill now uses tiled online FlashAttention. Its K/V
+    // tiles live in at most 32 KiB of CTA shared memory; it allocates neither a
+    // B*H*Tq*Tk score matrix nor a full FP32 copy of the FP16 KV cache.
+    // The estimates below are global-memory allocations for this inference path.
+    const size_t attention_workspace = 0;
+    const size_t kv_stage_bytes = 0;
+    const size_t gemm_mirror_bytes = 0;
 
     const size_t attention_total_workspace = sat_add(
         sat_add(attention_workspace, kv_stage_bytes), gemm_mirror_bytes);
@@ -98,7 +80,7 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
 
     log_info(strfmt("[mem ] GPU plan: weights %s | fp16 cache %s | activations %s "
                     "(includes Mamba state) | KV %s | CUDA workspaces %s "
-                    "(GEMM %s, MoE %s, Mamba %s, attention scores %s, "
+                    "(GEMM %s, MoE %s, Mamba %s, FlashAttention global scratch %s, "
                     "KV staging %s, GEMM mirror %s) = %s of %s usable VRAM "
                     "(%s free / %s total, %.0f%%)",
                     human_bytes(plan.weights).c_str(),
