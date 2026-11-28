@@ -244,7 +244,7 @@ __global__ void k_mamba_conv1d_channels(const float* __restrict__ in,
         (static_cast<size_t>(b) * C + c) * (K > 1 ? K - 1 : 1);
     float win[K > 1 ? K - 1 : 1];
 
-    if constexpr (K > 1) {
+    if (K > 1) {
         #pragma unroll
         for (int j = 0; j < K - 1; ++j)
             win[j] = conv_state ? conv_state[state_base + j] : 0.0f;
@@ -257,7 +257,7 @@ __global__ void k_mamba_conv1d_channels(const float* __restrict__ in,
     for (int t = 0; t < T; ++t) {
         if (segment_ids) {
             const int curr = segment_ids[static_cast<size_t>(b) * T + t];
-            if constexpr (K > 1) {
+            if (K > 1) {
                 if (t > 0 && curr >= 0 && prev_seg >= 0 && curr != prev_seg) {
                     #pragma unroll
                     for (int j = 0; j < K - 1; ++j) win[j] = 0.0f;
@@ -279,14 +279,14 @@ __global__ void k_mamba_conv1d_channels(const float* __restrict__ in,
         if (raw_out) raw_out[output_idx] = acc;
         out[output_idx] = acc / (1.0f + expf(-acc));
 
-        if constexpr (K > 1) {
+        if (K > 1) {
             #pragma unroll
             for (int j = 0; j + 1 < K - 1; ++j) win[j] = win[j + 1];
-            win[K - 2] = x;
+            win[(K > 1) ? (K - 2) : 0] = x;
         }
     }
 
-    if constexpr (K > 1) {
+    if (K > 1) {
         if (conv_state) {
             #pragma unroll
             for (int j = 0; j < K - 1; ++j)
