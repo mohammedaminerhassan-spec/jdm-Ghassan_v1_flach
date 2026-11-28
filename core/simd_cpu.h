@@ -44,7 +44,7 @@ inline bool avx512_supported() {
         const char* e = std::getenv("GAI_NO_SIMD");
         if (e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y')) return false;
         __builtin_cpu_init();
-        return __builtin_cpu_supports("avx512f");
+        return __builtin_cpu_supports("avx512f") != 0;
     }();
     return v;
 }

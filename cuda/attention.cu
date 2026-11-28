@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cfloat>
 #include <cstdio>
+#include <limits>
 #include <algorithm>
 #include <vector>
 
