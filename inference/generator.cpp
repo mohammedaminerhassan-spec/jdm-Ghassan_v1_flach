@@ -963,6 +963,8 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
             const size_t count = std::min(PREFILL_CHUNK, work.size() - offset);
             std::vector<i32> chunk(work.begin() + offset, work.begin() + offset + count);
             const int global_begin = base + static_cast<int>(offset);
+            const i64 global_end = static_cast<i64>(global_begin) +
+                                  static_cast<i64>(count);
 
             std::vector<int> chunk_override_pos;
             std::vector<float> chunk_override_embeds;
@@ -973,7 +975,7 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
                 for (int i = 0; i < n_override; ++i) {
                     const int global_pos = override_pos[i];
                     if (global_pos < global_begin ||
-                        global_pos >= global_begin + static_cast<int>(count)) continue;
+                        static_cast<i64>(global_pos) >= global_end) continue;
                     chunk_override_pos.push_back(global_pos - global_begin);
                     const float* row = embed_override +
                         static_cast<size_t>(i) * static_cast<size_t>(emb_d);

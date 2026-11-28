@@ -104,10 +104,16 @@ bool PagedKVCache::reserve_tokens(int num_tokens) {
     GAI_CHECK(needed64 <= total_blocks_, "PagedKVCache: required blocks exceed pool capacity");
     const size_t needed = static_cast<size_t>(needed64);
 
+    // Reserve container capacity before acquiring physical blocks, so vector
+    // growth cannot throw after blocks have been removed from the free list.
+    const size_t additional = needed > block_table_.size()
+        ? needed - block_table_.size() : 0;
+    block_table_.reserve(needed);
+
     // Strong failure guarantee: if the pool cannot satisfy the whole request,
     // return all blocks acquired by this call and leave the block table unchanged.
     std::vector<int> acquired;
-    acquired.reserve(needed > block_table_.size() ? needed - block_table_.size() : 0);
+    acquired.reserve(additional);
     while (block_table_.size() + acquired.size() < needed) {
         const int b = allocate_block();
         if (b < 0) {
