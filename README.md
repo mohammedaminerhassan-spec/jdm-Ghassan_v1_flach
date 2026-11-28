@@ -94,7 +94,7 @@ Ghassan v1 Flash is a **6.94-billion parameter hybrid foundation model** designe
 | **Shared Expert Dimension** | 1024 | Invariant syntactic features |
 | **Routed Expert Dimension** | 512 | Domain-specific specialization |
 | **Vocabulary Size ($V$)** | 100,352 | Granite-compatible byte-level BPE |
-| **Native Context Length** | 131,072 tokens | Recurrent state, theoretical limit beyond 1M |
+| **Configured Context** | Loaded from the selected model checkpoint | Training sequence length is configured separately; Kaggle profile starts at 1,024 tokens |
 
 ---
 

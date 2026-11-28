@@ -49,6 +49,8 @@ static void usage() {
     "  --data <dir> --checkpoint-dir <dir> --resume auto|none|<path>\n"
     "  --batch-size --seq-len --grad-accum --max-steps --lr --warmup --seed\n"
     "  --optimizer adamw|lion|muon --scheduler cosine|wsd --ckpt-segments <n>\n"
+    "                         # splits the batch across smaller forward/backward micro-batches\n"
+    "                         # to reduce peak activations; it is not layer recomputation\n"
     "  --ce-chunks <n>        chunked CE row-blocks, 0/1=off (default 4)\n"
     "  --build-shards <dir>   tokenize the .txt documents of <dir> (one per line)\n"
     "                        into the .gbin shards the loader reads, with the\n"

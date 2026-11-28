@@ -1,0 +1,44 @@
+name: CUDA Docker build
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "CMakeLists.txt"
+      - "Dockerfile"
+      - "**.cpp"
+      - "**.h"
+      - "**.cu"
+      - ".github/workflows/cuda-docker-build.yml"
+  push:
+    branches: [main]
+    paths:
+      - "CMakeLists.txt"
+      - "Dockerfile"
+      - "**.cpp"
+      - "**.h"
+      - "**.cu"
+      - ".github/workflows/cuda-docker-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cuda-docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda-t4-docker-build:
+    name: CUDA 12.4 / Tesla T4 (sm_75) Docker build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build C++20 and CUDA image
+        run: |
+          docker build --pull --progress=plain \
+            --build-arg CUDA_ARCHITECTURES=75 \
+            --tag ghassan-ai:ci-${GITHUB_SHA} .
