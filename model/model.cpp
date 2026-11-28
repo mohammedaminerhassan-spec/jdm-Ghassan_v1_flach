@@ -1764,8 +1764,13 @@ size_t Model::estimate_activation_bytes_for(const ModelConfig& cfg, bool fp16_on
     const u64 d   = static_cast<u64>(cfg.hidden_size);
     const u64 qd  = static_cast<u64>(cfg.q_dim());
     const u64 kvd = static_cast<u64>(cfg.kv_dim());
-    const u64 F   = cfg.use_moe ? static_cast<u64>(cfg.moe_top_k) * static_cast<u64>(cfg.moe_expert_dim)
-                                 : static_cast<u64>(cfg.intermediate_size);
+    const u64 dense_F = static_cast<u64>(cfg.intermediate_size);
+    const u64 moe_F = static_cast<u64>(cfg.moe_top_k) *
+                      static_cast<u64>(cfg.moe_expert_dim);
+    // Hybrid configurations may contain both routed-MoE and dense FFN layers.
+    // Reserve for the larger scratch layout rather than assuming every layer
+    // has the same FFN type.
+    const u64 F = (cfg.use_moe && moe_F > dense_F) ? moe_F : dense_F;
     const u64 V   = static_cast<u64>(cfg.vocab_size);
     const u64 L   = static_cast<u64>(cfg.num_layers);
 
