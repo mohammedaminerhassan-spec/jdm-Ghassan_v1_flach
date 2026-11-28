@@ -219,6 +219,8 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     }
     if (c.get_bool("training.activation_checkpointing", false)) {
         t.activation_checkpointing = true;
+        log_warn("[train] training.activation_checkpointing is a legacy name for batch micro-batching; "
+                 "it does not recompute layer activations.");
         t.ckpt_segments = static_cast<int>(c.get_int("training.ckpt_segments", 2));
         if (t.ckpt_segments < 1) t.ckpt_segments = 1;
         if (t.ckpt_segments > 8) t.ckpt_segments = 8;
@@ -730,7 +732,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
     dev_segments_ = Tensor::empty({static_cast<i64>(cfg_.batch_size) * cfg_.seq_len}, DType::I32, model_.device());
 
     if (cfg_.activation_checkpointing && !use_ckpt_) {
-        log_warn("[ckpt-act] activation_checkpointing on but ckpt_segments<=1: no effect "
+        log_warn("[microbatch] batch splitting is enabled but ckpt_segments<=1; no activation-memory reduction "
                  "(set ckpt_segments>=2 to split gradient accumulation)");
     }
     if (use_ckpt_) {
@@ -750,12 +752,12 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
             ckpt_segments_tail_ = Tensor::empty({static_cast<i64>(ckpt_tail_B_) * cfg_.seq_len}, DType::I32, model_.device());
         }
         if (num_segments > 1) {
-            log_info(strfmt("[ckpt-act] ON: micro-batch B=%d split into %d segments of B=%d (peak activations ~1/%d, grads identical)",
+            log_info(strfmt("[microbatch] ON: micro-batch B=%d split into %d segments of B=%d (peak activations ~1/%d, grads identical)",
                             cfg_.batch_size, num_segments, segB, num_segments));
         } else {
-            log_warn("[ckpt-act] activation_checkpointing requested with batch_size=1: "
-                     "batch-dimension micro-batching cannot reduce activations for B=1. "
-                     "Full activations allocated; use batch_size>=2 with ckpt_segments>=2 for activation reduction.");
+            log_warn("[microbatch] batch_size=1 cannot be split across batch rows: "
+                     "activation-memory reduction requires batch_size > 1. "
+                     "full activation buffers are allocated; reduce seq_len or use LoRA/a smaller model.");
         }
     }
 

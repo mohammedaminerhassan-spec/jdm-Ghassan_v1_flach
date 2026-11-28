@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cfloat>
 #include <cstdio>
+#include <limits>
 #include <algorithm>
 #include <vector>
 
@@ -19,6 +20,12 @@ namespace cuda_ops {
 
 static constexpr int WARP_A = 32;
 static constexpr int MAX_HD  = 128;
+
+// One warp owns one query row. A CTA reuses each shared-memory K/V tile
+// across 16 query rows and keeps the softmax state/output accumulator in
+// registers. Tile sizes cap dynamic shared memory at 32 KiB for hd <= 128.
+static constexpr int FLASH_Q_TILE = 16;
+static constexpr int FLASH_THREADS = FLASH_Q_TILE * WARP_A;
 
 static constexpr int DECODE_BLOCK = 128;
 static constexpr size_t DECODE_SHMEM_FLOATS = 40;
@@ -33,11 +40,27 @@ static thread_local size_t  g_attn_dsb_cap = 0;
 static thread_local void** g_attn_ptr[3] = {nullptr, nullptr, nullptr};
 static thread_local size_t g_attn_ptr_cap[3] = {0, 0, 0};
 
+static size_t attn_pool_capacity(size_t elems, size_t elem_bytes) {
+    const size_t maxv = (std::numeric_limits<size_t>::max)();
+    const size_t slack = elems / 8;
+    GAI_CHECK(elems <= maxv - 1024 && slack <= maxv - 1024 - elems,
+              "CUDA attention workspace capacity overflow");
+    const size_t want = elems + slack + 1024;
+    GAI_CHECK(elem_bytes == 0 || want <= maxv / elem_bytes,
+              "CUDA attention workspace byte-size overflow");
+    return want;
+}
+
 static void** attn_ptr_buf(int slot, size_t n) {
+    GAI_CHECK(slot >= 0 && slot < 3, "CUDA attention pointer-pool slot out of range");
     if (n > g_attn_ptr_cap[slot]) {
         if (g_attn_ptr[slot]) CU_CHECK2(cudaFree(g_attn_ptr[slot]));
         g_attn_ptr[slot] = nullptr;
         g_attn_ptr_cap[slot] = 0;
+        const size_t maxv = (std::numeric_limits<size_t>::max)();
+        GAI_CHECK(n <= maxv - 64 &&
+                  n + 64 <= maxv / sizeof(void*),
+                  "CUDA attention pointer-array size overflow");
         const size_t want = n + 64;
         CU_CHECK2(cudaMalloc(&g_attn_ptr[slot], want * sizeof(void*)));
         g_attn_ptr_cap[slot] = want;
@@ -45,11 +68,12 @@ static void** attn_ptr_buf(int slot, size_t n) {
     return g_attn_ptr[slot];
 }
 
-static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems) {    if (mir_elems > g_attn_mir_cap) {
+static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems) {
+    if (mir_elems > g_attn_mir_cap) {
         if (g_attn_mir) CU_CHECK2(cudaFree(g_attn_mir));
         g_attn_mir = nullptr;
         g_attn_mir_cap = 0;
-        size_t want = mir_elems + mir_elems / 8 + 1024;
+        const size_t want = attn_pool_capacity(mir_elems, sizeof(__half));
         CU_CHECK2(cudaMalloc(&g_attn_mir, sizeof(__half) * want));
         g_attn_mir_cap = want;
     }
@@ -57,7 +81,7 @@ static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems
         if (g_attn_exp) CU_CHECK2(cudaFree(g_attn_exp));
         g_attn_exp = nullptr;
         g_attn_exp_cap = 0;
-        size_t want = exp_elems + exp_elems / 8 + 1024;
+        const size_t want = attn_pool_capacity(exp_elems, sizeof(float));
         CU_CHECK2(cudaMalloc(&g_attn_exp, sizeof(float) * want));
         g_attn_exp_cap = want;
     }
@@ -65,11 +89,12 @@ static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems
         if (g_attn_dsb) CU_CHECK2(cudaFree(g_attn_dsb));
         g_attn_dsb = nullptr;
         g_attn_dsb_cap = 0;
-        size_t want = ds_elems + ds_elems / 8 + 1024;
+        const size_t want = attn_pool_capacity(ds_elems, sizeof(float));
         CU_CHECK2(cudaMalloc(&g_attn_dsb, sizeof(float) * want));
         g_attn_dsb_cap = want;
     }
 }
+
 
 void attn_free_pool() {
     if (g_attn_mir) { CU_CHECK2(cudaFree(g_attn_mir)); g_attn_mir = nullptr; }
@@ -277,6 +302,137 @@ __global__ void k_attn_softmax_fwd(float* __restrict__ P, const i32* __restrict_
     for (int j = t + 1 + lane; j < T; j += blockDim.x) row[j] = 0.0f;
 }
 
+
+
+template<int KV_TILE>
+__global__ void k_attn_flash_tiled(const float* __restrict__ q,
+                                   const void* __restrict__ k,
+                                   const void* __restrict__ v,
+                                   bool kv_fp16, float* __restrict__ out,
+                                   int Tq, int Tk, int H, int KV, int hd,
+                                   int q_pos_offset, float scale, int window) {
+    const int b = static_cast<int>(blockIdx.z);
+    const int h = static_cast<int>(blockIdx.y);
+    const int q_begin = static_cast<int>(blockIdx.x) * FLASH_Q_TILE;
+    const int warp = static_cast<int>(threadIdx.x) / WARP_A;
+    const int lane = static_cast<int>(threadIdx.x) & (WARP_A - 1);
+    const int q_local = q_begin + warp;
+    const bool valid_q = q_local < Tq;
+    const int kvh = h / (H / KV);
+    const int q_abs = valid_q ? q_pos_offset + q_local : 0;
+
+    float qv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -CUDART_INF_F;
+    float running_sum = 0.0f;
+
+    if (valid_q) {
+        const size_t q_base =
+            ((static_cast<size_t>(b) * Tq + q_local) * H + h) * hd;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int d = lane + i * WARP_A;
+            if (d < hd) qv[i] = q[q_base + static_cast<size_t>(d)];
+        }
+    }
+
+    const int q_count = min(FLASH_Q_TILE, Tq - q_begin);
+    const int first_q_abs = q_pos_offset + q_begin;
+    const int last_q_abs = first_q_abs + q_count - 1;
+    const int key_begin = (window > 0)
+        ? max(0, first_q_abs - window + 1) : 0;
+    const int key_end = last_q_abs + 1;
+
+    const size_t tile_elems = static_cast<size_t>(KV_TILE) * hd;
+    extern __shared__ float tile[];
+    float* tile_k = tile;
+    float* tile_v = tile + tile_elems;
+    const float* k32 = static_cast<const float*>(k);
+    const float* v32 = static_cast<const float*>(v);
+    const __half* k16 = reinterpret_cast<const __half*>(k);
+    const __half* v16 = reinterpret_cast<const __half*>(v);
+
+    // Walk K/V in fixed-size tiles. Only this tile is resident in shared
+    // memory; no [Tq,Tk] score matrix or full FP32 KV conversion is created.
+    for (int tile_base = key_begin; tile_base < key_end;) {
+        const int tile_count = min(KV_TILE, key_end - tile_base);
+        for (size_t idx = threadIdx.x; idx < tile_elems; idx += blockDim.x) {
+            const int token_in_tile = static_cast<int>(idx / hd);
+            const int d = static_cast<int>(idx % hd);
+            float kval = 0.0f;
+            float vval = 0.0f;
+            if (token_in_tile < tile_count) {
+                const int key_pos = tile_base + token_in_tile;
+                const size_t offset =
+                    ((static_cast<size_t>(b) * Tk + key_pos) * KV + kvh) * hd + d;
+                if (kv_fp16) {
+                    kval = __half2float(k16[offset]);
+                    vval = __half2float(v16[offset]);
+                } else {
+                    kval = k32[offset];
+                    vval = v32[offset];
+                }
+            }
+            tile_k[idx] = kval;
+            tile_v[idx] = vval;
+        }
+        __syncthreads();
+
+        if (valid_q) {
+            const int row_key_begin = (window > 0)
+                ? max(0, q_abs - window + 1) : 0;
+            const int row_tile_begin = max(tile_base, row_key_begin);
+            const int row_tile_end = min(tile_base + tile_count, q_abs + 1);
+
+            for (int key_pos = row_tile_begin; key_pos < row_tile_end; ++key_pos) {
+                const int kt = key_pos - tile_base;
+                const size_t kv_row = static_cast<size_t>(kt) * hd;
+
+                float dot = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int d = lane + i * WARP_A;
+                    if (d < hd) dot += qv[i] * tile_k[kv_row + d];
+                }
+                #pragma unroll
+                for (int offset = WARP_A / 2; offset > 0; offset >>= 1)
+                    dot += __shfl_down_sync(0xffffffffu, dot, offset);
+                const float score =
+                    __shfl_sync(0xffffffffu, dot, 0) * scale;
+
+                // Numerically stable online softmax update:
+                // m' = max(m, score), l' = l*alpha + beta,
+                // O' = O*alpha + beta*V.
+                const float next_max = fmaxf(running_max, score);
+                const float alpha = (running_sum > 0.0f)
+                    ? __expf(running_max - next_max) : 0.0f;
+                const float beta = __expf(score - next_max);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int d = lane + i * WARP_A;
+                    if (d < hd)
+                        accum[i] = accum[i] * alpha + beta * tile_v[kv_row + d];
+                }
+                running_sum = running_sum * alpha + beta;
+                running_max = next_max;
+            }
+        }
+        __syncthreads();
+        tile_base += tile_count;
+    }
+
+    if (valid_q) {
+        const size_t out_base =
+            ((static_cast<size_t>(b) * Tq + q_local) * H + h) * hd;
+        const float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int d = lane + i * WARP_A;
+            if (d < hd) out[out_base + static_cast<size_t>(d)] = accum[i] * inv_sum;
+        }
+    }
+}
+
 __global__ void k_attn_ds(float* __restrict__ dP, const float* __restrict__ P,
                           int T, int H, float scale) {
     const int t = blockIdx.x;
@@ -326,6 +482,59 @@ __global__ void k_attn_group_reduce(const float* __restrict__ big, float* __rest
         }
         srow[c] += a;
     }
+}
+
+void attention_forward_kv_ex(const float* q, const void* k, const void* v,
+                             bool kv_fp16, float* out, int B, int Tq, int Tk,
+                             int H, int KV, int hd, int q_pos_offset,
+                             float scale, int window) {
+    if (B <= 0 || Tq <= 0) return;
+    GAI_CHECK(q && k && v && out, "CUDA attention_forward_kv_ex: null tensor");
+    GAI_CHECK(Tk > 0 && H > 0 && KV > 0 && H % KV == 0 &&
+              hd > 0 && hd <= MAX_HD,
+              "CUDA attention_forward_kv_ex: invalid attention geometry");
+    GAI_CHECK(q_pos_offset >= 0 && q_pos_offset <= Tk &&
+              Tq <= Tk - q_pos_offset,
+              "CUDA attention_forward_kv_ex: query positions exceed KV length");
+    GAI_CHECK(Tq <= 65535 && H <= 65535 && B <= 65535,
+              "CUDA attention_forward_kv_ex: grid dimensions out of range");
+
+    const size_t maxv = (std::numeric_limits<size_t>::max)();
+    auto checked_mul = [&](size_t a, size_t b) -> size_t {
+        GAI_CHECK(b == 0 || a <= maxv / b,
+                  "CUDA attention_forward_kv_ex: tensor element count overflow");
+        return a * b;
+    };
+    const size_t q_elems = checked_mul(
+        checked_mul(checked_mul(static_cast<size_t>(B), static_cast<size_t>(Tq)),
+                    static_cast<size_t>(H)), static_cast<size_t>(hd));
+    const size_t kv_elems = checked_mul(
+        checked_mul(checked_mul(static_cast<size_t>(B), static_cast<size_t>(Tk)),
+                    static_cast<size_t>(KV)), static_cast<size_t>(hd));
+    GAI_CHECK(q_elems <= maxv / sizeof(float) &&
+              kv_elems <= maxv / (kv_fp16 ? sizeof(u16) : sizeof(float)),
+              "CUDA attention_forward_kv_ex: tensor byte-size overflow");
+
+    const unsigned q_blocks = static_cast<unsigned>(
+        (Tq + FLASH_Q_TILE - 1) / FLASH_Q_TILE);
+    const dim3 grid(q_blocks, static_cast<unsigned>(H), static_cast<unsigned>(B));
+
+    // Keep dynamic shared memory <= 32 KiB on SM75. Wider heads use a
+    // smaller K/V tile; narrower heads amortize global loads over 64 keys.
+    if (hd <= 64) {
+        const size_t shared_bytes =
+            2ull * 64ull * static_cast<size_t>(hd) * sizeof(float);
+        k_attn_flash_tiled<64><<<grid, FLASH_THREADS, shared_bytes>>>(
+            q, k, v, kv_fp16, out, Tq, Tk, H, KV, hd,
+            q_pos_offset, scale, window);
+    } else {
+        const size_t shared_bytes =
+            2ull * 32ull * static_cast<size_t>(hd) * sizeof(float);
+        k_attn_flash_tiled<32><<<grid, FLASH_THREADS, shared_bytes>>>(
+            q, k, v, kv_fp16, out, Tq, Tk, H, KV, hd,
+            q_pos_offset, scale, window);
+    }
+    CU_CHECK2(cudaGetLastError());
 }
 
 void attention_forward_ex(const float* q, const float* k, const float* v,

@@ -318,6 +318,10 @@ void attention_forward_ex(Device dev,
                           float* out, float* probs,
                           int B, int T, int H, int KV, int hd, float scale, int window,
                           const i32* segment_ids = nullptr);
+void attention_forward_kv_ex(Device dev, const float* q, const void* k, const void* v,
+                             bool kv_fp16, float* out, int B, int Tq, int Tk,
+                             int H, int KV, int hd, int q_pos_offset,
+                             float scale, int window);
 void attention_backward_ex(Device dev,
                            const float* q, const float* k, const float* v,
                            const float* probs, const float* dout,

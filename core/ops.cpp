@@ -813,6 +813,21 @@ void attention_forward_ex(Device dev,
                               segment_ids);
 }
 
+void attention_forward_kv_ex(Device dev, const float* q, const void* k, const void* v,
+                              bool kv_fp16, float* out, int B, int Tq, int Tk,
+                              int H, int KV, int hd, int q_pos_offset,
+                              float scale, int window) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::attention_forward_kv_ex(q, k, v, kv_fp16, out, B, Tq, Tk,
+                                          H, KV, hd, q_pos_offset, scale, window);
+        return;
+    }
+#endif
+    cpu::attention_forward_kv_ex(q, k, v, kv_fp16, out, B, Tq, Tk,
+                                 H, KV, hd, q_pos_offset, scale, window);
+}
+
 void attention_backward_ex(Device dev,
                            const float* q, const float* k, const float* v,
                            const float* probs, const float* dout,

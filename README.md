@@ -9,13 +9,10 @@
 [![CUDA Native](https://img.shields.io/badge/CUDA-12.4%20Native-76B900?style=flat-square&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20%20Standard-00599C?style=flat-square&logo=cplusplus&logoColor=white)](https://isocpp.org/)
 [![License Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
-[![ROCm HIP](https://img.shields.io/badge/ROCm-HIP-red?style=flat-square)](https://rocm.docs.amd.com/)
-[![Intel SYCL](https://img.shields.io/badge/Intel-oneAPI%2FSYCL-blue?style=flat-square)](https://www.intel.com/content/www/us/en/developer/tools/oneapi/overview.html)
-[![OpenXLA TPU](https://img.shields.io/badge/Google-OpenXLA%2FTPU-yellow?style=flat-square)](https://openxla.org/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](Dockerfile)
 [![CMake](https://img.shields.io/badge/Build-CMake-lightgrey.svg)](CMakeLists.txt)
 
-*Zero Python runtime dependency. Maximum performance on NVIDIA GPUs, AMD GPUs, Intel GPUs, TPUs, and CPUs through AVX-512 / AVX2 vectorization.*
+*Zero Python runtime dependency. The current model execution paths are CPU and NVIDIA CUDA; optional HIP, SYCL, and XLA adapters are experimental and are not yet wired into the core Model device dispatcher.*
 
 </div>
 
@@ -94,7 +91,8 @@ Ghassan v1 Flash is a **6.94-billion parameter hybrid foundation model** designe
 | **Shared Expert Dimension** | 1024 | Invariant syntactic features |
 | **Routed Expert Dimension** | 512 | Domain-specific specialization |
 | **Vocabulary Size ($V$)** | 100,352 | Granite-compatible byte-level BPE |
-| **Native Context Length** | 131,072 tokens | Recurrent state, theoretical limit beyond 1M |
+| **Default Inference Context** | min(checkpoint limit, 4,096 tokens) | Override with --ctx up to the checkpoint limit; a larger setting does not itself create long-context capability |
+| **Training Sequence Length** | Trainer default: 1,024 tokens | On 16 GB T4, full fine-tuning above 800M parameters is guarded to batch=1 and seq_len<=512; use LoRA for larger runs and check the memory estimate |
 
 ---
 
@@ -235,7 +233,7 @@ Mixed-precision training uses dynamic loss scaling $\mathrm{scale} = 1 / (N_{tok
 
 Arithmetic intensity determines kernel design. A large matrix multiplication performs hundreds of operations per byte loaded and is compute-bound, so tensor-core tiling wins. A single-token matrix-vector product performs only a couple of operations per byte and is memory-bound, so the kernel minimizes traffic and fuses operations. The four-bit batched path raises intensity by reusing each dequantized weight across several tokens.
 
-The engine pre-allocates device and host arenas so that steady-state generation performs no runtime allocation. A pooling allocator recycles memory through size classes, and activation checkpointing trades recomputation for capacity in constrained training.
+The engine reuses device and host workspaces to reduce steady-state allocation. The legacy `training.activation_checkpointing` option currently splits a batch into smaller micro-batches; it does **not** recompute transformer layers. It reduces activation peak only when batch_size is greater than one.
 
 ### Warp-Level Execution
 
@@ -249,31 +247,23 @@ On a 70-watt accelerator, sustained throughput sits below the theoretical peak b
 
 ## Hardware Backends
 
-The engine exposes a common device abstraction and dispatches to the backend appropriate for the target. Maturity differs between backends, and that distinction is stated explicitly here.
+The core `Model` and `Generator` execution dispatcher currently supports CPU and NVIDIA CUDA. Separate HIP, SYCL, and XLA adapter sources/options exist, but they are experimental and are not complete runtime backends in the core device path.
 
 | Backend | Vendor | Compute path | Status |
 | :--- | :--- | :--- | :--- |
-| CUDA | NVIDIA | Custom kernels + cuBLAS, tensor cores, CUDA graphs, NCCL | Production, validated |
-| HIP / ROCm | AMD | hipBLAS GEMM, 64-lane wavefront flash attention | Implemented, not numerically validated here |
-| SYCL / oneAPI | Intel | oneMKL GEMM, tiled flash attention, fused gated FFN | Implemented, not numerically validated here |
-| XLA / PjRt | Google | HLO dot and custom-call attention, CPU/GPU/TPU targets | Interface and program generation present; runtime execution pending external library |
-| CPU | Any x86-64 | AVX2/AVX-512 SIMD GEMM, OpenMP, scalar fallbacks | Complete, used as parity baseline |
+| CUDA | NVIDIA | Custom kernels + cuBLAS, tensor cores, CUDA graphs, NCCL (when available) | Primary GPU execution path; runtime correctness/performance must be checked on the target GPU |
+| CPU | x86-64 | SIMD GEMM, OpenMP, scalar fallbacks | Supported execution path |
+| HIP / ROCm | AMD | Separate adapter and build-probe sources | Experimental; not wired into the core Model dispatcher |
+| SYCL / oneAPI | Intel | Separate adapter and build-probe sources | Experimental; not wired into the core Model dispatcher |
+| XLA / PjRt | Google | Interface/program-generation prototype | Runtime execution not implemented |
 
 ### NVIDIA CUDA
 
 The production path contains custom kernels for attention, mixture of experts, state-space scanning, normalization, activations, quantization, sampling, and fused decode, together with direct vendor matrix-library calls. It supports mixed precision through tensor cores, device-side key-value caching, CUDA graphs for launch-overhead removal in steady-state decode, an asynchronous stream-aware memory pool, and multi-GPU collectives. Architectures from Turing onward are targeted.
 
-### AMD ROCm and HIP
+### Experimental non-CUDA adapters
 
-The AMD path provides device allocation, copies, independent single- and half-precision matrix multiplications, and a flash-attention kernel written for the wavefront model. The critical hardware difference is wavefront width: AMD wavefronts contain sixty-four lanes where NVIDIA warps contain thirty-two, so reduction strides derive from a backend-specific constant rather than a hard-coded value.
-
-### Intel oneAPI and SYCL
-
-The Intel path selects a graphics device at initialization and falls back to a central processor when none is present. Matrix operations route through the oneAPI math kernel library with half-precision inputs accumulating in single precision. A tiled flash-attention kernel is expressed with SYCL nd-range constructs, mapping one work-group to a batch-head pair.
-
-### Google XLA and Tensor Processing Units
-
-This backend defines the interface for compiling the forward computation into an accelerated linear algebra program that can target central processors, graphics processors, or tensor processing units. It generates dot and custom-call attention programs in the high-level optimizer representation and provides buffer and executable abstractions including ahead-of-time serialization. In the current tree the runtime execution calls are stubs: the interface and program generation exist, but execution requires linking the external runtime library.
+HIP and SYCL source files contain backend experiments, while XLA contains interface/program-generation scaffolding. They are not currently selected by the core model runtime and should not be treated as supported inference backends. The CPU and NVIDIA CUDA paths are the execution paths to use today.
 
 ### Central Processor Path
 
@@ -283,21 +273,11 @@ The CPU backend is complete and used for validation. It provides SIMD matrix mul
 
 ## Performance Characteristics
 
-Measured figures depend on hardware, batch size, sequence length, and precision. The following describe the operating envelope on a sixteen-gigabyte Turing-class accelerator and on a high-core-count central processor.
+Performance depends on the exact checkpoint, quantization, context, batch size, CUDA version, and accelerator. Do not treat a single throughput figure as a hardware-independent guarantee.
 
-| Configuration | Prefill | Decode | Memory |
-| :--- | :--- | :--- | :--- |
-| 7B, FP16, batch 1 | ~12 ms/token | ~9 ms/token | ~14.2 GB |
-| 7B, Q4_K, batch 1 | — | ~5 ms/token | ~4.7 GB |
-| Hybrid Mamba-7B | — | ~3 ms/token | ~13.5 GB |
-| MoE 8×7B, grouped path | 34.2 ms/token | 28.7 ms/token | — |
-| MoE 8×7B, device-side path | 22.8 ms/token | 16.3 ms/token | — |
+Use the built-in `bench` command on the target Kaggle GPU and record the commit, model, precision, context, prompt length, generated-token count, prefill tokens/second, decode tokens/second, and peak VRAM. Prefill throughput and decode throughput are separate metrics: cached chunked prefill improves prompt ingestion, while decode remains a one-token-at-a-time workload.
 
-The hybrid recurrent model decodes in roughly three milliseconds per token because the state-space layers perform a fixed-size state update rather than rereading a growing key-value cache. This is the clearest advantage of the hybrid topology at long context.
-
-The mixture-of-experts path improved from 28.7 to 16.3 milliseconds per token in decode, about a factor of 1.8, when the grouped host-synchronized implementation was replaced by the device-side slot-parallel implementation. Prefill improved by about 1.5.
-
-On a sixty-four-core central processor, four-bit decode of a seven-billion-parameter model takes roughly forty milliseconds per token. Converting weights once and calling the SIMD matrix routine instead of converting per element accounts for most of the gain over a naive implementation.
+The default inference context is capped at 4,096 tokens (or the checkpoint's smaller limit). Longer prompts are processed in 512-token query chunks against the accumulated KV cache; the CUDA path currently uses a bounded chunk-by-prefix score workspace. This is not yet a tiled FlashAttention kernel, and no throughput improvement should be claimed until it is benchmarked on the target GPU.
 
 Complexity is the durable result rather than any single number: state-space layers are linear in sequence length and constant in memory per token; attention anchors are quadratic but occur only four times; sparse experts make active compute a fraction of total parameters. The combination allows long-context operation on modest hardware.
 
@@ -317,13 +297,13 @@ Determinism is preserved for fixed seeds. Sampling uses a device-accelerated pat
 
 Device errors are checked at kernel boundaries through explicit status macros in each backend, and launch failures are not silently cleared. Resources follow ownership semantics: device handles, library handles, allocation arenas, and compiled programs are released in cleanup routines. Invariant checks abort with a file and line reference when a precondition is violated.
 
-The vision path keeps patch encoding on host arenas and moves projection weights to the target device only after encoding completes, which prevents illegal device-pointer dereferences in multimodal inputs. Video frame indices are clamped to the embedding table to prevent out-of-range reads.
+VisionTower can move its weights and encoding operations to CPU or CUDA; image pixels are loaded on the host and copied to the selected device when needed. The current vision trainer updates the multimodal projector and optionally the LLM, but it does not backpropagate through the ViT/VisionTower weights. Video is currently encoded frame-by-frame with time embeddings; a learned cross-frame temporal transformer is not yet implemented.
 
 ---
 
 ## Current Boundaries
 
-The CUDA path is the validated production backend. The AMD and Intel paths are implemented and compile behind their respective options but have not been numerically validated here. The XLA path exposes its interface and program generation while runtime execution remains pending external integration. Eight-bit floating point and micro-four-bit formats are not yet implemented. Speculative decoding is not yet integrated. Very long contexts beyond the native window require a scaling method not yet part of the engine. Four-bit quantization is inference-only.
+The primary GPU implementation is NVIDIA CUDA; the CPU path is the non-CUDA execution path. HIP/SYCL adapters are experimental and not connected to the core model dispatcher, while XLA runtime execution remains unimplemented. CUDA kernels require runtime validation on the target accelerator; a successful offline Docker build only proves compilation. The current default inference context is capped at 4,096 tokens even when a checkpoint advertises a larger limit. Eight-bit floating point, micro-four-bit formats, and speculative decoding are not implemented. Four-bit quantization is inference-only.
 
 These boundaries are stated so the architecture can be judged on what it does today, not on what the interface promises.
 

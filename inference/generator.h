@@ -93,7 +93,9 @@ private:
     void forward_prefill(const std::vector<i32>& tokens, int start_pos,
                            const float* embed_override = nullptr,
                            const int* override_pos = nullptr,
-                           int n_override = 0);
+                           int n_override = 0,
+                           int position_offset = 0,
+                           bool produce_logits = true);
 
     static constexpr int FAST_TOPK_MAX = 128;
     static constexpr int FAST_HIST_MAX = 2048;
@@ -144,8 +146,6 @@ private:
     std::vector<std::vector<float>> mamba_host_a_log_;
     std::vector<std::vector<float>> mamba_host_D_;
     std::vector<std::vector<float>> mamba_host_norm_;
-    std::vector<float> kv_stage_k_;
-    std::vector<float> kv_stage_v_;
 
     std::vector<float> logits_host_;
     std::vector<i32>   history_;

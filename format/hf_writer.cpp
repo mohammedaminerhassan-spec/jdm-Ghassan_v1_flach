@@ -509,6 +509,14 @@ bool export_model_safetensors(const std::string& dir, Model& model,
     ec.clear();
     fs::create_directories(stage, ec);
     GAI_CHECK(!ec, "cannot create export staging directory: " + ec.message());
+    struct StageDirectoryCleanup {
+        fs::path path;
+        ~StageDirectoryCleanup() {
+            std::error_code cleanup_ec;
+            fs::remove_all(path, cleanup_ec);
+        }
+    };
+    [[maybe_unused]] const StageDirectoryCleanup stage_cleanup{stage};
     auto publish_cleanup = [&]() { std::error_code c; fs::remove_all(stage, c); };
 
     const std::vector<ExportTensor> plan = plan_safetensors_export(model, dtype);
@@ -536,17 +544,6 @@ bool export_model_safetensors(const std::string& dir, Model& model,
         if (!cur.tensors.empty()) shards.push_back(cur);
     }
     const size_t nshards = shards.size();
-
-    {
-        std::error_code rm_ec;
-        fs::remove(fs::path(dir) / "model.safetensors", rm_ec);
-        fs::remove(fs::path(stage) / "model.safetensors.index.json", rm_ec);
-        for (const auto& entry : fs::directory_iterator(dir, rm_ec)) {
-            const std::string n = entry.path().filename().string();
-            if (n.rfind("model-", 0) == 0 && n.find(".safetensors") != std::string::npos)
-                fs::remove(entry.path(), rm_ec);
-        }
-    }
 
     std::map<std::string, std::string> weight_map;
     uint64_t total_size = 0;

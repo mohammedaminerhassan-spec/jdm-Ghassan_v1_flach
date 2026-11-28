@@ -7,16 +7,85 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <filesystem>
 #include <memory>
+#include <numeric>
+#include <random>
 #include <vector>
 
 namespace gai {
+
+namespace fs = std::filesystem;
+
+namespace {
+
+class FrozenModelGradGuard {
+public:
+    explicit FrozenModelGradGuard(Model& model)
+        : model_(model), was_grad_enabled_(model.grad_enabled()) {
+        const auto& params = model_.parameters();
+        params_.reserve(params.size());
+        was_frozen_.reserve(params.size());
+        saved_grads_.reserve(params.size());
+        for (Parameter* p : params) {
+            params_.push_back(p);
+            was_frozen_.push_back(p->frozen);
+            saved_grads_.push_back(std::move(p->g));
+            p->frozen = true;
+        }
+    }
+
+    FrozenModelGradGuard(const FrozenModelGradGuard&) = delete;
+    FrozenModelGradGuard& operator=(const FrozenModelGradGuard&) = delete;
+
+    ~FrozenModelGradGuard() { restore(); }
+
+private:
+    void restore() noexcept {
+        if (restored_) return;
+        try {
+            model_.enable_grad(false);
+        } catch (...) {
+            // Continue restoring flags/gradient ownership even during stack unwinding.
+        }
+        for (size_t i = 0; i < params_.size(); ++i) {
+            params_[i]->frozen = was_frozen_[i];
+            params_[i]->g = std::move(saved_grads_[i]);
+        }
+        if (was_grad_enabled_) {
+            try {
+                model_.enable_grad(true);
+            } catch (...) {
+                // The previous state is best-effort restored; never throw from a destructor.
+            }
+        }
+        restored_ = true;
+    }
+
+    Model& model_;
+    bool was_grad_enabled_ = false;
+    bool restored_ = false;
+    std::vector<Parameter*> params_;
+    std::vector<bool> was_frozen_;
+    std::vector<Tensor> saved_grads_;
+};
+
+} // namespace
 
 std::vector<VisionSample> load_vision_jsonl(const std::string& path) {
     std::ifstream f(path);
     GAI_CHECK(f.good(), "cannot open vision JSONL dataset: " + path);
 
     std::vector<VisionSample> samples;
+    const fs::path dataset_dir = fs::absolute(fs::path(path)).parent_path();
+    auto resolve_media_path = [&](std::string& media_path) {
+        if (media_path.empty()) return;
+        fs::path resolved(media_path);
+        if (resolved.is_relative()) resolved = dataset_dir / resolved;
+        std::error_code ec;
+        const fs::path absolute_path = fs::absolute(resolved, ec);
+        if (!ec) media_path = absolute_path.lexically_normal().string();
+    };
     std::string line;
     int line_no = 0;
     while (std::getline(f, line)) {
@@ -36,6 +105,11 @@ std::vector<VisionSample> load_vision_jsonl(const std::string& path) {
         VisionSample s;
         if (j.has("image")) s.image_path = j.at("image").as_string();
         if (j.has("video")) s.video_path = j.at("video").as_string();
+        resolve_media_path(s.image_path);
+        resolve_media_path(s.video_path);
+        GAI_CHECK(s.image_path.empty() != s.video_path.empty(),
+                  strfmt("vision JSONL line %d must specify exactly one of 'image' or 'video'",
+                         line_no));
 
         if (j.has("prompt"))        s.prompt = j.at("prompt").as_string();
         else if (j.has("question")) s.prompt = j.at("question").as_string();
@@ -75,6 +149,12 @@ VisionTrainStats run_vision_training(Model& model,
 
     const int inter = (vcfg.proj_hidden > 0) ? vcfg.proj_hidden : vcfg.out_dim;
 
+    // Projector-only mode must not allocate gradients for billions of frozen LLM weights.
+    // The language-model backward pass still propagates d(visual embeddings) with null dW pointers.
+    std::unique_ptr<FrozenModelGradGuard> frozen_llm;
+    if (!cfg.train_llm) {
+        frozen_llm = std::make_unique<FrozenModelGradGuard>(model);
+    }
     model.enable_grad(true);
 
     std::unique_ptr<AdamW> llm_opt;
@@ -99,6 +179,13 @@ VisionTrainStats run_vision_training(Model& model,
 
     Activations act = model.make_activations(1, cfg.seq_len, true);
 
+    // Shuffle each pass deterministically so a short run does not only see the
+    // first N rows of a large JSONL file. cfg.seed is part of the public config.
+    std::mt19937_64 sample_rng(cfg.seed);
+    std::vector<size_t> sample_order(samples.size());
+    std::iota(sample_order.begin(), sample_order.end(), size_t{0});
+    std::shuffle(sample_order.begin(), sample_order.end(), sample_rng);
+
     const i32 pad_id = std::max<i32>(0, tok.pad_id());
     const i32 bos_id = tok.bos_id();
     const i32 eos_id = tok.eos_id();
@@ -115,7 +202,11 @@ VisionTrainStats run_vision_training(Model& model,
     auto t0 = std::chrono::steady_clock::now();
 
     for (int step = 1; step <= cfg.max_steps; ++step) {
-        const VisionSample& s = samples[static_cast<size_t>((step - 1) % static_cast<int>(samples.size()) )];
+        const size_t epoch_pos = static_cast<size_t>(step - 1) % sample_order.size();
+        if (step > 1 && epoch_pos == 0) {
+            std::shuffle(sample_order.begin(), sample_order.end(), sample_rng);
+        }
+        const VisionSample& s = samples[sample_order[epoch_pos]];
 
         Tensor pooled;
         if (!s.video_path.empty()) {

@@ -87,6 +87,13 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
         cache_.set_pinned_prefix(0);
 
     const int d = c.hidden_size;
+    bool has_moe_layer = false;
+    bool has_dense_layer = false;
+    for (int l = 0; l < c.num_layers; ++l) {
+        if (model_.layer(l).has_moe()) has_moe_layer = true;
+        else has_dense_layer = true;
+    }
+
     x_          = Tensor::empty({d}, DType::F32, dev);
     xb_         = Tensor::empty({d}, DType::F32, dev);
     q_          = Tensor::empty({c.q_dim()}, DType::F32, dev);
@@ -97,10 +104,12 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     }
     attn_       = Tensor::empty({c.q_dim()}, DType::F32, dev);
     proj_       = Tensor::empty({d}, DType::F32, dev);
-    gate_       = Tensor::empty({c.intermediate_size}, DType::F32, dev);
-    up_         = Tensor::empty({c.intermediate_size}, DType::F32, dev);
-    act_        = Tensor::empty({c.intermediate_size}, DType::F32, dev);
-    if (c.use_moe) {
+    if (has_dense_layer) {
+        gate_ = Tensor::empty({c.intermediate_size}, DType::F32, dev);
+        up_   = Tensor::empty({c.intermediate_size}, DType::F32, dev);
+        act_  = Tensor::empty({c.intermediate_size}, DType::F32, dev);
+    }
+    if (has_moe_layer) {
         const i64 nke = static_cast<i64>(c.moe_top_k) * c.moe_expert_dim;
         moe_gate_ = Tensor::empty({nke}, DType::F32, dev);
         moe_up_   = Tensor::empty({nke}, DType::F32, dev);
@@ -146,16 +155,17 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
             c.arch == ModelConfig::ArchGranite &&
             std::any_of(c.layer_types.begin(), c.layer_types.end(),
                         [](int k) { return k == 0; });
-        if (has_mamba) {
-            mamba_proj_dev_   = Tensor::empty({(i64)proj}, DType::F32, dev);
-            mamba_norm_dev_   = Tensor::empty({(i64)d_inner}, DType::F32, dev);
+        const bool cuda_step_native = (dev == Device::CUDA && c.mamba_n_groups == 1);
+        if (has_mamba && !cuda_step_native) {
+            // These staging tensors/vectors are used only by the CPU recurrent-step
+            // fallback. Native CUDA decode consumes device weights and recurrent state.
+            mamba_proj_dev_   = Tensor::empty({static_cast<i64>(proj)}, DType::F32, dev);
+            mamba_norm_dev_   = Tensor::empty({static_cast<i64>(d_inner)}, DType::F32, dev);
             mamba_proj_host_.assign(static_cast<size_t>(proj), 0.0f);
             mamba_normed_host_.assign(static_cast<size_t>(d_inner), 0.0f);
             mamba_bc_out_host_.assign(static_cast<size_t>(conv_dim), 0.0f);
             mamba_y_host_.assign(static_cast<size_t>(d_inner), 0.0f);
         }
-        kv_stage_k_.assign(static_cast<size_t>(c.kv_dim()), 0.0f);
-        kv_stage_v_.assign(static_cast<size_t>(c.kv_dim()), 0.0f);
         for (int l = 0; l < c.num_layers; ++l) {
             const bool is_mamba = (c.arch == ModelConfig::ArchGranite) &&
                                   l < static_cast<int>(c.layer_types.size()) &&
@@ -163,8 +173,13 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
             if (!is_mamba) continue;
             const LayerParams& L = model_.layer(l);
             MambaState st;
-            st.conv_host.assign(static_cast<size_t>(conv_dim) * conv_win, 0.0f);
-            st.ssm_host.assign(static_cast<size_t>(c.mamba_n_heads) * c.mamba_d_head * c.mamba_d_state, 0.0f);
+            if (dev == Device::CPU || !cuda_step_native) {
+                // n_groups != 1 currently uses the CPU recurrent-step fallback even
+                // after a CUDA prefill, so it needs a synchronized host state mirror.
+                st.conv_host.assign(static_cast<size_t>(conv_dim) * conv_win, 0.0f);
+                st.ssm_host.assign(static_cast<size_t>(c.mamba_n_heads) *
+                                   c.mamba_d_head * c.mamba_d_state, 0.0f);
+            }
             if (dev == Device::CUDA) {
                 st.conv_dev = Tensor::zeros({static_cast<i64>(conv_dim) * conv_win},
                                             DType::F32, dev);
@@ -172,12 +187,24 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
                                             c.mamba_d_head * c.mamba_d_state},
                                            DType::F32, dev);
             }
-            mamba_host_conv_w_.push_back(stage(L.mamba_conv_w.w));
-            mamba_host_conv_b_.push_back(stage(L.mamba_conv_b.w));
-            mamba_host_dt_bias_.push_back(stage(L.mamba_dt_bias.w));
-            mamba_host_a_log_.push_back(stage(L.mamba_A_log.w));
-            mamba_host_D_.push_back(stage(L.mamba_D.w));
-            mamba_host_norm_.push_back(stage(L.mamba_norm.w));
+
+            // The native CUDA decode-step kernel currently handles n_groups == 1.
+            // Preserve host mirrors for CPU and the supported CUDA fallback geometry.
+            if (dev == Device::CPU || !cuda_step_native) {
+                mamba_host_conv_w_.push_back(stage(L.mamba_conv_w.w));
+                mamba_host_conv_b_.push_back(stage(L.mamba_conv_b.w));
+                mamba_host_dt_bias_.push_back(stage(L.mamba_dt_bias.w));
+                mamba_host_a_log_.push_back(stage(L.mamba_A_log.w));
+                mamba_host_D_.push_back(stage(L.mamba_D.w));
+                mamba_host_norm_.push_back(stage(L.mamba_norm.w));
+            } else {
+                mamba_host_conv_w_.emplace_back();
+                mamba_host_conv_b_.emplace_back();
+                mamba_host_dt_bias_.emplace_back();
+                mamba_host_a_log_.emplace_back();
+                mamba_host_D_.emplace_back();
+                mamba_host_norm_.emplace_back();
+            }
             mamba_states_.push_back(std::move(st));
         }
         mamba_states_ready_ = !mamba_states_.empty();
@@ -559,17 +586,24 @@ float* Generator::decode_step(i32 token, int position, const float* token_embed)
 void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
                                 const float* embed_override,
                                 const int* override_pos,
-                                int n_override) {
+                                int n_override, int position_offset,
+                                bool produce_logits) {
     GAI_CHECK(model_.device() == expected_device_,
               "model device changed after Generator construction; rebuild the Generator");
 
-    if (tokens.empty() || cache_.length() != 0 || start_pos != 0) {
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            decode_step(tokens[i], start_pos + static_cast<int>(i));
-            push_history(tokens[i]);
-        }
-        return;
-    }
+    if (tokens.empty()) return;
+    GAI_CHECK(start_pos >= 0 && cache_.length() == start_pos,
+              "prefill: start_pos must match the current KV cache length");
+    GAI_CHECK(tokens.size() <= static_cast<size_t>((std::numeric_limits<int>::max)()),
+              "prefill: token chunk exceeds the supported int range");
+    GAI_CHECK(static_cast<i64>(start_pos) + static_cast<i64>(tokens.size()) <=
+                  cache_.capacity(),
+              "prefill: chunk exceeds the KV cache capacity");
+    const i64 first_rope_pos = static_cast<i64>(position_offset) + start_pos;
+    const i64 last_rope_pos = first_rope_pos + static_cast<i64>(tokens.size()) - 1;
+    GAI_CHECK(first_rope_pos >= 0 &&
+              last_rope_pos <= static_cast<i64>((std::numeric_limits<i32>::max)()),
+              "prefill: absolute RoPE position exceeds the supported i32 range");
     const ModelConfig& c = model_.config();
 
     Device dev = model_.device();
@@ -585,7 +619,8 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     Tensor d_ids({P}, DType::I32, dev);
     d_ids.copy_from(ids);
     Tensor pos({P}, DType::I32, Device::CPU);
-    for (int i = 0; i < P; ++i) pos.i32p()[i] = start_pos + i;
+    for (int i = 0; i < P; ++i)
+        pos.i32p()[i] = position_offset + start_pos + i;
     Tensor d_pos({P}, DType::I32, dev);
     d_pos.copy_from(pos);
 
@@ -601,13 +636,28 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     Tensor att({(i64)P * qd}, DType::F32, dev);
     Tensor proj({(i64)P * d}, DType::F32, dev);
 
-    const i64 nke = (i64)c.moe_top_k * c.moe_expert_dim;
-    Tensor mg({(i64)P * nke}, DType::F32, dev);
-    Tensor mu({(i64)P * nke}, DType::F32, dev);
-    Tensor ma({(i64)P * nke}, DType::F32, dev);
-    Tensor gtmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
-    Tensor utmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
-    Tensor atmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
+    bool has_moe_layer = false;
+    bool has_dense_layer = false;
+    for (int l = 0; l < c.num_layers; ++l) {
+        if (model_.layer(l).has_moe()) has_moe_layer = true;
+        else has_dense_layer = true;
+    }
+
+    const i64 nke = static_cast<i64>(c.moe_top_k) * c.moe_expert_dim;
+    Tensor mg, mu, ma;
+    if (has_moe_layer) {
+        mg = Tensor::empty({static_cast<i64>(P) * nke}, DType::F32, dev);
+        mu = Tensor::empty({static_cast<i64>(P) * nke}, DType::F32, dev);
+        ma = Tensor::empty({static_cast<i64>(P) * nke}, DType::F32, dev);
+    }
+
+    Tensor gtmp, utmp, atmp;
+    if (has_dense_layer) {
+        const i64 dense_elements = static_cast<i64>(P) * c.intermediate_size;
+        gtmp = Tensor::empty({dense_elements}, DType::F32, dev);
+        utmp = Tensor::empty({dense_elements}, DType::F32, dev);
+        atmp = Tensor::empty({dense_elements}, DType::F32, dev);
+    }
 
     if (is_half_or_quant(model_.tok_embeddings().w))
         ops::embedding_forward_half(dev, d_ids.i32p(), weight16(dev, model_.tok_embeddings().w, 0),
@@ -707,10 +757,15 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
                                     nullptr, conv_ptr);
             }
 
-            if (dev == Device::CUDA && st.ssm_dev.defined() && !st.ssm_host.empty()) {
-                device_copy(st.ssm_host.data(), Device::CPU, st.ssm_dev.f32(), dev, sizeof(float) * st.ssm_host.size());
+            // For n_groups != 1 decode_mamba_layer uses the CPU recurrent-step
+            // fallback; synchronize the CUDA prefill state once before that fallback.
+            // The common n_groups == 1 path keeps all recurrent state device-resident.
+            if (dev == Device::CUDA && c.mamba_n_groups != 1 && st.ssm_dev.defined()) {
+                device_copy(st.ssm_host.data(), Device::CPU, st.ssm_dev.f32(),
+                            dev, sizeof(float) * st.ssm_host.size());
                 if (st.conv_dev.defined() && !st.conv_host.empty()) {
-                    device_copy(st.conv_host.data(), Device::CPU, st.conv_dev.f32(), dev, sizeof(float) * st.conv_host.size());
+                    device_copy(st.conv_host.data(), Device::CPU, st.conv_dev.f32(),
+                                dev, sizeof(float) * st.conv_host.size());
                 }
             }
 
@@ -797,14 +852,22 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
 
         if (cache_.fp16()) {
             const size_t n = static_cast<size_t>(P) * static_cast<size_t>(kvd);
-            ops::convert_f32_to_f16(dev, kp, cache_.k_f16(l), static_cast<i64>(n));
-            ops::convert_f32_to_f16(dev, vp, cache_.v_f16(l), static_cast<i64>(n));
+            u16* kdst = cache_.k_f16(l) + static_cast<size_t>(start_pos) * kvd;
+            u16* vdst = cache_.v_f16(l) + static_cast<size_t>(start_pos) * kvd;
+            ops::convert_f32_to_f16(dev, kp, kdst, static_cast<i64>(n));
+            ops::convert_f32_to_f16(dev, vp, vdst, static_cast<i64>(n));
+            ops::attention_forward_kv_ex(dev, qp, cache_.k_f16(l), cache_.v_f16(l),
+                                          true, att.f32(), 1, P, start_pos + P,
+                                          H, KV, hd, start_pos, scale, c.sliding_window);
         } else {
-            device_copy(cache_.k(l), dev, kp, dev, sizeof(float) * (size_t)P * kvd);
-            device_copy(cache_.v(l), dev, vp, dev, sizeof(float) * (size_t)P * kvd);
+            float* kdst = cache_.k(l) + static_cast<size_t>(start_pos) * kvd;
+            float* vdst = cache_.v(l) + static_cast<size_t>(start_pos) * kvd;
+            device_copy(kdst, dev, kp, dev, sizeof(float) * (size_t)P * kvd);
+            device_copy(vdst, dev, vp, dev, sizeof(float) * (size_t)P * kvd);
+            ops::attention_forward_kv_ex(dev, qp, cache_.k(l), cache_.v(l),
+                                          false, att.f32(), 1, P, start_pos + P,
+                                          H, KV, hd, start_pos, scale, c.sliding_window);
         }
-        ops::attention_forward_ex(dev, qp, kp, vp, att.f32(), nullptr,
-                                  1, P, H, KV, hd, scale, c.sliding_window);
         linear_param(dev, L.wo.w, att.f32(), proj.f32(), P, qd, d);
         if (c.residual_multiplier != 1.0f)
             ops::scale_inplace(dev, proj.f32(), c.residual_multiplier, (i64)P * d);
@@ -846,19 +909,24 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
             ops::scale_inplace(dev, proj.f32(), c.residual_multiplier, (i64)P * d);
         ops::add_inplace(dev, x.f32(), proj.f32(), (i64)P * d);
     }
-    cache_.set_length(P);
-    ops::rmsnorm_forward(dev, x.f32() + (size_t)(P - 1) * d,
-                         model_.final_norm().w.f32(), hlast_.f32(),
-                         nullptr, 1, d, c.rms_eps);
-    linear_param(dev, model_.lm_head().w, hlast_.f32(),
-                 logits_dev_.f32(), 1, d, c.vocab_size);
-    if (c.logits_scaling != 1.0f)
-        ops::scale_inplace(dev, logits_dev_.f32(), 1.0f / c.logits_scaling, c.vocab_size);
-    device_copy(logits_host_.data(), Device::CPU,
-                logits_dev_.f32(), dev,
-                sizeof(float) * (size_t)c.vocab_size);
-
-    device_copy(x_.f32(), dev, x.f32() + (size_t)(P - 1) * d, dev, sizeof(float) * (size_t)d);
+    cache_.set_length(start_pos + P);
+    // Intermediate prompt chunks only populate the KV/recurrent caches. The
+    // final norm, vocabulary projection, and D2H logits copy are needed once,
+    // after the last chunk, not once per chunk.
+    if (produce_logits) {
+        ops::rmsnorm_forward(dev, x.f32() + (size_t)(P - 1) * d,
+                             model_.final_norm().w.f32(), hlast_.f32(),
+                             nullptr, 1, d, c.rms_eps);
+        linear_param(dev, model_.lm_head().w, hlast_.f32(),
+                     logits_dev_.f32(), 1, d, c.vocab_size);
+        if (c.logits_scaling != 1.0f)
+            ops::scale_inplace(dev, logits_dev_.f32(), 1.0f / c.logits_scaling, c.vocab_size);
+        device_copy(logits_host_.data(), Device::CPU,
+                    logits_dev_.f32(), dev,
+                    sizeof(float) * (size_t)c.vocab_size);
+        device_copy(x_.f32(), dev, x.f32() + (size_t)(P - 1) * d,
+                    dev, sizeof(float) * (size_t)d);
+    }
     for (auto t : tokens) push_history(t);
 }
 
@@ -881,46 +949,59 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
         return nullptr;
     };
     if (start == 0 && tokens.size() > 1) {
+        GAI_CHECK(tokens.size() <= static_cast<size_t>((std::numeric_limits<int>::max)()),
+                  "prefill: prompt exceeds the supported int range");
 
         std::vector<i32> work = tokens;
-        bool truncated = false;
         int drop = 0;
         if (static_cast<int>(work.size()) > max_context_) {
             drop = static_cast<int>(work.size()) - max_context_;
             work.erase(work.begin() + 1, work.begin() + 1 + drop);
             log_warn(strfmt("prefill: prompt truncated by %d tokens", drop));
-            truncated = true;
             processed = static_cast<int>(work.size());
         }
 
-        if (!truncated && front_drop == 0) {
+        const i64 base64 = static_cast<i64>(drop) + static_cast<i64>(front_drop);
+        const i64 last_position = base64 + static_cast<i64>(work.size()) - 1;
+        GAI_CHECK(base64 >= 0 &&
+                  last_position <= static_cast<i64>((std::numeric_limits<i32>::max)()),
+                  "prefill: truncated/front-dropped prompt exceeds the supported i32 RoPE position range");
+        const int base = static_cast<int>(base64);
+        static constexpr size_t PREFILL_CHUNK = 512;
+        for (size_t offset = 0; offset < work.size(); offset += PREFILL_CHUNK) {
+            const size_t count = std::min(PREFILL_CHUNK, work.size() - offset);
+            std::vector<i32> chunk(work.begin() + offset, work.begin() + offset + count);
+            const int global_begin = base + static_cast<int>(offset);
+            const i64 global_end = static_cast<i64>(global_begin) +
+                                  static_cast<i64>(count);
 
-            static constexpr size_t PREFILL_CHUNK = 1024;
-            if (work.size() > PREFILL_CHUNK) {
-                std::vector<i32> head(work.begin(), work.begin() + PREFILL_CHUNK);
-                forward_prefill(head, 0, embed_override, override_pos, n_override);
-                absolute_pos_ = static_cast<int64_t>(head.size());
-                for (size_t i = PREFILL_CHUNK; i < work.size(); ++i) {
-                    const int pos = static_cast<int>(absolute_pos_);
-                    decode_step(work[i], pos, override_for_pos(pos));
-                    ++absolute_pos_;
-                    push_history(work[i]);
+            std::vector<int> chunk_override_pos;
+            std::vector<float> chunk_override_embeds;
+            if (embed_override && override_pos && n_override > 0) {
+                chunk_override_pos.reserve(static_cast<size_t>(n_override));
+                chunk_override_embeds.reserve(static_cast<size_t>(n_override) *
+                                               static_cast<size_t>(emb_d));
+                for (int i = 0; i < n_override; ++i) {
+                    const int global_pos = override_pos[i];
+                    if (global_pos < global_begin ||
+                        static_cast<i64>(global_pos) >= global_end) continue;
+                    chunk_override_pos.push_back(global_pos - global_begin);
+                    const float* row = embed_override +
+                        static_cast<size_t>(i) * static_cast<size_t>(emb_d);
+                    chunk_override_embeds.insert(chunk_override_embeds.end(),
+                                                  row, row + emb_d);
                 }
-            } else {
-                forward_prefill(work, 0, embed_override, override_pos, n_override);
-
-                absolute_pos_ = static_cast<int64_t>(work.size());
             }
-        } else {
-
-            const int base = drop + front_drop;
-            for (size_t i = 0; i < work.size(); ++i) {
-                const int pos = base + static_cast<int>(i);
-                decode_step(work[i], pos, override_for_pos(pos));
-                push_history(work[i]);
-            }
-
-            absolute_pos_ = static_cast<int64_t>(base) + static_cast<int64_t>(work.size());
+            const float* chunk_embeds = chunk_override_embeds.empty()
+                ? nullptr : chunk_override_embeds.data();
+            const int* chunk_positions = chunk_override_pos.empty()
+                ? nullptr : chunk_override_pos.data();
+            const bool last_chunk = offset + count == work.size();
+            forward_prefill(chunk, static_cast<int>(offset), chunk_embeds,
+                            chunk_positions, static_cast<int>(chunk_override_pos.size()),
+                            base, last_chunk);
+            absolute_pos_ = static_cast<int64_t>(base) +
+                            static_cast<int64_t>(offset + count);
         }
     } else {
         for (size_t i = 0; i < tokens.size(); ++i) {

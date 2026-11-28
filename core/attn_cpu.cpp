@@ -1,4 +1,5 @@
 #include "core/ops_cpu.h"
+#include "core/dtype.h"
 #include "core/simd_cpu.h"
 
 #include <algorithm>
@@ -77,6 +78,10 @@ static void flash_attn_head(
                 m_new = std::max(m_new, s_buf[j - jb]);
             }
 
+            // A packed-sequence block can be entirely masked. Skipping it avoids
+            // exp(-inf - -inf), which would otherwise inject NaNs into the output.
+            if (m_new == -std::numeric_limits<float>::infinity()) continue;
+
             // Rescale accumulated output with new max
             if (m_new > m) {
                 const float alpha = std::exp(m - m_new);
@@ -97,6 +102,73 @@ static void flash_attn_head(
         if (lse > 0.f) {
             const float inv_lse = 1.f / lse;
             for (int d = 0; d < hd; ++d) oh[d] *= inv_lse;
+        }
+    }
+}
+
+// Incremental causal attention over a KV prefix and the current query chunk.
+// This CPU reference uses online softmax and supports both F32 and F16 KV storage.
+void attention_forward_kv_ex(const float* q, const void* k, const void* v,
+                             bool kv_fp16, float* out, int B, int Tq, int Tk,
+                             int H, int KV, int hd, int q_pos_offset,
+                             float scale, int window) {
+    if (B <= 0 || Tq <= 0) return;
+    GAI_CHECK(q && k && v && out, "attention_forward_kv_ex: null tensor");
+    GAI_CHECK(H > 0 && KV > 0 && H % KV == 0 && hd > 0,
+              "attention_forward_kv_ex: invalid head geometry");
+    GAI_CHECK(q_pos_offset >= 0 && q_pos_offset <= Tk &&
+              Tq <= Tk - q_pos_offset,
+              "attention_forward_kv_ex: query positions exceed KV length");
+
+    const int group = H / KV;
+    const float* k32 = kv_fp16 ? nullptr : static_cast<const float*>(k);
+    const float* v32 = kv_fp16 ? nullptr : static_cast<const float*>(v);
+    const u16* k16 = kv_fp16 ? static_cast<const u16*>(k) : nullptr;
+    const u16* v16 = kv_fp16 ? static_cast<const u16*>(v) : nullptr;
+
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int bh = 0; bh < B * H; ++bh) {
+        const int b = bh / H;
+        const int h = bh % H;
+        const int kvh = h / group;
+        for (int tq = 0; tq < Tq; ++tq) {
+            const int q_abs = q_pos_offset + tq;
+            const int j0 = (window > 0) ? std::max(0, q_abs - window + 1) : 0;
+            const float* qrow =
+                q + ((static_cast<size_t>(b) * Tq + tq) * H + h) * hd;
+            float* outrow =
+                out + ((static_cast<size_t>(b) * Tq + tq) * H + h) * hd;
+            std::fill(outrow, outrow + hd, 0.0f);
+
+            float m = -std::numeric_limits<float>::infinity();
+            float l = 0.0f;
+            for (int j = j0; j <= q_abs; ++j) {
+                const size_t base =
+                    ((static_cast<size_t>(b) * Tk + j) * KV + kvh) * hd;
+                double dot = 0.0;
+                for (int c = 0; c < hd; ++c) {
+                    const float kval = kv_fp16 ? fp16_to_fp32(k16[base + c])
+                                               : k32[base + c];
+                    dot += static_cast<double>(qrow[c]) * kval;
+                }
+                const float score = static_cast<float>(dot) * scale;
+                const float m_next = std::max(m, score);
+                const float alpha = std::isfinite(m) ? std::exp(m - m_next) : 0.0f;
+                const float beta = std::exp(score - m_next);
+                l = l * alpha + beta;
+                for (int c = 0; c < hd; ++c) {
+                    const float vval = kv_fp16 ? fp16_to_fp32(v16[base + c])
+                                               : v32[base + c];
+                    outrow[c] = outrow[c] * alpha + beta * vval;
+                }
+                m = m_next;
+            }
+            if (l > 0.0f) {
+                const float inv = 1.0f / l;
+                for (int c = 0; c < hd; ++c) outrow[c] *= inv;
+            }
         }
     }
 }

@@ -477,7 +477,19 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
         g.weight = w;
         for (const auto& p : paths) {
             Shard s;
-                if (!s.load_header(p) && !s.load(p)) { log_warn("dataloader: cannot load shard " + p); continue; }
+            if (!s.load_header(p) && !s.load(p)) {
+                log_warn("dataloader: cannot load shard " + p);
+                continue;
+            }
+            if (vocab_size_ > 0 && s.header().vocab_size != 0 &&
+                s.header().vocab_size != static_cast<u32>(vocab_size_))
+                GAI_FAIL("dataloader: shard " + p + " was built with vocab_size " +
+                         std::to_string(s.header().vocab_size) + " but the model uses " +
+                         std::to_string(vocab_size_) + "; rebuild the dataset");
+            if (tok_fingerprint_ != 0 && s.header().tok_fingerprint != 0 &&
+                s.header().tok_fingerprint != tok_fingerprint_)
+                GAI_FAIL("dataloader: shard " + p + " was built with a different tokenizer " +
+                         "(fingerprint mismatch); rebuild the dataset");
             const u64 min_tokens = spec.pack_sequences ? 2u : static_cast<u64>(spec.seq_len) + 1u;
             if (s.n_tokens() < min_tokens) {
                 log_warn("dataloader: shard too small, skipped: " + p);

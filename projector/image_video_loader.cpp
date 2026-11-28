@@ -118,6 +118,23 @@ static bool run_capture(const std::vector<std::string>& args, std::vector<uint8_
 #endif
 }
 
+static double probe_video_duration_seconds(const std::string& path) {
+    std::vector<uint8_t> captured;
+    const bool ok = run_capture({"ffprobe", "-v", "error",
+                                 "-show_entries", "format=duration",
+                                 "-of", "default=noprint_wrappers=1:nokey=1",
+                                 path},
+                                captured);
+    if (!ok || captured.empty()) return 0.0;
+
+    const std::string value(captured.begin(), captured.end());
+    char* end = nullptr;
+    const double duration = std::strtod(value.c_str(), &end);
+    if (end == value.c_str() || !std::isfinite(duration) || duration <= 0.0)
+        return 0.0;
+    return duration;
+}
+
 } 
 
 bool load_ppm_raw(const std::string& path, float* out, int C, int H, int W) {
@@ -416,28 +433,56 @@ VideoBuffer load_video_any(const std::string& path, int max_frames, int target_w
     vbuf.height = target_h;
     vbuf.channels = 3;
 
-    if (max_frames <= 0) return vbuf;
+    if (max_frames <= 0 || target_w <= 0 || target_h <= 0) return vbuf;
 
-    std::string vf_filter = keep_aspect_ratio
-        ? strfmt("fps=2,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=gray",
-                 target_w, target_h, target_w, target_h)
-        : strfmt("fps=2,scale=%d:%d", target_w, target_h);
+    const double duration = probe_video_duration_seconds(path);
+    std::vector<std::string> args{"ffmpeg", "-v", "error"};
+    std::string vf_filter;
+
+    if (max_frames == 1 && duration > 0.0) {
+        // A single-frame request should sample the middle, not the first frame.
+        args.push_back("-ss");
+        args.push_back(strfmt("%.6f", duration * 0.5));
+        vf_filter = keep_aspect_ratio
+            ? strfmt("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=gray",
+                     target_w, target_h, target_w, target_h)
+            : strfmt("scale=%d:%d", target_w, target_h);
+    } else {
+        // Decode at a duration-aware rate and hard-cap output frames in ffmpeg.
+        // If ffprobe is unavailable, preserve a bounded 2 FPS fallback.
+        const double fps = duration > 0.0
+            ? static_cast<double>(max_frames) / duration
+            : 2.0;
+        vf_filter = keep_aspect_ratio
+            ? strfmt("fps=%.10g,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=gray",
+                     fps, target_w, target_h, target_w, target_h)
+            : strfmt("fps=%.10g,scale=%d:%d", fps, target_w, target_h);
+    }
+
+    args.insert(args.end(), {"-i", path, "-vf", vf_filter,
+                             "-frames:v", std::to_string(max_frames),
+                             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"});
 
     std::vector<uint8_t> raw_all;
-    const bool ffmpeg_ok = run_capture({"ffmpeg", "-v", "error", "-i", path,
-                                        "-vf", vf_filter, "-f", "rawvideo",
-                                        "-pix_fmt", "rgb24", "-"}, raw_all);
-
-    const size_t frame_bytes = static_cast<size_t>(target_w) * target_h * 3;
+    const bool ffmpeg_ok = run_capture(args, raw_all);
+    const size_t frame_pixels = static_cast<size_t>(target_w) *
+                                static_cast<size_t>(target_h);
+    const size_t frame_bytes = frame_pixels * 3;
     const float inv255 = 1.0f / 255.0f;
-    const size_t plane_stride = static_cast<size_t>(target_w) * target_h;
 
-    std::vector<std::vector<float>> all_extracted_frames;
+    if (!ffmpeg_ok || frame_bytes == 0 || raw_all.size() < frame_bytes) {
+        log_warn("[vision] no video frames could be extracted from: " + path);
+        return vbuf;
+    }
+
+    const size_t plane_stride = frame_pixels;
     const uint8_t* cursor = raw_all.data();
     size_t remaining = raw_all.size();
+    vbuf.frames.reserve(static_cast<size_t>(max_frames));
 
-    while (ffmpeg_ok && remaining >= frame_bytes) {
-        std::vector<float> chw(static_cast<size_t>(3) * target_w * target_h);
+    while (remaining >= frame_bytes &&
+           static_cast<int>(vbuf.frames.size()) < max_frames) {
+        std::vector<float> chw(frame_pixels * 3);
         float* r_plane = chw.data();
         float* g_plane = r_plane + plane_stride;
         float* b_plane = g_plane + plane_stride;
@@ -445,35 +490,23 @@ VideoBuffer load_video_any(const std::string& path, int max_frames, int target_w
 #ifdef GAI_OPENMP
         #pragma omp parallel for schedule(static)
 #endif
-        for (int i = 0; i < target_w * target_h; ++i) {
+        for (i64 i = 0; i < static_cast<i64>(frame_pixels); ++i) {
             const size_t src_idx = static_cast<size_t>(i) * 3;
             r_plane[i] = static_cast<float>(cursor[src_idx + 0]) * inv255;
             g_plane[i] = static_cast<float>(cursor[src_idx + 1]) * inv255;
             b_plane[i] = static_cast<float>(cursor[src_idx + 2]) * inv255;
         }
-        all_extracted_frames.push_back(std::move(chw));
+        vbuf.frames.push_back(std::move(chw));
         cursor += frame_bytes;
         remaining -= frame_bytes;
     }
 
-    if (all_extracted_frames.empty()) {
+    // Drop the bounded RGB staging buffer as soon as frames are converted to CHW.
+    std::vector<uint8_t>().swap(raw_all);
+
+    if (vbuf.frames.empty()) {
         log_warn("[vision] no video frames could be extracted from: " + path);
         return vbuf;
-    }
-
-    if (static_cast<int>(all_extracted_frames.size()) <= max_frames) {
-        vbuf.frames = std::move(all_extracted_frames);
-    } else if (max_frames == 1) {
-        vbuf.frames.push_back(std::move(all_extracted_frames[all_extracted_frames.size() / 2]));
-    } else {
-        vbuf.frames.reserve(static_cast<size_t>(max_frames));
-        const double step = static_cast<double>(all_extracted_frames.size() - 1) /
-                            static_cast<double>(max_frames - 1);
-        for (int i = 0; i < max_frames; ++i) {
-            size_t idx = static_cast<size_t>(std::round(i * step));
-            if (idx >= all_extracted_frames.size()) idx = all_extracted_frames.size() - 1;
-            vbuf.frames.push_back(std::move(all_extracted_frames[idx]));
-        }
     }
 
     vbuf.num_frames = static_cast<int>(vbuf.frames.size());
