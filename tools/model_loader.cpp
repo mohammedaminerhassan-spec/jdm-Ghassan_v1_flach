@@ -53,10 +53,31 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
         sat_mul(sat_mul(static_cast<size_t>(cfg.num_heads),
                         static_cast<size_t>(prefill_T)),
                 static_cast<size_t>(kv_ctx));
-    const size_t attention_workspace = sat_mul(attention_cells, sizeof(float));
+    // Match attn_pool_ensure's 12.5% growth margin and fixed allocation slack.
+    const size_t attention_alloc_cells = sat_add(
+        attention_cells, sat_add(attention_cells / 8, static_cast<size_t>(1024)));
+    const size_t attention_workspace = sat_mul(attention_alloc_cells, sizeof(float));
+
+    // F16 KV cache is converted to a reusable FP32 staging pair before the
+    // current CUDA chunked GEMMs. The QK GEMM may also allocate an FP16 mirror
+    // containing both Q and K operands; reserve that even if its threshold is
+    // disabled at runtime so this estimate stays conservative.
+    const size_t kv_cells = sat_mul(static_cast<size_t>(kv_ctx),
+                                    static_cast<size_t>(cfg.kv_dim()));
+    const size_t kv_stage_bytes = sat_mul(sat_mul(kv_cells, 2), sizeof(float));
+    const size_t q_cells = sat_mul(static_cast<size_t>(prefill_T),
+                                   static_cast<size_t>(cfg.q_dim()));
+    const size_t gemm_mirror_elems = sat_add(q_cells, kv_cells);
+    const size_t gemm_mirror_alloc_elems = sat_add(
+        gemm_mirror_elems,
+        sat_add(gemm_mirror_elems / 8, static_cast<size_t>(1024)));
+    const size_t gemm_mirror_bytes = sat_mul(gemm_mirror_alloc_elems, sizeof(u16));
+
+    const size_t attention_total_workspace = sat_add(
+        sat_add(attention_workspace, kv_stage_bytes), gemm_mirror_bytes);
     const size_t workspaces = sat_add(
         sat_add(wsp.gemm_bytes, wsp.moe_bytes),
-        sat_add(wsp.mamba_bytes, attention_workspace));
+        sat_add(wsp.mamba_bytes, attention_total_workspace));
 
     // plan.activations already includes the persistent Mamba recurrent-state allocation.
     const size_t need = sat_add(
@@ -77,8 +98,9 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
 
     log_info(strfmt("[mem ] GPU plan: weights %s | fp16 cache %s | activations %s "
                     "(includes Mamba state) | KV %s | CUDA workspaces %s "
-                    "(GEMM %s, MoE %s, Mamba %s, attention scores %s) = %s "
-                    "of %s usable VRAM (%s free / %s total, %.0f%%)",
+                    "(GEMM %s, MoE %s, Mamba %s, attention scores %s, "
+                    "KV staging %s, GEMM mirror %s) = %s of %s usable VRAM "
+                    "(%s free / %s total, %.0f%%)",
                     human_bytes(plan.weights).c_str(),
                     human_bytes(plan.fp16_cache).c_str(),
                     human_bytes(plan.activations).c_str(),
@@ -88,6 +110,8 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
                     human_bytes(wsp.moe_bytes).c_str(),
                     human_bytes(wsp.mamba_bytes).c_str(),
                     human_bytes(attention_workspace).c_str(),
+                    human_bytes(kv_stage_bytes).c_str(),
+                    human_bytes(gemm_mirror_bytes).c_str(),
                     human_bytes(need).c_str(),
                     human_bytes(budget).c_str(),
                     human_bytes(available).c_str(),
