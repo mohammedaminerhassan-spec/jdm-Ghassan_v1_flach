@@ -584,9 +584,16 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     if (tokens.empty()) return;
     GAI_CHECK(start_pos >= 0 && cache_.length() == start_pos,
               "prefill: start_pos must match the current KV cache length");
+    GAI_CHECK(tokens.size() <= static_cast<size_t>((std::numeric_limits<int>::max)()),
+              "prefill: token chunk exceeds the supported int range");
     GAI_CHECK(static_cast<i64>(start_pos) + static_cast<i64>(tokens.size()) <=
                   cache_.capacity(),
               "prefill: chunk exceeds the KV cache capacity");
+    const i64 first_rope_pos = static_cast<i64>(position_offset) + start_pos;
+    const i64 last_rope_pos = first_rope_pos + static_cast<i64>(tokens.size()) - 1;
+    GAI_CHECK(first_rope_pos >= 0 &&
+              last_rope_pos <= static_cast<i64>((std::numeric_limits<i32>::max)()),
+              "prefill: absolute RoPE position exceeds the supported i32 range");
     const ModelConfig& c = model_.config();
 
     Device dev = model_.device();
@@ -912,6 +919,8 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
         return nullptr;
     };
     if (start == 0 && tokens.size() > 1) {
+        GAI_CHECK(tokens.size() <= static_cast<size_t>((std::numeric_limits<int>::max)()),
+                  "prefill: prompt exceeds the supported int range");
 
         std::vector<i32> work = tokens;
         int drop = 0;
@@ -922,7 +931,12 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
             processed = static_cast<int>(work.size());
         }
 
-        const int base = drop + front_drop;
+        const i64 base64 = static_cast<i64>(drop) + static_cast<i64>(front_drop);
+        const i64 last_position = base64 + static_cast<i64>(work.size()) - 1;
+        GAI_CHECK(base64 >= 0 &&
+                  last_position <= static_cast<i64>((std::numeric_limits<i32>::max)()),
+                  "prefill: truncated/front-dropped prompt exceeds the supported i32 RoPE position range");
+        const int base = static_cast<int>(base64);
         static constexpr size_t PREFILL_CHUNK = 512;
         for (size_t offset = 0; offset < work.size(); offset += PREFILL_CHUNK) {
             const size_t count = std::min(PREFILL_CHUNK, work.size() - offset);
