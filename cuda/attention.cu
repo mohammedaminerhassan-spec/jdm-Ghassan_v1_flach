@@ -38,11 +38,27 @@ static thread_local size_t  g_attn_kv_v_cap = 0;
 static thread_local void** g_attn_ptr[3] = {nullptr, nullptr, nullptr};
 static thread_local size_t g_attn_ptr_cap[3] = {0, 0, 0};
 
+static size_t attn_pool_capacity(size_t elems, size_t elem_bytes) {
+    const size_t maxv = (std::numeric_limits<size_t>::max)();
+    const size_t slack = elems / 8;
+    GAI_CHECK(elems <= maxv - 1024 && slack <= maxv - 1024 - elems,
+              "CUDA attention workspace capacity overflow");
+    const size_t want = elems + slack + 1024;
+    GAI_CHECK(elem_bytes == 0 || want <= maxv / elem_bytes,
+              "CUDA attention workspace byte-size overflow");
+    return want;
+}
+
 static void** attn_ptr_buf(int slot, size_t n) {
+    GAI_CHECK(slot >= 0 && slot < 3, "CUDA attention pointer-pool slot out of range");
     if (n > g_attn_ptr_cap[slot]) {
         if (g_attn_ptr[slot]) CU_CHECK2(cudaFree(g_attn_ptr[slot]));
         g_attn_ptr[slot] = nullptr;
         g_attn_ptr_cap[slot] = 0;
+        const size_t maxv = (std::numeric_limits<size_t>::max)();
+        GAI_CHECK(n <= maxv - 64 &&
+                  n + 64 <= maxv / sizeof(void*),
+                  "CUDA attention pointer-array size overflow");
         const size_t want = n + 64;
         CU_CHECK2(cudaMalloc(&g_attn_ptr[slot], want * sizeof(void*)));
         g_attn_ptr_cap[slot] = want;
@@ -50,11 +66,12 @@ static void** attn_ptr_buf(int slot, size_t n) {
     return g_attn_ptr[slot];
 }
 
-static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems) {    if (mir_elems > g_attn_mir_cap) {
+static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems) {
+    if (mir_elems > g_attn_mir_cap) {
         if (g_attn_mir) CU_CHECK2(cudaFree(g_attn_mir));
         g_attn_mir = nullptr;
         g_attn_mir_cap = 0;
-        size_t want = mir_elems + mir_elems / 8 + 1024;
+        const size_t want = attn_pool_capacity(mir_elems, sizeof(__half));
         CU_CHECK2(cudaMalloc(&g_attn_mir, sizeof(__half) * want));
         g_attn_mir_cap = want;
     }
@@ -62,7 +79,7 @@ static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems
         if (g_attn_exp) CU_CHECK2(cudaFree(g_attn_exp));
         g_attn_exp = nullptr;
         g_attn_exp_cap = 0;
-        size_t want = exp_elems + exp_elems / 8 + 1024;
+        const size_t want = attn_pool_capacity(exp_elems, sizeof(float));
         CU_CHECK2(cudaMalloc(&g_attn_exp, sizeof(float) * want));
         g_attn_exp_cap = want;
     }
@@ -70,13 +87,15 @@ static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems
         if (g_attn_dsb) CU_CHECK2(cudaFree(g_attn_dsb));
         g_attn_dsb = nullptr;
         g_attn_dsb_cap = 0;
-        size_t want = ds_elems + ds_elems / 8 + 1024;
+        const size_t want = attn_pool_capacity(ds_elems, sizeof(float));
         CU_CHECK2(cudaMalloc(&g_attn_dsb, sizeof(float) * want));
         g_attn_dsb_cap = want;
     }
 }
 
 static void attn_kv_pool_ensure(size_t elems) {
+    GAI_CHECK(elems <= (std::numeric_limits<size_t>::max)() / sizeof(float),
+              "CUDA attention KV staging size overflow");
     if (elems > g_attn_kv_k_cap) {
         if (g_attn_kv_k) CU_CHECK2(cudaFree(g_attn_kv_k));
         g_attn_kv_k = nullptr;
@@ -418,15 +437,23 @@ void attention_forward_kv_ex(const float* q, const void* k, const void* v,
               Tq <= Tk - q_pos_offset,
               "CUDA attention_forward_kv_ex: query positions exceed KV length");
 
+    GAI_CHECK(Tk > 0, "CUDA attention_forward_kv_ex: Tk must be positive");
     const size_t bsz = static_cast<size_t>(B);
     const size_t q_heads = static_cast<size_t>(H);
     const size_t kv_heads = static_cast<size_t>(KV);
-    const size_t q_elems = bsz * static_cast<size_t>(Tq) * q_heads *
-                           static_cast<size_t>(hd);
-    const size_t kv_elems = bsz * static_cast<size_t>(Tk) * kv_heads *
-                            static_cast<size_t>(hd);
-    const size_t bh = bsz * q_heads;
     const size_t maxv = (std::numeric_limits<size_t>::max)();
+    auto checked_mul = [&](size_t a, size_t b) -> size_t {
+        GAI_CHECK(b == 0 || a <= maxv / b,
+                  "CUDA attention_forward_kv_ex: tensor element count overflow");
+        return a * b;
+    };
+    const size_t q_elems = checked_mul(
+        checked_mul(checked_mul(bsz, static_cast<size_t>(Tq)), q_heads),
+        static_cast<size_t>(hd));
+    const size_t kv_elems = checked_mul(
+        checked_mul(checked_mul(bsz, static_cast<size_t>(Tk)), kv_heads),
+        static_cast<size_t>(hd));
+    const size_t bh = checked_mul(bsz, q_heads);
     GAI_CHECK(Tq <= 65535 && H <= 65535 && B <= 65535,
               "CUDA attention_forward_kv_ex: grid dimensions out of range");
     GAI_CHECK(static_cast<size_t>(Tq) <= maxv / static_cast<size_t>(Tk) &&
@@ -448,7 +475,8 @@ void attention_forward_kv_ex(const float* q, const void* k, const void* v,
         v32 = g_attn_kv_v;
     }
 
-    const size_t score_elems = bh * static_cast<size_t>(Tq) * static_cast<size_t>(Tk);
+    const size_t score_elems = checked_mul(
+        checked_mul(bh, static_cast<size_t>(Tq)), static_cast<size_t>(Tk));
     attn_pool_ensure(0, 0, score_elems);
     float* scores = g_attn_dsb;
 
