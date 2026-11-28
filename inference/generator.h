@@ -93,7 +93,8 @@ private:
     void forward_prefill(const std::vector<i32>& tokens, int start_pos,
                            const float* embed_override = nullptr,
                            const int* override_pos = nullptr,
-                           int n_override = 0);
+                           int n_override = 0,
+                           int position_offset = 0);
 
     static constexpr int FAST_TOPK_MAX = 128;
     static constexpr int FAST_HIST_MAX = 2048;

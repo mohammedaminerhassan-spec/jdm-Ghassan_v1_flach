@@ -577,7 +577,7 @@ float* Generator::decode_step(i32 token, int position, const float* token_embed)
 void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
                                 const float* embed_override,
                                 const int* override_pos,
-                                int n_override) {
+                                int n_override, int position_offset) {
     GAI_CHECK(model_.device() == expected_device_,
               "model device changed after Generator construction; rebuild the Generator");
 
@@ -602,7 +602,8 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     Tensor d_ids({P}, DType::I32, dev);
     d_ids.copy_from(ids);
     Tensor pos({P}, DType::I32, Device::CPU);
-    for (int i = 0; i < P; ++i) pos.i32p()[i] = start_pos + i;
+    for (int i = 0; i < P; ++i)
+        pos.i32p()[i] = position_offset + start_pos + i;
     Tensor d_pos({P}, DType::I32, dev);
     d_pos.copy_from(pos);
 
@@ -913,58 +914,47 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
     if (start == 0 && tokens.size() > 1) {
 
         std::vector<i32> work = tokens;
-        bool truncated = false;
         int drop = 0;
         if (static_cast<int>(work.size()) > max_context_) {
             drop = static_cast<int>(work.size()) - max_context_;
             work.erase(work.begin() + 1, work.begin() + 1 + drop);
             log_warn(strfmt("prefill: prompt truncated by %d tokens", drop));
-            truncated = true;
             processed = static_cast<int>(work.size());
         }
 
-        if (!truncated && front_drop == 0) {
+        const int base = drop + front_drop;
+        static constexpr size_t PREFILL_CHUNK = 512;
+        for (size_t offset = 0; offset < work.size(); offset += PREFILL_CHUNK) {
+            const size_t count = std::min(PREFILL_CHUNK, work.size() - offset);
+            std::vector<i32> chunk(work.begin() + offset, work.begin() + offset + count);
+            const int global_begin = base + static_cast<int>(offset);
 
-            static constexpr size_t PREFILL_CHUNK = 512;
-            for (size_t offset = 0; offset < work.size(); offset += PREFILL_CHUNK) {
-                const size_t count = std::min(PREFILL_CHUNK, work.size() - offset);
-                std::vector<i32> chunk(work.begin() + offset, work.begin() + offset + count);
-
-                std::vector<int> chunk_override_pos;
-                std::vector<float> chunk_override_embeds;
-                if (embed_override && override_pos && n_override > 0) {
-                    chunk_override_pos.reserve(static_cast<size_t>(n_override));
-                    chunk_override_embeds.reserve(static_cast<size_t>(n_override) *
-                                                   static_cast<size_t>(emb_d));
-                    for (int i = 0; i < n_override; ++i) {
-                        const int global_pos = override_pos[i];
-                        if (global_pos < static_cast<int>(offset) ||
-                            global_pos >= static_cast<int>(offset + count)) continue;
-                        chunk_override_pos.push_back(global_pos - static_cast<int>(offset));
-                        const float* row = embed_override +
-                            static_cast<size_t>(i) * static_cast<size_t>(emb_d);
-                        chunk_override_embeds.insert(chunk_override_embeds.end(),
-                                                      row, row + emb_d);
-                    }
+            std::vector<int> chunk_override_pos;
+            std::vector<float> chunk_override_embeds;
+            if (embed_override && override_pos && n_override > 0) {
+                chunk_override_pos.reserve(static_cast<size_t>(n_override));
+                chunk_override_embeds.reserve(static_cast<size_t>(n_override) *
+                                               static_cast<size_t>(emb_d));
+                for (int i = 0; i < n_override; ++i) {
+                    const int global_pos = override_pos[i];
+                    if (global_pos < global_begin ||
+                        global_pos >= global_begin + static_cast<int>(count)) continue;
+                    chunk_override_pos.push_back(global_pos - global_begin);
+                    const float* row = embed_override +
+                        static_cast<size_t>(i) * static_cast<size_t>(emb_d);
+                    chunk_override_embeds.insert(chunk_override_embeds.end(),
+                                                  row, row + emb_d);
                 }
-                const float* chunk_embeds = chunk_override_embeds.empty()
-                    ? nullptr : chunk_override_embeds.data();
-                const int* chunk_positions = chunk_override_pos.empty()
-                    ? nullptr : chunk_override_pos.data();
-                forward_prefill(chunk, static_cast<int>(offset), chunk_embeds,
-                                chunk_positions, static_cast<int>(chunk_override_pos.size()));
-                absolute_pos_ = static_cast<int64_t>(offset + count);
             }
-        } else {
-
-            const int base = drop + front_drop;
-            for (size_t i = 0; i < work.size(); ++i) {
-                const int pos = base + static_cast<int>(i);
-                decode_step(work[i], pos, override_for_pos(pos));
-                push_history(work[i]);
-            }
-
-            absolute_pos_ = static_cast<int64_t>(base) + static_cast<int64_t>(work.size());
+            const float* chunk_embeds = chunk_override_embeds.empty()
+                ? nullptr : chunk_override_embeds.data();
+            const int* chunk_positions = chunk_override_pos.empty()
+                ? nullptr : chunk_override_pos.data();
+            forward_prefill(chunk, static_cast<int>(offset), chunk_embeds,
+                            chunk_positions, static_cast<int>(chunk_override_pos.size()),
+                            base);
+            absolute_pos_ = static_cast<int64_t>(base) +
+                            static_cast<int64_t>(offset + count);
         }
     } else {
         for (size_t i = 0; i < tokens.size(); ++i) {
