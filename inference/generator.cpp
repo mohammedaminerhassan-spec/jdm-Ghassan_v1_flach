@@ -166,8 +166,6 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
             mamba_bc_out_host_.assign(static_cast<size_t>(conv_dim), 0.0f);
             mamba_y_host_.assign(static_cast<size_t>(d_inner), 0.0f);
         }
-        kv_stage_k_.assign(static_cast<size_t>(c.kv_dim()), 0.0f);
-        kv_stage_v_.assign(static_cast<size_t>(c.kv_dim()), 0.0f);
         for (int l = 0; l < c.num_layers; ++l) {
             const bool is_mamba = (c.arch == ModelConfig::ArchGranite) &&
                                   l < static_cast<int>(c.layer_types.size()) &&

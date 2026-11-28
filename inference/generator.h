@@ -146,8 +146,6 @@ private:
     std::vector<std::vector<float>> mamba_host_a_log_;
     std::vector<std::vector<float>> mamba_host_D_;
     std::vector<std::vector<float>> mamba_host_norm_;
-    std::vector<float> kv_stage_k_;
-    std::vector<float> kv_stage_v_;
 
     std::vector<float> logits_host_;
     std::vector<i32>   history_;
