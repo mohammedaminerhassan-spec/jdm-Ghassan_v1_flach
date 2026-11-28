@@ -509,6 +509,14 @@ bool export_model_safetensors(const std::string& dir, Model& model,
     ec.clear();
     fs::create_directories(stage, ec);
     GAI_CHECK(!ec, "cannot create export staging directory: " + ec.message());
+    struct StageDirectoryCleanup {
+        fs::path path;
+        ~StageDirectoryCleanup() {
+            std::error_code cleanup_ec;
+            fs::remove_all(path, cleanup_ec);
+        }
+    };
+    [[maybe_unused]] const StageDirectoryCleanup stage_cleanup{stage};
     auto publish_cleanup = [&]() { std::error_code c; fs::remove_all(stage, c); };
 
     const std::vector<ExportTensor> plan = plan_safetensors_export(model, dtype);

@@ -58,6 +58,7 @@ struct TrainerConfig {
 
     double loss_scale_max    = 0.0;
 
+    // Legacy config name: splits batch rows into micro-batches; does not recompute layers.
     bool  activation_checkpointing = false;
     int   ckpt_segments = 2;
 

@@ -78,6 +78,10 @@ static void flash_attn_head(
                 m_new = std::max(m_new, s_buf[j - jb]);
             }
 
+            // A packed-sequence block can be entirely masked. Skipping it avoids
+            // exp(-inf - -inf), which would otherwise inject NaNs into the output.
+            if (m_new == -std::numeric_limits<float>::infinity()) continue;
+
             // Rescale accumulated output with new max
             if (m_new > m) {
                 const float alpha = std::exp(m - m_new);
