@@ -9,6 +9,7 @@ on:
       - "**.cpp"
       - "**.h"
       - "**.cu"
+      - "**.cuh"
       - ".github/workflows/cuda-docker-build.yml"
   push:
     branches: [main]
@@ -18,6 +19,7 @@ on:
       - "**.cpp"
       - "**.h"
       - "**.cu"
+      - "**.cuh"
       - ".github/workflows/cuda-docker-build.yml"
   workflow_dispatch:
 
