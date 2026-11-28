@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <cfloat>
 #include <cmath>
+#include <limits>
 #include <type_traits>
 
 namespace gai {
