@@ -819,12 +819,8 @@ static void mamba2_backward_impl(const float* x,
 
     mamba_linear(x, w_in, proj, B * T, d, proj_size);
     {
-        dim3 grid(conv_dim, B);
-        const int block = 128;
-        const size_t sh = sizeof(float) * (k > 1 ? k : 1);
-        k_mamba_conv1d<<<grid, block, sh>>>(proj + d_inner, conv_w, conv_b,
-                                            bc, conv_raw, B, T, conv_dim, proj_size, k,
-                                            nullptr, segment_ids);
+        launch_mamba_conv1d(proj + d_inner, conv_w, conv_b, bc, conv_raw,
+                            B, T, conv_dim, proj_size, k, nullptr, segment_ids);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
     {
