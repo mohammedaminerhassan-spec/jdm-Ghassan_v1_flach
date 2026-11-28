@@ -139,6 +139,9 @@ void PagedKVCache::append_token(int layer_idx, const float* k_vec, const float* 
     const int offset = logical_idx % block_size_;
 
     if (block_idx >= static_cast<int>(block_table_.size())) {
+        // Grow the logical table before taking ownership of a physical block;
+        // push_back must not throw after allocate_block removes an id from the pool.
+        block_table_.reserve(static_cast<size_t>(block_idx) + 1);
         int b = allocate_block();
         GAI_CHECK(b >= 0, "PagedKVCache: out of physical blocks in VRAM pool");
         block_table_.push_back(b);
