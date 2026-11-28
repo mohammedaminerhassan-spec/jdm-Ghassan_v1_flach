@@ -577,7 +577,8 @@ float* Generator::decode_step(i32 token, int position, const float* token_embed)
 void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
                                 const float* embed_override,
                                 const int* override_pos,
-                                int n_override, int position_offset) {
+                                int n_override, int position_offset,
+                                bool produce_logits) {
     GAI_CHECK(model_.device() == expected_device_,
               "model device changed after Generator construction; rebuild the Generator");
 
@@ -626,13 +627,28 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     Tensor att({(i64)P * qd}, DType::F32, dev);
     Tensor proj({(i64)P * d}, DType::F32, dev);
 
-    const i64 nke = (i64)c.moe_top_k * c.moe_expert_dim;
-    Tensor mg({(i64)P * nke}, DType::F32, dev);
-    Tensor mu({(i64)P * nke}, DType::F32, dev);
-    Tensor ma({(i64)P * nke}, DType::F32, dev);
-    Tensor gtmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
-    Tensor utmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
-    Tensor atmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
+    bool has_moe_layer = false;
+    bool has_dense_layer = false;
+    for (int l = 0; l < c.num_layers; ++l) {
+        if (model_.layer(l).has_moe()) has_moe_layer = true;
+        else has_dense_layer = true;
+    }
+
+    const i64 nke = static_cast<i64>(c.moe_top_k) * c.moe_expert_dim;
+    Tensor mg, mu, ma;
+    if (has_moe_layer) {
+        mg = Tensor::empty({static_cast<i64>(P) * nke}, DType::F32, dev);
+        mu = Tensor::empty({static_cast<i64>(P) * nke}, DType::F32, dev);
+        ma = Tensor::empty({static_cast<i64>(P) * nke}, DType::F32, dev);
+    }
+
+    Tensor gtmp, utmp, atmp;
+    if (has_dense_layer) {
+        const i64 dense_elements = static_cast<i64>(P) * c.intermediate_size;
+        gtmp = Tensor::empty({dense_elements}, DType::F32, dev);
+        utmp = Tensor::empty({dense_elements}, DType::F32, dev);
+        atmp = Tensor::empty({dense_elements}, DType::F32, dev);
+    }
 
     if (is_half_or_quant(model_.tok_embeddings().w))
         ops::embedding_forward_half(dev, d_ids.i32p(), weight16(dev, model_.tok_embeddings().w, 0),
@@ -885,18 +901,23 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
         ops::add_inplace(dev, x.f32(), proj.f32(), (i64)P * d);
     }
     cache_.set_length(start_pos + P);
-    ops::rmsnorm_forward(dev, x.f32() + (size_t)(P - 1) * d,
-                         model_.final_norm().w.f32(), hlast_.f32(),
-                         nullptr, 1, d, c.rms_eps);
-    linear_param(dev, model_.lm_head().w, hlast_.f32(),
-                 logits_dev_.f32(), 1, d, c.vocab_size);
-    if (c.logits_scaling != 1.0f)
-        ops::scale_inplace(dev, logits_dev_.f32(), 1.0f / c.logits_scaling, c.vocab_size);
-    device_copy(logits_host_.data(), Device::CPU,
-                logits_dev_.f32(), dev,
-                sizeof(float) * (size_t)c.vocab_size);
-
-    device_copy(x_.f32(), dev, x.f32() + (size_t)(P - 1) * d, dev, sizeof(float) * (size_t)d);
+    // Intermediate prompt chunks only populate the KV/recurrent caches. The
+    // final norm, vocabulary projection, and D2H logits copy are needed once,
+    // after the last chunk, not once per chunk.
+    if (produce_logits) {
+        ops::rmsnorm_forward(dev, x.f32() + (size_t)(P - 1) * d,
+                             model_.final_norm().w.f32(), hlast_.f32(),
+                             nullptr, 1, d, c.rms_eps);
+        linear_param(dev, model_.lm_head().w, hlast_.f32(),
+                     logits_dev_.f32(), 1, d, c.vocab_size);
+        if (c.logits_scaling != 1.0f)
+            ops::scale_inplace(dev, logits_dev_.f32(), 1.0f / c.logits_scaling, c.vocab_size);
+        device_copy(logits_host_.data(), Device::CPU,
+                    logits_dev_.f32(), dev,
+                    sizeof(float) * (size_t)c.vocab_size);
+        device_copy(x_.f32(), dev, x.f32() + (size_t)(P - 1) * d,
+                    dev, sizeof(float) * (size_t)d);
+    }
     for (auto t : tokens) push_history(t);
 }
 
@@ -964,9 +985,10 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
                 ? nullptr : chunk_override_embeds.data();
             const int* chunk_positions = chunk_override_pos.empty()
                 ? nullptr : chunk_override_pos.data();
+            const bool last_chunk = offset + count == work.size();
             forward_prefill(chunk, static_cast<int>(offset), chunk_embeds,
                             chunk_positions, static_cast<int>(chunk_override_pos.size()),
-                            base);
+                            base, last_chunk);
             absolute_pos_ = static_cast<int64_t>(base) +
                             static_cast<int64_t>(offset + count);
         }

@@ -94,7 +94,8 @@ private:
                            const float* embed_override = nullptr,
                            const int* override_pos = nullptr,
                            int n_override = 0,
-                           int position_offset = 0);
+                           int position_offset = 0,
+                           bool produce_logits = true);
 
     static constexpr int FAST_TOPK_MAX = 128;
     static constexpr int FAST_HIST_MAX = 2048;
