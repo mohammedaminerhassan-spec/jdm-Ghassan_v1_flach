@@ -18,6 +18,7 @@ struct PhysicalBlock {
     int ref_count = 0;
 };
 
+// Experimental preallocated block pool. It is not wired into Generator's active KVCache path.
 class PagedKVCache {
 public:
     PagedKVCache() = default;
@@ -48,10 +49,19 @@ private:
     Device dev_ = Device::CPU;
     int block_size_ = DEFAULT_BLOCK_SIZE;
     int total_blocks_ = 0;
+    int max_tokens_ = 0;
     int kv_dim_ = 0;
     int num_layers_ = 0;
     int current_length_ = 0;
     bool fp16_ = true;
+
+    // Ownership flags prevent a block from being returned to the free list twice.
+    std::vector<u8> block_allocated_;
+    // A logical token is committed only after every cached attention layer wrote it.
+    std::vector<u8> layer_written_;
+    // Reused CUDA F16 staging buffers avoid per-token host heap allocations.
+    std::vector<u16> host_k_stage_f16_;
+    std::vector<u16> host_v_stage_f16_;
 
     Tensor k_storage_;
     Tensor v_storage_;
