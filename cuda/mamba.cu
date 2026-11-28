@@ -224,6 +224,117 @@ __global__ void k_mamba_gated_norm(const float* __restrict__ y,
         orow[c] = orow[c] * s_inv * w[c];
 }
 
+template <int K>
+__global__ void k_mamba_conv1d_channels(const float* __restrict__ in,
+                                        const float* __restrict__ w,
+                                        const float* __restrict__ bias,
+                                        float* __restrict__ out,
+                                        float* __restrict__ raw_out,
+                                        int B, int T, int C, int in_stride,
+                                        float* __restrict__ conv_state,
+                                        const i32* __restrict__ segment_ids) {
+    const int channel_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * C;
+    if (channel_batch >= total) return;
+
+    const int b = channel_batch / C;
+    const int c = channel_batch - b * C;
+    const size_t state_base =
+        (static_cast<size_t>(b) * C + c) * (K > 1 ? K - 1 : 1);
+    float win[K > 1 ? K - 1 : 1];
+
+    if constexpr (K > 1) {
+        #pragma unroll
+        for (int j = 0; j < K - 1; ++j)
+            win[j] = conv_state ? conv_state[state_base + j] : 0.0f;
+    }
+
+    const float* wc = w + static_cast<size_t>(c) * K;
+    const float bc = bias ? bias[c] : 0.0f;
+    int prev_seg = -2;
+
+    for (int t = 0; t < T; ++t) {
+        if (segment_ids) {
+            const int curr = segment_ids[static_cast<size_t>(b) * T + t];
+            if constexpr (K > 1) {
+                if (t > 0 && curr >= 0 && prev_seg >= 0 && curr != prev_seg) {
+                    #pragma unroll
+                    for (int j = 0; j < K - 1; ++j) win[j] = 0.0f;
+                }
+            }
+            if (curr >= 0) prev_seg = curr;
+        }
+
+        const float x = in[(static_cast<size_t>(b) * T + t) * in_stride + c];
+        float acc = bc;
+        #pragma unroll
+        for (int j = 0; j < K; ++j) {
+            const float value = (j == K - 1) ? x : win[j];
+            acc += wc[j] * value;
+        }
+
+        const size_t output_idx =
+            (static_cast<size_t>(b) * T + t) * C + c;
+        if (raw_out) raw_out[output_idx] = acc;
+        out[output_idx] = acc / (1.0f + expf(-acc));
+
+        if constexpr (K > 1) {
+            #pragma unroll
+            for (int j = 0; j + 1 < K - 1; ++j) win[j] = win[j + 1];
+            win[K - 2] = x;
+        }
+    }
+
+    if constexpr (K > 1) {
+        if (conv_state) {
+            #pragma unroll
+            for (int j = 0; j < K - 1; ++j)
+                conv_state[state_base + j] = win[j];
+        }
+    }
+}
+
+static void launch_mamba_conv1d(const float* in, const float* w,
+                                const float* bias, float* out, float* raw_out,
+                                int B, int T, int C, int in_stride, int k,
+                                float* conv_state, const i32* segment_ids) {
+    const size_t total = static_cast<size_t>(B) * static_cast<size_t>(C);
+    GAI_CHECK(total <= static_cast<size_t>((std::numeric_limits<int>::max)()),
+              "Mamba convolution channel count exceeds int range");
+
+    if (k >= 1 && k <= 16) {
+        const int block = 256;
+        const unsigned grid = static_cast<unsigned>((total + block - 1) / block);
+        switch (k) {
+            case 1: k_mamba_conv1d_channels<1><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 2: k_mamba_conv1d_channels<2><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 3: k_mamba_conv1d_channels<3><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 4: k_mamba_conv1d_channels<4><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 5: k_mamba_conv1d_channels<5><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 6: k_mamba_conv1d_channels<6><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 7: k_mamba_conv1d_channels<7><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 8: k_mamba_conv1d_channels<8><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 9: k_mamba_conv1d_channels<9><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 10: k_mamba_conv1d_channels<10><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 11: k_mamba_conv1d_channels<11><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 12: k_mamba_conv1d_channels<12><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 13: k_mamba_conv1d_channels<13><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 14: k_mamba_conv1d_channels<14><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 15: k_mamba_conv1d_channels<15><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            case 16: k_mamba_conv1d_channels<16><<<grid, block>>>(in,w,bias,out,raw_out,B,T,C,in_stride,conv_state,segment_ids); break;
+            default: break;
+        }
+        return;
+    }
+
+    // General fallback for unusually wide convolution kernels.
+    const dim3 grid(C, B);
+    const int block = 128;
+    const size_t shared = sizeof(float) * static_cast<size_t>(k > 1 ? k : 1);
+    k_mamba_conv1d<<<grid, block, shared>>>(in,w,bias,out,raw_out,B,T,C,in_stride,
+                                            k,conv_state,segment_ids);
+}
+
 template <typename W>
 static inline void mamba_linear(const float* x, const W* w, float* y, int M, int K, int N,
                                 int qkind = -1) {
@@ -275,12 +386,8 @@ static void mamba2_forward_impl(const float* x,
     mamba_linear(x, w_in, proj, B * T, d, proj_size, qkind);
 
     {
-        dim3 grid(conv_dim, B);
-        const int block = 128;
-        const size_t sh = sizeof(float) * (k > 1 ? k : 1);
-        k_mamba_conv1d<<<grid, block, sh>>>(proj + d_inner, conv_w, conv_b,
-                                           bc, nullptr, B, T, conv_dim, proj_size, k,
-                                           conv_state, segment_ids);
+        launch_mamba_conv1d(proj + d_inner, conv_w, conv_b, bc, nullptr,
+                            B, T, conv_dim, proj_size, k, conv_state, segment_ids);
         CU_MAMBA_CHECK(cudaGetLastError());
     }
 
