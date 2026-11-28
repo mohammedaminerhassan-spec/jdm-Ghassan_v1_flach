@@ -413,6 +413,14 @@ foreach(t ghassan-ai gai_train gai_data gai_tiny_prepare)
     gai_apply_cxx_flags(${t})
 endforeach()
 
+# Build a small parity harness so tiled CUDA attention can be checked against
+# the CPU online-softmax reference on an actual CUDA device (e.g. Kaggle T4).
+if(GAI_HAVE_CUDA)
+    add_executable(gai_cuda_attention_test tools/cuda_attention_test.cpp)
+    target_link_libraries(gai_cuda_attention_test PRIVATE gai_core)
+    gai_apply_cxx_flags(gai_cuda_attention_test)
+endif()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ══════════════════════════════════════════════════════════════════════════════
