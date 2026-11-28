@@ -29,6 +29,10 @@ static thread_local float*  g_attn_exp = nullptr;
 static thread_local size_t  g_attn_exp_cap = 0;
 static thread_local float*  g_attn_dsb = nullptr;
 static thread_local size_t  g_attn_dsb_cap = 0;
+static thread_local float*  g_attn_kv_k = nullptr;
+static thread_local size_t  g_attn_kv_k_cap = 0;
+static thread_local float*  g_attn_kv_v = nullptr;
+static thread_local size_t  g_attn_kv_v_cap = 0;
 
 static thread_local void** g_attn_ptr[3] = {nullptr, nullptr, nullptr};
 static thread_local size_t g_attn_ptr_cap[3] = {0, 0, 0};
@@ -71,7 +75,28 @@ static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems
     }
 }
 
+static void attn_kv_pool_ensure(size_t elems) {
+    if (elems > g_attn_kv_k_cap) {
+        if (g_attn_kv_k) CU_CHECK2(cudaFree(g_attn_kv_k));
+        g_attn_kv_k = nullptr;
+        g_attn_kv_k_cap = 0;
+        CU_CHECK2(cudaMalloc(&g_attn_kv_k, elems * sizeof(float)));
+        g_attn_kv_k_cap = elems;
+    }
+    if (elems > g_attn_kv_v_cap) {
+        if (g_attn_kv_v) CU_CHECK2(cudaFree(g_attn_kv_v));
+        g_attn_kv_v = nullptr;
+        g_attn_kv_v_cap = 0;
+        CU_CHECK2(cudaMalloc(&g_attn_kv_v, elems * sizeof(float)));
+        g_attn_kv_v_cap = elems;
+    }
+}
+
 void attn_free_pool() {
+    if (g_attn_kv_k) { CU_CHECK2(cudaFree(g_attn_kv_k)); g_attn_kv_k = nullptr; }
+    g_attn_kv_k_cap = 0;
+    if (g_attn_kv_v) { CU_CHECK2(cudaFree(g_attn_kv_v)); g_attn_kv_v = nullptr; }
+    g_attn_kv_v_cap = 0;
     if (g_attn_mir) { CU_CHECK2(cudaFree(g_attn_mir)); g_attn_mir = nullptr; }
     g_attn_mir_cap = 0;
     if (g_attn_exp) { CU_CHECK2(cudaFree(g_attn_exp)); g_attn_exp = nullptr; }
@@ -277,6 +302,58 @@ __global__ void k_attn_softmax_fwd(float* __restrict__ P, const i32* __restrict_
     for (int j = t + 1 + lane; j < T; j += blockDim.x) row[j] = 0.0f;
 }
 
+__global__ void k_attn_softmax_chunk(float* __restrict__ scores,
+                                     int Tq, int Tk, int q_pos_offset,
+                                     int H, int window, float scale) {
+    const int tq = blockIdx.x;
+    const int h = blockIdx.y;
+    const int b = blockIdx.z;
+    const int tid = threadIdx.x;
+    if (tq >= Tq) return;
+
+    const int q_abs = q_pos_offset + tq;
+    const int j0 = (window > 0) ? max(0, q_abs - window + 1) : 0;
+    const int j1 = min(Tk - 1, q_abs);
+    float* row = scores + ((static_cast<size_t>(b) * H + h) * Tq + tq) * Tk;
+
+    extern __shared__ float sm[];
+    float local_max = -FLT_MAX;
+    for (int j = j0 + tid; j <= j1; j += blockDim.x)
+        local_max = fmaxf(local_max, row[j] * scale);
+    sm[tid] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sm[tid] = fmaxf(sm[tid], sm[tid + stride]);
+        __syncthreads();
+    }
+    const float row_max = sm[0];
+
+    float local_sum = 0.0f;
+    for (int j = j0 + tid; j <= j1; j += blockDim.x) {
+        const float p = expf(row[j] * scale - row_max);
+        row[j] = p;
+        local_sum += p;
+    }
+    sm[tid] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sm[tid] += sm[tid + stride];
+        __syncthreads();
+    }
+    const float inv = (sm[0] > 0.0f) ? (1.0f / sm[0]) : 0.0f;
+    for (int j = tid; j < j0; j += blockDim.x) row[j] = 0.0f;
+    for (int j = j0 + tid; j <= j1; j += blockDim.x) row[j] *= inv;
+    for (int j = j1 + 1 + tid; j < Tk; j += blockDim.x) row[j] = 0.0f;
+}
+
+__global__ void k_attn_f16_to_f32(const u16* __restrict__ src,
+                                  float* __restrict__ dst, i64 n) {
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(reinterpret_cast<const __half*>(src)[i]);
+}
+
 __global__ void k_attn_ds(float* __restrict__ dP, const float* __restrict__ P,
                           int T, int H, float scale) {
     const int t = blockIdx.x;
@@ -326,6 +403,97 @@ __global__ void k_attn_group_reduce(const float* __restrict__ big, float* __rest
         }
         srow[c] += a;
     }
+}
+
+void attention_forward_kv_ex(const float* q, const void* k, const void* v,
+                             bool kv_fp16, float* out, int B, int Tq, int Tk,
+                             int H, int KV, int hd, int q_pos_offset,
+                             float scale, int window) {
+    if (B <= 0 || Tq <= 0) return;
+    GAI_CHECK(q && k && v && out, "CUDA attention_forward_kv_ex: null tensor");
+    GAI_CHECK(H > 0 && KV > 0 && H % KV == 0 && hd > 0 && hd <= MAX_HD,
+              "CUDA attention_forward_kv_ex: invalid head geometry");
+    GAI_CHECK(q_pos_offset >= 0 && q_pos_offset <= Tk &&
+              Tq <= Tk - q_pos_offset,
+              "CUDA attention_forward_kv_ex: query positions exceed KV length");
+
+    const size_t bsz = static_cast<size_t>(B);
+    const size_t q_heads = static_cast<size_t>(H);
+    const size_t kv_heads = static_cast<size_t>(KV);
+    const size_t q_elems = bsz * static_cast<size_t>(Tq) * q_heads *
+                           static_cast<size_t>(hd);
+    const size_t kv_elems = bsz * static_cast<size_t>(Tk) * kv_heads *
+                            static_cast<size_t>(hd);
+    const size_t bh = bsz * q_heads;
+    const size_t maxv = (std::numeric_limits<size_t>::max)();
+    GAI_CHECK(Tq <= 65535 && H <= 65535 && B <= 65535,
+              "CUDA attention_forward_kv_ex: grid dimensions out of range");
+    GAI_CHECK(static_cast<size_t>(Tq) <= maxv / static_cast<size_t>(Tk) &&
+              bh <= maxv / (static_cast<size_t>(Tq) * static_cast<size_t>(Tk)) &&
+              bh <= static_cast<size_t>((std::numeric_limits<int>::max)()),
+              "CUDA attention_forward_kv_ex: workspace size overflow");
+
+    const float* k32 = static_cast<const float*>(k);
+    const float* v32 = static_cast<const float*>(v);
+    if (kv_fp16) {
+        attn_kv_pool_ensure(kv_elems);
+        const unsigned blocks = static_cast<unsigned>((kv_elems + 255) / 256);
+        k_attn_f16_to_f32<<<blocks, 256>>>(static_cast<const u16*>(k), g_attn_kv_k,
+                                           static_cast<i64>(kv_elems));
+        k_attn_f16_to_f32<<<blocks, 256>>>(static_cast<const u16*>(v), g_attn_kv_v,
+                                           static_cast<i64>(kv_elems));
+        CU_CHECK2(cudaGetLastError());
+        k32 = g_attn_kv_k;
+        v32 = g_attn_kv_v;
+    }
+
+    const size_t score_elems = bh * static_cast<size_t>(Tq) * static_cast<size_t>(Tk);
+    attn_pool_ensure(0, 0, score_elems);
+    float* scores = g_attn_dsb;
+
+    thread_local std::vector<const float*> Aq, Bk;
+    thread_local std::vector<float*> Cs;
+    Aq.resize(bh);
+    Bk.resize(bh);
+    Cs.resize(bh);
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            const size_t i = static_cast<size_t>(b) * H + h;
+            const int kvh = h / (H / KV);
+            Aq[i] = q + (static_cast<size_t>(b) * Tq * H + h) * hd;
+            Bk[i] = k32 + (static_cast<size_t>(b) * Tk * KV + kvh) * hd;
+            Cs[i] = scores + i * static_cast<size_t>(Tq) * Tk;
+        }
+    }
+    attn_sbgemm(false, true, Tq, Tk, hd, 1.0f,
+                Aq.data(), H * hd, q, q_elems,
+                Bk.data(), KV * hd, k32, kv_elems,
+                0.0f, Cs.data(), Tk, static_cast<int>(bh));
+
+    const dim3 grid(static_cast<unsigned>(Tq), static_cast<unsigned>(H),
+                    static_cast<unsigned>(B));
+    k_attn_softmax_chunk<<<grid, 256, 256 * sizeof(float)>>>(
+        scores, Tq, Tk, q_pos_offset, H, window, scale);
+    CU_CHECK2(cudaGetLastError());
+
+    thread_local std::vector<const float*> As, Bv;
+    thread_local std::vector<float*> Co;
+    As.resize(bh);
+    Bv.resize(bh);
+    Co.resize(bh);
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            const size_t i = static_cast<size_t>(b) * H + h;
+            const int kvh = h / (H / KV);
+            As[i] = scores + i * static_cast<size_t>(Tq) * Tk;
+            Bv[i] = v32 + (static_cast<size_t>(b) * Tk * KV + kvh) * hd;
+            Co[i] = out + (static_cast<size_t>(b) * Tq * H + h) * hd;
+        }
+    }
+    attn_sbgemm(false, false, Tq, hd, Tk, 1.0f,
+                As.data(), Tk, scores, score_elems,
+                Bv.data(), KV * hd, v32, kv_elems,
+                0.0f, Co.data(), H * hd, static_cast<int>(bh), true);
 }
 
 void attention_forward_ex(const float* q, const float* k, const float* v,

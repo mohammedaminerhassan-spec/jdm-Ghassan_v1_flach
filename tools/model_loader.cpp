@@ -38,8 +38,8 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
     };
 
     const int kv_ctx = ctx > 0 ? ctx : std::min(cfg.max_seq_len, 4096);
-    // Generator batches at most 1024 prompt tokens in its fast prefill path.
-    const int prefill_T = std::max(1, std::min(kv_ctx, 1024));
+    // Generator prefill uses 512-query chunks that attend to the accumulated KV prefix.
+    const int prefill_T = std::max(1, std::min(kv_ctx, 512));
     const size_t kv = Model::kv_cache_bytes(cfg, kv_ctx);
     const Model::MemoryPlan plan =
         Model::plan_memory(cfg, 1, prefill_T, false, 1,
@@ -47,12 +47,12 @@ void check_vram_budget(const ModelConfig& cfg, Device dev, int ctx, bool fp16_ca
     const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, 1, prefill_T);
     const size_t qscratch = quant_kind >= 0 ? (512ull << 20) : 0;
 
-    // CUDA attention currently materialises one B*H*T*T FP32 score matrix per call.
-    // It is a reusable per-layer workspace, so count it once, not once per layer.
+    // Chunked prefill materialises B*H*Tq*Tk FP32 scores, where Tq is capped
+    // at prefill_T and Tk is bounded by the configured context length.
     const size_t attention_cells =
         sat_mul(sat_mul(static_cast<size_t>(cfg.num_heads),
                         static_cast<size_t>(prefill_T)),
-                static_cast<size_t>(prefill_T));
+                static_cast<size_t>(kv_ctx));
     const size_t attention_workspace = sat_mul(attention_cells, sizeof(float));
     const size_t workspaces = sat_add(
         sat_add(wsp.gemm_bytes, wsp.moe_bytes),

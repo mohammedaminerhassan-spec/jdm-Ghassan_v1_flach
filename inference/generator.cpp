@@ -581,13 +581,12 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
     GAI_CHECK(model_.device() == expected_device_,
               "model device changed after Generator construction; rebuild the Generator");
 
-    if (tokens.empty() || cache_.length() != 0 || start_pos != 0) {
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            decode_step(tokens[i], start_pos + static_cast<int>(i));
-            push_history(tokens[i]);
-        }
-        return;
-    }
+    if (tokens.empty()) return;
+    GAI_CHECK(start_pos >= 0 && cache_.length() == start_pos,
+              "prefill: start_pos must match the current KV cache length");
+    GAI_CHECK(static_cast<i64>(start_pos) + static_cast<i64>(tokens.size()) <=
+                  cache_.capacity(),
+              "prefill: chunk exceeds the KV cache capacity");
     const ModelConfig& c = model_.config();
 
     Device dev = model_.device();
@@ -820,14 +819,22 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
 
         if (cache_.fp16()) {
             const size_t n = static_cast<size_t>(P) * static_cast<size_t>(kvd);
-            ops::convert_f32_to_f16(dev, kp, cache_.k_f16(l), static_cast<i64>(n));
-            ops::convert_f32_to_f16(dev, vp, cache_.v_f16(l), static_cast<i64>(n));
+            u16* kdst = cache_.k_f16(l) + static_cast<size_t>(start_pos) * kvd;
+            u16* vdst = cache_.v_f16(l) + static_cast<size_t>(start_pos) * kvd;
+            ops::convert_f32_to_f16(dev, kp, kdst, static_cast<i64>(n));
+            ops::convert_f32_to_f16(dev, vp, vdst, static_cast<i64>(n));
+            ops::attention_forward_kv_ex(dev, qp, cache_.k_f16(l), cache_.v_f16(l),
+                                          true, att.f32(), 1, P, start_pos + P,
+                                          H, KV, hd, start_pos, scale, c.sliding_window);
         } else {
-            device_copy(cache_.k(l), dev, kp, dev, sizeof(float) * (size_t)P * kvd);
-            device_copy(cache_.v(l), dev, vp, dev, sizeof(float) * (size_t)P * kvd);
+            float* kdst = cache_.k(l) + static_cast<size_t>(start_pos) * kvd;
+            float* vdst = cache_.v(l) + static_cast<size_t>(start_pos) * kvd;
+            device_copy(kdst, dev, kp, dev, sizeof(float) * (size_t)P * kvd);
+            device_copy(vdst, dev, vp, dev, sizeof(float) * (size_t)P * kvd);
+            ops::attention_forward_kv_ex(dev, qp, cache_.k(l), cache_.v(l),
+                                          false, att.f32(), 1, P, start_pos + P,
+                                          H, KV, hd, start_pos, scale, c.sliding_window);
         }
-        ops::attention_forward_ex(dev, qp, kp, vp, att.f32(), nullptr,
-                                  1, P, H, KV, hd, scale, c.sliding_window);
         linear_param(dev, L.wo.w, att.f32(), proj.f32(), P, qd, d);
         if (c.residual_multiplier != 1.0f)
             ops::scale_inplace(dev, proj.f32(), c.residual_multiplier, (i64)P * d);
@@ -869,7 +876,7 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos,
             ops::scale_inplace(dev, proj.f32(), c.residual_multiplier, (i64)P * d);
         ops::add_inplace(dev, x.f32(), proj.f32(), (i64)P * d);
     }
-    cache_.set_length(P);
+    cache_.set_length(start_pos + P);
     ops::rmsnorm_forward(dev, x.f32() + (size_t)(P - 1) * d,
                          model_.final_norm().w.f32(), hlast_.f32(),
                          nullptr, 1, d, c.rms_eps);
@@ -918,21 +925,35 @@ void Generator::prefill(const std::vector<i32>& tokens, int front_drop,
 
         if (!truncated && front_drop == 0) {
 
-            static constexpr size_t PREFILL_CHUNK = 1024;
-            if (work.size() > PREFILL_CHUNK) {
-                std::vector<i32> head(work.begin(), work.begin() + PREFILL_CHUNK);
-                forward_prefill(head, 0, embed_override, override_pos, n_override);
-                absolute_pos_ = static_cast<int64_t>(head.size());
-                for (size_t i = PREFILL_CHUNK; i < work.size(); ++i) {
-                    const int pos = static_cast<int>(absolute_pos_);
-                    decode_step(work[i], pos, override_for_pos(pos));
-                    ++absolute_pos_;
-                    push_history(work[i]);
-                }
-            } else {
-                forward_prefill(work, 0, embed_override, override_pos, n_override);
+            static constexpr size_t PREFILL_CHUNK = 512;
+            for (size_t offset = 0; offset < work.size(); offset += PREFILL_CHUNK) {
+                const size_t count = std::min(PREFILL_CHUNK, work.size() - offset);
+                std::vector<i32> chunk(work.begin() + offset, work.begin() + offset + count);
 
-                absolute_pos_ = static_cast<int64_t>(work.size());
+                std::vector<int> chunk_override_pos;
+                std::vector<float> chunk_override_embeds;
+                if (embed_override && override_pos && n_override > 0) {
+                    chunk_override_pos.reserve(static_cast<size_t>(n_override));
+                    chunk_override_embeds.reserve(static_cast<size_t>(n_override) *
+                                                   static_cast<size_t>(emb_d));
+                    for (int i = 0; i < n_override; ++i) {
+                        const int global_pos = override_pos[i];
+                        if (global_pos < static_cast<int>(offset) ||
+                            global_pos >= static_cast<int>(offset + count)) continue;
+                        chunk_override_pos.push_back(global_pos - static_cast<int>(offset));
+                        const float* row = embed_override +
+                            static_cast<size_t>(i) * static_cast<size_t>(emb_d);
+                        chunk_override_embeds.insert(chunk_override_embeds.end(),
+                                                      row, row + emb_d);
+                    }
+                }
+                const float* chunk_embeds = chunk_override_embeds.empty()
+                    ? nullptr : chunk_override_embeds.data();
+                const int* chunk_positions = chunk_override_pos.empty()
+                    ? nullptr : chunk_override_pos.data();
+                forward_prefill(chunk, static_cast<int>(offset), chunk_embeds,
+                                chunk_positions, static_cast<int>(chunk_override_pos.size()));
+                absolute_pos_ = static_cast<int64_t>(offset + count);
             }
         } else {
 
